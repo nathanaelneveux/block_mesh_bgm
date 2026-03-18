@@ -12,9 +12,7 @@ use bevy::{
 use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, UnitQuadBuffer, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{
-    binary_greedy_quads, binary_greedy_quads_carry_merge, BinaryGreedyQuadsBuffer,
-};
+use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 use block_mesh_bgm_examples::{
     build_demo_samples, mesh_from_quads, mesh_from_unit_quads, striped_sphere, MeshStats,
     SampleShape, SAMPLE_MAX, SAMPLE_MIN,
@@ -85,21 +83,9 @@ fn setup(
     );
     let (binary_mesh, binary_stats) = mesh_from_quads(binary_buffer.quads, &faces, &samples);
 
-    let mut carry_buffer = BinaryGreedyQuadsBuffer::new();
-    binary_greedy_quads_carry_merge(
-        &samples,
-        &SampleShape {},
-        SAMPLE_MIN,
-        SAMPLE_MAX,
-        &faces,
-        &mut carry_buffer,
-    );
-    let (carry_mesh, carry_stats) = mesh_from_quads(carry_buffer.quads, &faces, &samples);
-
-    log_stats("simple", Vec3::new(-22.0, 0.0, -22.0), simple_stats);
-    log_stats("greedy", Vec3::new(22.0, 0.0, -22.0), greedy_stats);
-    log_stats("binary exact", Vec3::new(-22.0, 0.0, 22.0), binary_stats);
-    log_stats("binary carry", Vec3::new(22.0, 0.0, 22.0), carry_stats);
+    log_stats("simple", Vec3::new(-32.0, 0.0, 0.0), simple_stats);
+    log_stats("greedy", Vec3::new(0.0, 0.0, 0.0), greedy_stats);
+    log_stats("binary", Vec3::new(32.0, 0.0, 0.0), binary_stats);
     info!("Press Space to toggle wireframe.");
 
     spawn_camera(&mut commands);
@@ -111,28 +97,21 @@ fn setup(
         &mut meshes,
         &mut materials,
         simple_mesh,
-        Vec3::new(-22.0, 0.0, -22.0),
+        Vec3::new(-32.0, 0.0, 0.0),
     );
     spawn_mesh(
         &mut commands,
         &mut meshes,
         &mut materials,
         greedy_mesh,
-        Vec3::new(22.0, 0.0, -22.0),
+        Vec3::new(0.0, 0.0, 0.0),
     );
     spawn_mesh(
         &mut commands,
         &mut meshes,
         &mut materials,
         binary_mesh,
-        Vec3::new(-22.0, 0.0, 22.0),
-    );
-    spawn_mesh(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        carry_mesh,
-        Vec3::new(22.0, 0.0, 22.0),
+        Vec3::new(32.0, 0.0, 0.0),
     );
 }
 
@@ -168,8 +147,7 @@ fn spawn_overlay(commands: &mut Commands) {
         Text::new(
             "Render comparison\n\
              Space: toggle quad wireframe\n\
-             Top row: visible faces | greedy quads\n\
-             Bottom row: binary exact | binary carry",
+             Left to right: visible faces | greedy quads | binary greedy",
         ),
         Node {
             position_type: PositionType::Absolute,

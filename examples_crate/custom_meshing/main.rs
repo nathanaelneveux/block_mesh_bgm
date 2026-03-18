@@ -20,13 +20,9 @@ use bevy_voxel_world::{
     rendering::ATTRIBUTE_TEX_INDEX,
 };
 use block_mesh::RIGHT_HANDED_Y_UP_CONFIG;
-use block_mesh_bgm::{
-    binary_greedy_quads, binary_greedy_quads_carry_merge, BinaryGreedyQuadsBuffer,
-};
+use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
-
-const USE_CARRY_MERGE: bool = true;
 
 #[derive(Clone, Copy)]
 struct ColumnSample {
@@ -72,25 +68,14 @@ impl VoxelWorldConfig for MainWorld {
                         let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
                         let mut buffer = BinaryGreedyQuadsBuffer::new();
 
-                        if USE_CARRY_MERGE {
-                            binary_greedy_quads_carry_merge(
-                                &voxels,
-                                &PaddedChunkShape {},
-                                [0; 3],
-                                [CHUNK_SIZE_U + 1; 3],
-                                &faces,
-                                &mut buffer,
-                            );
-                        } else {
-                            binary_greedy_quads(
-                                &voxels,
-                                &PaddedChunkShape {},
-                                [0; 3],
-                                [CHUNK_SIZE_U + 1; 3],
-                                &faces,
-                                &mut buffer,
-                            );
-                        }
+                        binary_greedy_quads(
+                            &voxels,
+                            &PaddedChunkShape {},
+                            [0; 3],
+                            [CHUNK_SIZE_U + 1; 3],
+                            &faces,
+                            &mut buffer,
+                        );
 
                         let num_indices = buffer.quads.num_quads() * 6;
                         let num_vertices = buffer.quads.num_quads() * 4;
@@ -178,14 +163,7 @@ fn main() {
 }
 
 fn setup(mut commands: Commands) {
-    info!(
-        "bevy_voxel_world custom meshing example using binary greedy {}",
-        if USE_CARRY_MERGE {
-            "carry-merge"
-        } else {
-            "exact"
-        }
-    );
+    info!("bevy_voxel_world custom meshing example using binary greedy meshing");
 
     commands.spawn((
         Camera3d::default(),

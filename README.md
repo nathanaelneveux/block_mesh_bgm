@@ -5,7 +5,8 @@ It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy
 
 ## Goals
 
-- Match `block_mesh::greedy_quads` output for supported inputs.
+- Match `block_mesh::greedy_quads` visible-face geometry for supported inputs.
+- Stay close to `block_mesh::greedy_quads` quad counts while prioritizing speed.
 - Reuse `block_mesh` public types (`QuadBuffer`, `UnorientedQuad`, `OrientedBlockFace`).
 - Avoid the voxel remapping and intermediate buffer conversions required by standalone binary mesher crates.
 
@@ -125,8 +126,8 @@ Run the side-by-side renderer with:
 cargo run -p block-mesh-bgm-examples --example render
 ```
 
-That example places `visible_block_faces`, `greedy_quads`, `binary_greedy_quads`,
-and `binary_greedy_quads_carry_merge` in a 2x2 grid and logs their quad counts.
+That example places `visible_block_faces`, `greedy_quads`, and
+`binary_greedy_quads` side-by-side and logs their quad counts.
 Press `Space` to toggle wireframe so you can switch between surface shading and quad layout.
 
 Run the `bevy_voxel_world` integration example with:
@@ -136,7 +137,4 @@ cargo run -p block-mesh-bgm-examples --example custom_meshing
 ```
 
 That example is based on the `bevy_voxel_world` custom meshing demo, but swaps in
-this crate's binary greedy mesher. It uses carry-merge by default; flip
-`USE_CARRY_MERGE` in
-[`examples_crate/custom_meshing/main.rs`](/Users/nathanaelneveux/Developer/block_mesh_bgm/examples_crate/custom_meshing/main.rs)
-if you want to compare it against the exact partitioning path.
+this crate's binary greedy mesher.

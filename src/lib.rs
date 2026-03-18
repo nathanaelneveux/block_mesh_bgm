@@ -16,11 +16,11 @@
 //!    bits along one axis of the queried extent.
 //! 2. Derive per-face visibility rows by comparing each source column with its
 //!    neighbour column in the face normal direction.
-//! 3. Scan each face slice for visible cells, using a direct row scan when the
-//!    face's `(u, v)` axes already match the preferred scan order and a
-//!    transposed bitset otherwise.
-//! 4. Grow each visible cell into the largest merge-compatible quad by checking
-//!    `MergeVoxel::merge_value()` across the run selected by the visibility mask.
+//! 3. Arrange each face slice into scan rows, using a transposed bitset when
+//!    the face's `(u, v)` axes do not match the preferred scan order.
+//! 4. Carry merge lengths forward from one row to the next so compatible runs
+//!    collapse into large quads with only a small number of `merge_value()`
+//!    comparisons.
 //!
 //! The `62`-voxel interior limit comes from stage 1: each queried axis includes
 //! one voxel of padding on both sides, so the padded extent must fit in a
@@ -108,6 +108,8 @@ pub struct BinaryGreedyQuadsBuffer {
     // Transposed view of `visible_rows` used when a face prefers scanning by
     // columns instead of rows.
     scan_rows: Vec<u64>,
+    // Carry lengths used by the row-merging pass.
+    carry_runs: Vec<u8>,
 }
 
 impl BinaryGreedyQuadsBuffer {
@@ -121,6 +123,10 @@ impl BinaryGreedyQuadsBuffer {
 ///
 /// The public API mirrors [`block_mesh::greedy_quads`]. Output quads are stored
 /// in [`BinaryGreedyQuadsBuffer::quads`].
+///
+/// This implementation preserves visible-face geometry and usually
+/// stays very close to `block_mesh::greedy_quads` quad counts, but it does not
+/// guarantee the exact same quad partition.
 ///
 /// Supported extents must have a padded interior of at most `62` voxels on each
 /// axis. This corresponds to a maximum queried extent of `64` voxels on each
@@ -200,6 +206,7 @@ fn binary_greedy_quads_impl<T, S>(
         trans_cols,
         visible_rows,
         scan_rows,
+        carry_runs,
     } = output;
 
     let face_axes = (*faces).map(|face| FaceAxes::new(&face));
@@ -225,6 +232,7 @@ fn binary_greedy_quads_impl<T, S>(
             has_translucent,
             visible_rows,
             scan_rows,
+            carry_runs,
             &mut quads.groups[i],
         );
     }
@@ -243,6 +251,7 @@ fn mesh_face<T>(
     has_translucent: bool,
     visible_rows: &mut Vec<u64>,
     scan_rows: &mut Vec<u64>,
+    carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
@@ -297,22 +306,25 @@ fn mesh_face<T>(
     }
 
     if scan_aligned {
-        mesh_face_aligned(
+        mesh_face_carry(
             voxels,
             interior_min,
             interior_start_index,
             strides,
             axes,
-            u_len,
             v_len,
+            u_len,
             interior_n_len,
-            u_stride,
             v_stride,
+            u_stride,
+            axes.v_axis,
+            axes.u_axis,
             visible_rows,
+            carry_runs,
             quads,
         );
     } else {
-        mesh_face_transposed(
+        mesh_face_carry(
             voxels,
             interior_min,
             interior_start_index,
@@ -323,286 +335,156 @@ fn mesh_face<T>(
             interior_n_len,
             u_stride,
             v_stride,
-            visible_rows,
+            axes.u_axis,
+            axes.v_axis,
             scan_rows,
+            carry_runs,
             quads,
         );
     }
 }
 
-fn mesh_face_aligned<T>(
+fn mesh_face_carry<T>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_start_index: usize,
     strides: [usize; 3],
     axes: FaceAxes,
-    u_len: usize,
-    v_len: usize,
+    row_count: usize,
+    bit_count: usize,
     interior_n_len: usize,
-    u_stride: usize,
-    v_stride: usize,
-    visible_rows: &mut [u64],
+    row_stride: usize,
+    bit_stride: usize,
+    outer_axis: usize,
+    bit_axis: usize,
+    rows: &[u64],
+    carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
+    reset_carry_runs(carry_runs, bit_count);
+
     for n_local in 0..interior_n_len {
+        carry_runs.fill(0);
         let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
         let n_coord = interior_min[axes.n_axis] + n_local as u32;
-        let slice_start = n_local * v_len;
-        let slice_rows = &mut visible_rows[slice_start..slice_start + v_len];
+        let slice_start = n_local * row_count;
+        let slice_rows = &rows[slice_start..slice_start + row_count];
 
-        for v_local in 0..v_len {
-            let mut pending = slice_rows[v_local];
-            if pending == 0 {
+        for outer_local in 0..row_count {
+            let mut bits_here = slice_rows[outer_local];
+            if bits_here == 0 {
                 continue;
             }
 
-            let row_base_index = n_index_base + v_local * v_stride;
-            let v_coord = interior_min[axes.v_axis] + v_local as u32;
-
-            while pending != 0 {
-                let u_local = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-
-                let mut minimum = [0; 3];
-                minimum[axes.n_axis] = n_coord;
-                minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
-                minimum[axes.v_axis] = v_coord;
-
-                mesh_cell(
-                    voxels,
-                    minimum,
-                    row_base_index + u_local * u_stride,
-                    u_len,
-                    v_len,
-                    u_stride,
-                    v_stride,
-                    u_local,
-                    v_local,
-                    slice_rows,
-                    quads,
-                );
-            }
-        }
-    }
-}
-
-fn mesh_face_transposed<T>(
-    voxels: &[T],
-    interior_min: [u32; 3],
-    interior_start_index: usize,
-    strides: [usize; 3],
-    axes: FaceAxes,
-    u_len: usize,
-    v_len: usize,
-    interior_n_len: usize,
-    u_stride: usize,
-    v_stride: usize,
-    visible_rows: &mut [u64],
-    scan_rows: &[u64],
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    for n_local in 0..interior_n_len {
-        let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
-        let n_coord = interior_min[axes.n_axis] + n_local as u32;
-        let slice_start = n_local * v_len;
-        let slice_rows = &mut visible_rows[slice_start..slice_start + v_len];
-        let slice_scan_rows = &scan_rows[n_local * u_len..n_local * u_len + u_len];
-
-        for u_local in 0..u_len {
-            let mut pending = slice_scan_rows[u_local];
-            if pending == 0 {
-                continue;
-            }
-
-            let column_base_index = n_index_base + u_local * u_stride;
-            let u_coord = interior_min[axes.u_axis] + u_local as u32;
-
-            while pending != 0 {
-                let v_local = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-
-                let mut minimum = [0; 3];
-                minimum[axes.n_axis] = n_coord;
-                minimum[axes.u_axis] = u_coord;
-                minimum[axes.v_axis] = interior_min[axes.v_axis] + v_local as u32;
-
-                mesh_cell(
-                    voxels,
-                    minimum,
-                    column_base_index + v_local * v_stride,
-                    u_len,
-                    v_len,
-                    u_stride,
-                    v_stride,
-                    u_local,
-                    v_local,
-                    slice_rows,
-                    quads,
-                );
-            }
-        }
-    }
-}
-
-fn mesh_cell<T>(
-    voxels: &[T],
-    minimum: [u32; 3],
-    voxel_index: usize,
-    u_len: usize,
-    v_len: usize,
-    u_stride: usize,
-    v_stride: usize,
-    u_local: usize,
-    v_local: usize,
-    visible_rows: &mut [u64],
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    let row_index = v_local;
-    if visible_rows[row_index] & (1u64 << u_local) == 0 {
-        return;
-    }
-
-    let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
-
-    let max_width = u_len - u_local;
-    let quad_width = unsafe {
-        row_width_start(
-            voxels,
-            visible_rows[row_index],
-            u_local,
-            max_width,
-            voxel_index,
-            u_stride,
-            &quad_value,
-        )
-    };
-
-    let mut quad_height = 1usize;
-    let max_height = v_len - v_local;
-    let mut next_row_index = row_index + 1;
-    let mut next_voxel_index = voxel_index + v_stride;
-
-    if quad_width == 1 {
-        while quad_height < max_height {
-            let row_bits = visible_rows[next_row_index];
-            if row_bits & (1u64 << u_local) == 0 {
-                break;
-            }
-            if unsafe { voxels.get_unchecked(next_voxel_index) }
-                .merge_value()
-                .ne(&quad_value)
-            {
-                break;
-            }
-
-            quad_height += 1;
-            next_row_index += 1;
-            next_voxel_index += v_stride;
-        }
-    } else {
-        while quad_height < max_height {
-            let width = unsafe {
-                row_width(
-                    voxels,
-                    visible_rows[next_row_index],
-                    u_local,
-                    quad_width,
-                    next_voxel_index,
-                    u_stride,
-                    &quad_value,
-                )
+            let bits_next = if outer_local + 1 < row_count {
+                slice_rows[outer_local + 1]
+            } else {
+                0
             };
+            let row_base_index = n_index_base + outer_local * row_stride;
 
-            if width < quad_width {
-                break;
+            while bits_here != 0 {
+                let bit_local = bits_here.trailing_zeros() as usize;
+                let bit = 1u64 << bit_local;
+                let voxel_index = row_base_index + bit_local * bit_stride;
+                let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
+
+                if unsafe {
+                    row_bit_continues(voxels, bits_next, bit, voxel_index, row_stride, &quad_value)
+                } {
+                    carry_runs[bit_local] += 1;
+                    bits_here &= !bit;
+                    continue;
+                }
+
+                let run_length = carry_runs[bit_local] as usize + 1;
+                let mut run_width = 1usize;
+
+                while bit_local + run_width < bit_count {
+                    let next_bit_local = bit_local + run_width;
+                    let next_bit = 1u64 << next_bit_local;
+                    if bits_here & next_bit == 0
+                        || carry_runs[next_bit_local] != carry_runs[bit_local]
+                    {
+                        break;
+                    }
+
+                    let next_index = row_base_index + next_bit_local * bit_stride;
+                    if unsafe { voxels.get_unchecked(next_index) }
+                        .merge_value()
+                        .ne(&quad_value)
+                    {
+                        break;
+                    }
+
+                    if unsafe {
+                        row_bit_continues(
+                            voxels,
+                            bits_next,
+                            next_bit,
+                            next_index,
+                            row_stride,
+                            &quad_value,
+                        )
+                    } {
+                        break;
+                    }
+
+                    carry_runs[next_bit_local] = 0;
+                    run_width += 1;
+                }
+
+                bits_here &= !bit_mask(bit_local, run_width);
+
+                let start_outer = outer_local - carry_runs[bit_local] as usize;
+                let mut minimum = [0; 3];
+                minimum[axes.n_axis] = n_coord;
+                minimum[outer_axis] = interior_min[outer_axis] + start_outer as u32;
+                minimum[bit_axis] = interior_min[bit_axis] + bit_local as u32;
+
+                let (width, height) = if bit_axis == axes.u_axis {
+                    (run_width as u32, run_length as u32)
+                } else {
+                    (run_length as u32, run_width as u32)
+                };
+
+                quads.push(UnorientedQuad {
+                    minimum,
+                    width,
+                    height,
+                });
+
+                carry_runs[bit_local] = 0;
             }
-
-            quad_height += 1;
-            next_row_index += 1;
-            next_voxel_index += v_stride;
         }
     }
-
-    let visit_mask = bit_mask(u_local, quad_width);
-    for row in 0..quad_height {
-        visible_rows[row_index + row] &= !visit_mask;
-    }
-
-    quads.push(UnorientedQuad {
-        minimum,
-        width: quad_width as u32,
-        height: quad_height as u32,
-    });
 }
 
-unsafe fn row_width_start<T>(
+#[inline]
+fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
+    carry_runs.resize(len, 0);
+    carry_runs.fill(0);
+}
+
+#[inline]
+unsafe fn row_bit_continues<T>(
     voxels: &[T],
-    visible_row: u64,
-    start_u: usize,
-    max_width: usize,
-    start_index: usize,
-    u_stride: usize,
+    next_row_bits: u64,
+    bit: u64,
+    voxel_index: usize,
+    row_stride: usize,
     quad_value: &T::MergeValue,
-) -> usize
+) -> bool
 where
     T: MergeVoxel,
 {
-    let available = visible_row >> start_u;
-    let run_width = (available.trailing_ones() as usize).min(max_width);
-    if run_width <= 1 {
-        return run_width;
-    }
-
-    let mut index = start_index + u_stride;
-    let mut width = 1usize;
-
-    while width < run_width {
-        let voxel = voxels.get_unchecked(index);
-        if !voxel.merge_value().eq(quad_value) {
-            break;
-        }
-
-        width += 1;
-        index += u_stride;
-    }
-
-    width
-}
-
-unsafe fn row_width<T>(
-    voxels: &[T],
-    visible_row: u64,
-    start_u: usize,
-    max_width: usize,
-    start_index: usize,
-    u_stride: usize,
-    quad_value: &T::MergeValue,
-) -> usize
-where
-    T: MergeVoxel,
-{
-    let available = visible_row >> start_u;
-    let run_width = (available.trailing_ones() as usize).min(max_width);
-    let mut index = start_index;
-    let mut width = 0usize;
-
-    while width < run_width {
-        let voxel = voxels.get_unchecked(index);
-        if !voxel.merge_value().eq(quad_value) {
-            break;
-        }
-
-        width += 1;
-        index += u_stride;
-    }
-
-    width
+    next_row_bits & bit != 0
+        && voxels
+            .get_unchecked(voxel_index + row_stride)
+            .merge_value()
+            .eq(quad_value)
 }
 
 fn reset_columns(
