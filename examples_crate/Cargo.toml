@@ -1,0 +1,21 @@
+[package]
+name = "block-mesh-bgm-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bevy = "0.18"
+bevy_voxel_world = "0.15.1"
+block-mesh = "0.2"
+block-mesh-bgm = { path = ".." }
+ndshape = "0.3"
+noise = "0.9"
+
+[[example]]
+name = "render"
+path = "render/main.rs"
+
+[[example]]
+name = "custom_meshing"
+path = "custom_meshing/main.rs"

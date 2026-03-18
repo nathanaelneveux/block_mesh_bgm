@@ -8,6 +8,11 @@ keywords = ["graphics", "mesh", "voxel", "greedy", "binary"]
 categories = ["graphics", "rendering"]
 readme = "README.md"
 
+[workspace]
+members = ["examples_crate"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 block-mesh = "0.2"
 ndshape = "0.3"

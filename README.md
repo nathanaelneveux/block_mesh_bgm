@@ -108,3 +108,35 @@ The benchmark suite compares three paths on the same voxel datasets:
 
 That makes it easier to reason about where time is going:
 `visible_block_faces` is the speed target, while `greedy_quads` is the output-shape baseline.
+
+## Visual Examples
+
+The workspace includes an `examples_crate` for visual inspection.
+
+Build-check the examples with:
+
+```text
+cargo check -p block-mesh-bgm-examples --examples
+```
+
+Run the side-by-side renderer with:
+
+```text
+cargo run -p block-mesh-bgm-examples --example render
+```
+
+That example places `visible_block_faces`, `greedy_quads`, `binary_greedy_quads`,
+and `binary_greedy_quads_carry_merge` in a 2x2 grid and logs their quad counts.
+Press `Space` to toggle wireframe so you can switch between surface shading and quad layout.
+
+Run the `bevy_voxel_world` integration example with:
+
+```text
+cargo run -p block-mesh-bgm-examples --example custom_meshing
+```
+
+That example is based on the `bevy_voxel_world` custom meshing demo, but swaps in
+this crate's binary greedy mesher. It uses carry-merge by default; flip
+`USE_CARRY_MERGE` in
+[`examples_crate/custom_meshing/main.rs`](/Users/nathanaelneveux/Developer/block_mesh_bgm/examples_crate/custom_meshing/main.rs)
+if you want to compare it against the exact partitioning path.
