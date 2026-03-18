@@ -409,11 +409,9 @@ fn mesh_face<T>(
     }
 
     let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
+    let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
     let outer_len = interior_shape[outer_axis] as usize;
-    let unit_only_slices = unit_only_slice_mask(visible_rows, v_len, interior_n_len);
-    let all_slices_mask = (1u64 << interior_n_len) - 1;
-
-    if unit_only_slices == all_slices_mask {
+    if all_slices_unit_only(visible_rows, v_len, interior_n_len) {
         #[cfg(feature = "profiling")]
         let unit_emit_start = Instant::now();
         for n_local in 0..interior_n_len {
@@ -435,98 +433,172 @@ fn mesh_face<T>(
         return;
     }
 
-    #[cfg(feature = "profiling")]
-    let scan_start = Instant::now();
-    reset_scan_rows(scan_rows, interior_n_len * outer_len);
-    build_scan_rows(
-        visible_rows,
-        scan_rows,
-        v_len,
-        outer_len,
-        interior_n_len,
-        axes,
-        outer_axis,
-        inner_axis,
-    );
-    #[cfg(feature = "profiling")]
-    if let Some(profile) = profile.as_mut() {
-        profile.scan_masks += scan_start.elapsed();
+    if !scan_aligned {
+        #[cfg(feature = "profiling")]
+        let scan_start = Instant::now();
+        reset_scan_rows(scan_rows, interior_n_len * outer_len);
+        build_transposed_scan_rows(visible_rows, scan_rows, v_len, outer_len, interior_n_len);
+        #[cfg(feature = "profiling")]
+        if let Some(profile) = profile.as_mut() {
+            profile.scan_masks += scan_start.elapsed();
+        }
     }
 
     #[cfg(feature = "profiling")]
     let merge_start = Instant::now();
+    if scan_aligned {
+        mesh_face_aligned(
+            voxels,
+            interior_min,
+            interior_start_index,
+            strides,
+            axes,
+            u_len,
+            v_len,
+            interior_n_len,
+            u_stride,
+            v_stride,
+            visible_rows,
+            quads,
+        );
+    } else {
+        mesh_face_transposed(
+            voxels,
+            interior_min,
+            interior_start_index,
+            strides,
+            axes,
+            u_len,
+            v_len,
+            interior_n_len,
+            u_stride,
+            v_stride,
+            visible_rows,
+            scan_rows,
+            quads,
+        );
+    }
+    #[cfg(feature = "profiling")]
+    if let Some(profile) = profile.as_mut() {
+        profile.merge += merge_start.elapsed();
+    }
+}
+
+fn mesh_face_aligned<T>(
+    voxels: &[T],
+    interior_min: [u32; 3],
+    interior_start_index: usize,
+    strides: [usize; 3],
+    axes: FaceAxes,
+    u_len: usize,
+    v_len: usize,
+    interior_n_len: usize,
+    u_stride: usize,
+    v_stride: usize,
+    visible_rows: &mut [u64],
+    quads: &mut Vec<UnorientedQuad>,
+) where
+    T: MergeVoxel,
+{
     for n_local in 0..interior_n_len {
         let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
         let n_coord = interior_min[axes.n_axis] + n_local as u32;
         let slice_start = n_local * v_len;
         let slice_rows = &mut visible_rows[slice_start..slice_start + v_len];
 
-        for outer_local in 0..outer_len {
-            let mut pending = scan_rows[n_local * outer_len + outer_local];
+        for v_local in 0..v_len {
+            let mut pending = slice_rows[v_local];
             if pending == 0 {
                 continue;
             }
 
-            if outer_axis == axes.v_axis {
-                let row_base_index = n_index_base + outer_local * strides[axes.v_axis];
-                let v_coord = interior_min[axes.v_axis] + outer_local as u32;
+            let row_base_index = n_index_base + v_local * v_stride;
+            let v_coord = interior_min[axes.v_axis] + v_local as u32;
 
-                while pending != 0 {
-                    let u_local = pending.trailing_zeros() as usize;
-                    pending &= pending - 1;
+            while pending != 0 {
+                let u_local = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
 
-                    let mut minimum = [0; 3];
-                    minimum[axes.n_axis] = n_coord;
-                    minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
-                    minimum[axes.v_axis] = v_coord;
+                let mut minimum = [0; 3];
+                minimum[axes.n_axis] = n_coord;
+                minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
+                minimum[axes.v_axis] = v_coord;
 
-                    mesh_cell(
-                        voxels,
-                        minimum,
-                        row_base_index + u_local * strides[axes.u_axis],
-                        u_len,
-                        v_len,
-                        u_stride,
-                        v_stride,
-                        u_local,
-                        outer_local,
-                        slice_rows,
-                        quads,
-                    );
-                }
-            } else {
-                let column_base_index = n_index_base + outer_local * strides[axes.u_axis];
-                let u_coord = interior_min[axes.u_axis] + outer_local as u32;
-
-                while pending != 0 {
-                    let v_local = pending.trailing_zeros() as usize;
-                    pending &= pending - 1;
-
-                    let mut minimum = [0; 3];
-                    minimum[axes.n_axis] = n_coord;
-                    minimum[axes.u_axis] = u_coord;
-                    minimum[axes.v_axis] = interior_min[axes.v_axis] + v_local as u32;
-
-                    mesh_cell(
-                        voxels,
-                        minimum,
-                        column_base_index + v_local * strides[axes.v_axis],
-                        u_len,
-                        v_len,
-                        u_stride,
-                        v_stride,
-                        outer_local,
-                        v_local,
-                        slice_rows,
-                        quads,
-                    );
-                }
+                mesh_cell(
+                    voxels,
+                    minimum,
+                    row_base_index + u_local * u_stride,
+                    u_len,
+                    v_len,
+                    u_stride,
+                    v_stride,
+                    u_local,
+                    v_local,
+                    slice_rows,
+                    quads,
+                );
             }
         }
     }
-    #[cfg(feature = "profiling")]
-    if let Some(profile) = profile.as_mut() {
-        profile.merge += merge_start.elapsed();
+}
+
+fn mesh_face_transposed<T>(
+    voxels: &[T],
+    interior_min: [u32; 3],
+    interior_start_index: usize,
+    strides: [usize; 3],
+    axes: FaceAxes,
+    u_len: usize,
+    v_len: usize,
+    interior_n_len: usize,
+    u_stride: usize,
+    v_stride: usize,
+    visible_rows: &mut [u64],
+    scan_rows: &[u64],
+    quads: &mut Vec<UnorientedQuad>,
+) where
+    T: MergeVoxel,
+{
+    for n_local in 0..interior_n_len {
+        let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
+        let n_coord = interior_min[axes.n_axis] + n_local as u32;
+        let slice_start = n_local * v_len;
+        let slice_rows = &mut visible_rows[slice_start..slice_start + v_len];
+        let slice_scan_rows = &scan_rows[n_local * u_len..n_local * u_len + u_len];
+
+        for u_local in 0..u_len {
+            let mut pending = slice_scan_rows[u_local];
+            if pending == 0 {
+                continue;
+            }
+
+            let column_base_index = n_index_base + u_local * u_stride;
+            let u_coord = interior_min[axes.u_axis] + u_local as u32;
+
+            while pending != 0 {
+                let v_local = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+
+                let mut minimum = [0; 3];
+                minimum[axes.n_axis] = n_coord;
+                minimum[axes.u_axis] = u_coord;
+                minimum[axes.v_axis] = interior_min[axes.v_axis] + v_local as u32;
+
+                mesh_cell(
+                    voxels,
+                    minimum,
+                    column_base_index + v_local * v_stride,
+                    u_len,
+                    v_len,
+                    u_stride,
+                    v_stride,
+                    u_local,
+                    v_local,
+                    slice_rows,
+                    quads,
+                );
+            }
+        }
     }
 }
 
@@ -856,23 +928,13 @@ fn reset_scan_rows(scan_rows: &mut Vec<u64>, len: usize) {
     scan_rows.fill(0);
 }
 
-fn build_scan_rows(
+fn build_transposed_scan_rows(
     visible_rows: &[u64],
     scan_rows: &mut [u64],
     v_len: usize,
     outer_len: usize,
     interior_n_len: usize,
-    axes: FaceAxes,
-    outer_axis: usize,
-    inner_axis: usize,
 ) {
-    if outer_axis == axes.v_axis && inner_axis == axes.u_axis {
-        scan_rows.copy_from_slice(visible_rows);
-        return;
-    }
-
-    debug_assert_eq!(outer_axis, axes.u_axis);
-    debug_assert_eq!(inner_axis, axes.v_axis);
     for n_local in 0..interior_n_len {
         let src = &visible_rows[n_local * v_len..n_local * v_len + v_len];
         let dst = &mut scan_rows[n_local * outer_len..n_local * outer_len + outer_len];
@@ -888,28 +950,20 @@ fn build_scan_rows(
 }
 
 #[inline]
-fn unit_only_slice_mask(visible_rows: &[u64], v_len: usize, interior_n_len: usize) -> u64 {
-    let mut unit_only_mask = 0u64;
-
+fn all_slices_unit_only(visible_rows: &[u64], v_len: usize, interior_n_len: usize) -> bool {
     for n_local in 0..interior_n_len {
         let slice_rows = &visible_rows[n_local * v_len..n_local * v_len + v_len];
         let mut previous_row = 0u64;
-        let mut can_merge = false;
 
         for &row in slice_rows {
             if (row & (row >> 1)) != 0 || (row & previous_row) != 0 {
-                can_merge = true;
-                break;
+                return false;
             }
             previous_row = row;
         }
-
-        if !can_merge {
-            unit_only_mask |= 1u64 << n_local;
-        }
     }
 
-    unit_only_mask
+    true
 }
 
 fn emit_unit_slice(
@@ -972,7 +1026,6 @@ fn emit_unit_slice(
 
 fn reset_visible_rows(visible_rows: &mut Vec<u64>, interior_rows: usize) {
     visible_rows.resize(interior_rows, 0);
-    visible_rows.fill(0);
 }
 
 fn bit_mask(start: usize, width: usize) -> u64 {
