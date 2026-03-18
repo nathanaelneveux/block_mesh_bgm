@@ -1,0 +1,21 @@
+[package]
+name = "block-mesh-bgm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A block-mesh-compatible binary greedy mesher for voxel chunks."
+keywords = ["graphics", "mesh", "voxel", "greedy", "binary"]
+categories = ["graphics", "rendering"]
+readme = "README.md"
+
+[dependencies]
+block-mesh = "0.2"
+ndshape = "0.3"
+
+[dev-dependencies]
+criterion = "0.8"
+rand = "0.9"
+
+[[bench]]
+name = "bench"
+harness = false
