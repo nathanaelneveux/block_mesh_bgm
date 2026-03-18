@@ -8,6 +8,24 @@
 //! growth. It operates directly on the caller's voxel slice, so it does not
 //! require repacking voxels into an intermediate material buffer.
 //!
+//! # How the algorithm works
+//!
+//! The implementation is organized as four stages:
+//!
+//! 1. Build three axis-specific column tables where each `u64` packs occupancy
+//!    bits along one axis of the queried extent.
+//! 2. Derive per-face visibility rows by comparing each source column with its
+//!    neighbour column in the face normal direction.
+//! 3. Scan each face slice for visible cells, using a direct row scan when the
+//!    face's `(u, v)` axes already match the preferred scan order and a
+//!    transposed bitset otherwise.
+//! 4. Grow each visible cell into the largest merge-compatible quad by checking
+//!    `MergeVoxel::merge_value()` across the run selected by the visibility mask.
+//!
+//! The `62`-voxel interior limit comes from stage 1: each queried axis includes
+//! one voxel of padding on both sides, so the padded extent must fit in a
+//! single `u64`.
+//!
 //! # Example
 //!
 //! ```
@@ -80,9 +98,15 @@ use ndshape::Shape;
 #[derive(Default)]
 pub struct BinaryGreedyQuadsBuffer {
     pub quads: QuadBuffer,
+    // For each bit axis, store one `u64` per orthogonal column.
+    // `opaque_cols[axis][column]` packs opaque occupancy bits along `axis`.
     opaque_cols: [Vec<u64>; 3],
+    // Mirrors `opaque_cols`, but only for translucent voxels.
     trans_cols: [Vec<u64>; 3],
+    // Face-local visibility rows laid out as `[n][v] -> bits over u`.
     visible_rows: Vec<u64>,
+    // Transposed view of `visible_rows` used when a face prefers scanning by
+    // columns instead of rows.
     scan_rows: Vec<u64>,
 }
 
@@ -101,6 +125,13 @@ impl BinaryGreedyQuadsBuffer {
 /// Supported extents must have a padded interior of at most `62` voxels on each
 /// axis. This corresponds to a maximum queried extent of `64` voxels on each
 /// axis including the one-voxel padding required by `block-mesh`.
+///
+/// Conceptually, the queried extent is split into:
+///
+/// - the padded query bounds `[min, max]`, which are only used to determine
+///   face visibility, and
+/// - the interior bounds `[min + 1, max - 1]`, which are the voxels that may
+///   actually contribute quads to the mesh.
 pub fn binary_greedy_quads<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -112,14 +143,7 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    binary_greedy_quads_impl(
-        voxels,
-        voxels_shape,
-        min,
-        max,
-        faces,
-        output,
-    )
+    binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output)
 }
 
 fn binary_greedy_quads_impl<T, S>(
@@ -129,13 +153,14 @@ fn binary_greedy_quads_impl<T, S>(
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
     output: &mut BinaryGreedyQuadsBuffer,
-)
-where
+) where
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
     assert_in_bounds(voxels, voxels_shape, min, max);
 
+    // `block-mesh` requires a one-voxel border around the actual meshed region.
+    // If any axis only contains padding, there is no interior to mesh.
     if max
         .iter()
         .zip(min.iter())
@@ -179,8 +204,11 @@ where
 
     let face_axes = (*faces).map(|face| FaceAxes::new(&face));
 
+    // Build reusable occupancy columns for all three possible bit axes up
+    // front, then derive face visibility from those compact masks.
     reset_columns(opaque_cols, trans_cols, query_shape);
-    build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
+    let has_translucent =
+        build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
 
     for i in 0..6 {
         let axes = face_axes[i];
@@ -194,6 +222,7 @@ where
             axes,
             &opaque_cols[axes.u_axis],
             &trans_cols[axes.u_axis],
+            has_translucent,
             visible_rows,
             scan_rows,
             &mut quads.groups[i],
@@ -211,6 +240,7 @@ fn mesh_face<T>(
     axes: FaceAxes,
     opaque_cols: &[u64],
     trans_cols: &[u64],
+    has_translucent: bool,
     visible_rows: &mut Vec<u64>,
     scan_rows: &mut Vec<u64>,
     quads: &mut Vec<UnorientedQuad>,
@@ -225,7 +255,7 @@ fn mesh_face<T>(
     let v_stride = strides[axes.v_axis];
 
     reset_visible_rows(visible_rows, interior_rows);
-    build_visible_rows(
+    let unit_only = build_visible_rows(
         query_shape,
         axes.u_axis,
         u_len,
@@ -236,13 +266,16 @@ fn mesh_face<T>(
         axes.v_axis,
         opaque_cols,
         trans_cols,
+        has_translucent,
         visible_rows,
     );
 
+    // Some face orientations already match the row-major bit layout, while the
+    // others are faster to scan by first transposing into `[n][u] -> bits over v`.
     let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
     let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
     let outer_len = interior_shape[outer_axis] as usize;
-    if all_slices_unit_only(visible_rows, v_len, interior_n_len) {
+    if unit_only {
         for n_local in 0..interior_n_len {
             emit_unit_slice(
                 interior_min,
@@ -415,128 +448,6 @@ fn mesh_face_transposed<T>(
     }
 }
 
-fn reset_columns(
-    opaque_cols: &mut [Vec<u64>; 3],
-    trans_cols: &mut [Vec<u64>; 3],
-    query_shape: [usize; 3],
-) {
-    for bit_axis in 0..3 {
-        let len = column_count(bit_axis, query_shape);
-        opaque_cols[bit_axis].resize(len, 0);
-        trans_cols[bit_axis].resize(len, 0);
-        opaque_cols[bit_axis].fill(0);
-        trans_cols[bit_axis].fill(0);
-    }
-}
-
-fn build_axis_columns<T>(
-    voxels: &[T],
-    min: [u32; 3],
-    query_shape: [usize; 3],
-    strides: [usize; 3],
-    opaque_cols: &mut [Vec<u64>; 3],
-    trans_cols: &mut [Vec<u64>; 3],
-) where
-    T: Voxel,
-{
-    let base_index = coord_to_index(min, strides);
-    let qx = query_shape[0];
-    let qy = query_shape[1];
-    let qz = query_shape[2];
-    let x_stride = strides[0];
-    let y_stride = strides[1];
-    let z_stride = strides[2];
-
-    for z in 0..qz {
-        let z_base_index = base_index + z * z_stride;
-        let z_bit = 1u64 << z;
-        let z_x_base = z * qx;
-        let z_y_base = z * qy;
-
-        for y in 0..qy {
-            let mut index = z_base_index + y * y_stride;
-            let x_col_index = y + z_y_base;
-            let y_bit = 1u64 << y;
-            let z_col_row_base = y * qx;
-
-            for x in 0..qx {
-                match unsafe { voxels.get_unchecked(index) }.get_visibility() {
-                    VoxelVisibility::Empty => {}
-                    VoxelVisibility::Translucent => {
-                        trans_cols[0][x_col_index] |= 1u64 << x;
-                        trans_cols[1][x + z_x_base] |= y_bit;
-                        trans_cols[2][x + z_col_row_base] |= z_bit;
-                    }
-                    VoxelVisibility::Opaque => {
-                        opaque_cols[0][x_col_index] |= 1u64 << x;
-                        opaque_cols[1][x + z_x_base] |= y_bit;
-                        opaque_cols[2][x + z_col_row_base] |= z_bit;
-                    }
-                }
-
-                index += x_stride;
-            }
-        }
-    }
-}
-
-fn build_visible_rows(
-    query_shape: [usize; 3],
-    u_axis: usize,
-    u_len: usize,
-    v_len: usize,
-    interior_n_len: usize,
-    n_sign: i32,
-    n_axis: usize,
-    v_axis: usize,
-    opaque_cols: &[u64],
-    trans_cols: &[u64],
-    visible_rows: &mut [u64],
-) {
-    let interior_u_mask = bit_mask(0, u_len);
-    let (base_offset, n_stride, v_stride) = match (u_axis, n_axis, v_axis) {
-        (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
-        (0, 2, 1) => (1, query_shape[1], 1),
-        (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
-        (1, 2, 0) => (1, query_shape[0], 1),
-        (2, 0, 1) => (query_shape[0], 1, query_shape[0]),
-        (2, 1, 0) => (1, query_shape[0], 1),
-        _ => unreachable!(),
-    };
-
-    for n_local in 0..interior_n_len {
-        let src_n = n_local + 1;
-        let neighbour_n = if n_sign > 0 { src_n + 1 } else { src_n - 1 };
-        let row_start = n_local * v_len;
-        let mut src = base_offset + src_n * n_stride;
-        let mut neighbour = base_offset + neighbour_n * n_stride;
-
-        for row in &mut visible_rows[row_start..row_start + v_len] {
-            let src_opaque = opaque_cols[src];
-            let src_trans = trans_cols[src];
-            let neighbour_opaque = opaque_cols[neighbour];
-            let neighbour_trans = trans_cols[neighbour];
-
-            let raw_visible = (src_opaque & !neighbour_opaque)
-                | (src_trans & !(neighbour_opaque | neighbour_trans));
-
-            *row = (raw_visible >> 1) & interior_u_mask;
-            src += v_stride;
-            neighbour += v_stride;
-        }
-    }
-}
-
-#[inline]
-fn column_count(bit_axis: usize, query_shape: [usize; 3]) -> usize {
-    match bit_axis {
-        0 => query_shape[1] * query_shape[2],
-        1 => query_shape[0] * query_shape[2],
-        2 => query_shape[0] * query_shape[1],
-        _ => unreachable!(),
-    }
-}
-
 fn mesh_cell<T>(
     voxels: &[T],
     minimum: [u32; 3],
@@ -694,6 +605,145 @@ where
     width
 }
 
+fn reset_columns(
+    opaque_cols: &mut [Vec<u64>; 3],
+    trans_cols: &mut [Vec<u64>; 3],
+    query_shape: [usize; 3],
+) {
+    for bit_axis in 0..3 {
+        let len = column_count(bit_axis, query_shape);
+        opaque_cols[bit_axis].resize(len, 0);
+        trans_cols[bit_axis].resize(len, 0);
+        opaque_cols[bit_axis].fill(0);
+        trans_cols[bit_axis].fill(0);
+    }
+}
+
+fn build_axis_columns<T>(
+    voxels: &[T],
+    min: [u32; 3],
+    query_shape: [usize; 3],
+    strides: [usize; 3],
+    opaque_cols: &mut [Vec<u64>; 3],
+    trans_cols: &mut [Vec<u64>; 3],
+) -> bool
+where
+    T: Voxel,
+{
+    let base_index = coord_to_index(min, strides);
+    let qx = query_shape[0];
+    let qy = query_shape[1];
+    let qz = query_shape[2];
+    let x_stride = strides[0];
+    let y_stride = strides[1];
+    let z_stride = strides[2];
+    let mut has_translucent = false;
+
+    for z in 0..qz {
+        let z_base_index = base_index + z * z_stride;
+        let z_bit = 1u64 << z;
+        let z_x_base = z * qx;
+        let z_y_base = z * qy;
+
+        for y in 0..qy {
+            let mut index = z_base_index + y * y_stride;
+            let x_col_index = y + z_y_base;
+            let y_bit = 1u64 << y;
+            let z_col_row_base = y * qx;
+
+            for x in 0..qx {
+                match unsafe { voxels.get_unchecked(index) }.get_visibility() {
+                    VoxelVisibility::Empty => {}
+                    VoxelVisibility::Translucent => {
+                        has_translucent = true;
+                        trans_cols[0][x_col_index] |= 1u64 << x;
+                        trans_cols[1][x + z_x_base] |= y_bit;
+                        trans_cols[2][x + z_col_row_base] |= z_bit;
+                    }
+                    VoxelVisibility::Opaque => {
+                        opaque_cols[0][x_col_index] |= 1u64 << x;
+                        opaque_cols[1][x + z_x_base] |= y_bit;
+                        opaque_cols[2][x + z_col_row_base] |= z_bit;
+                    }
+                }
+
+                index += x_stride;
+            }
+        }
+    }
+
+    has_translucent
+}
+
+fn build_visible_rows(
+    query_shape: [usize; 3],
+    u_axis: usize,
+    u_len: usize,
+    v_len: usize,
+    interior_n_len: usize,
+    n_sign: i32,
+    n_axis: usize,
+    v_axis: usize,
+    opaque_cols: &[u64],
+    trans_cols: &[u64],
+    has_translucent: bool,
+    visible_rows: &mut [u64],
+) -> bool {
+    let interior_u_mask = bit_mask(0, u_len);
+    let (base_offset, n_stride, v_stride) = match (u_axis, n_axis, v_axis) {
+        (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
+        (0, 2, 1) => (1, query_shape[1], 1),
+        (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
+        (1, 2, 0) => (1, query_shape[0], 1),
+        (2, 0, 1) => (query_shape[0], 1, query_shape[0]),
+        (2, 1, 0) => (1, query_shape[0], 1),
+        _ => unreachable!(),
+    };
+
+    let mut unit_only = true;
+    for n_local in 0..interior_n_len {
+        let src_n = n_local + 1;
+        let neighbour_n = if n_sign > 0 { src_n + 1 } else { src_n - 1 };
+        let row_start = n_local * v_len;
+        let mut src = base_offset + src_n * n_stride;
+        let mut neighbour = base_offset + neighbour_n * n_stride;
+        let mut previous_row = 0u64;
+
+        for row in &mut visible_rows[row_start..row_start + v_len] {
+            let src_opaque = opaque_cols[src];
+            let neighbour_opaque = opaque_cols[neighbour];
+            let raw_visible = if has_translucent {
+                let src_trans = trans_cols[src];
+                let neighbour_trans = trans_cols[neighbour];
+                (src_opaque & !neighbour_opaque)
+                    | (src_trans & !(neighbour_opaque | neighbour_trans))
+            } else {
+                src_opaque & !neighbour_opaque
+            };
+
+            let visible = (raw_visible >> 1) & interior_u_mask;
+            unit_only &= (visible & (visible >> 1)) == 0;
+            unit_only &= (visible & previous_row) == 0;
+            *row = visible;
+            previous_row = visible;
+            src += v_stride;
+            neighbour += v_stride;
+        }
+    }
+
+    unit_only
+}
+
+#[inline]
+fn column_count(bit_axis: usize, query_shape: [usize; 3]) -> usize {
+    match bit_axis {
+        0 => query_shape[1] * query_shape[2],
+        1 => query_shape[0] * query_shape[2],
+        2 => query_shape[0] * query_shape[1],
+        _ => unreachable!(),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FaceAxes {
     n_axis: usize,
@@ -748,6 +798,10 @@ fn build_transposed_scan_rows(
     outer_len: usize,
     interior_n_len: usize,
 ) {
+    // `visible_rows` is stored as `[n][v] -> bits over u`. Some face
+    // orientations are cheaper to scan as `[n][u] -> bits over v`, so we build
+    // that transposed view once per face instead of re-walking rows for every
+    // probe.
     for n_local in 0..interior_n_len {
         let src = &visible_rows[n_local * v_len..n_local * v_len + v_len];
         let dst = &mut scan_rows[n_local * outer_len..n_local * outer_len + outer_len];
@@ -760,23 +814,6 @@ fn build_transposed_scan_rows(
             }
         }
     }
-}
-
-#[inline]
-fn all_slices_unit_only(visible_rows: &[u64], v_len: usize, interior_n_len: usize) -> bool {
-    for n_local in 0..interior_n_len {
-        let slice_rows = &visible_rows[n_local * v_len..n_local * v_len + v_len];
-        let mut previous_row = 0u64;
-
-        for &row in slice_rows {
-            if (row & (row >> 1)) != 0 || (row & previous_row) != 0 {
-                return false;
-            }
-            previous_row = row;
-        }
-    }
-
-    true
 }
 
 fn emit_unit_slice(
@@ -841,14 +878,18 @@ fn reset_visible_rows(visible_rows: &mut Vec<u64>, interior_rows: usize) {
     visible_rows.resize(interior_rows, 0);
 }
 
+#[inline]
 fn bit_mask(start: usize, width: usize) -> u64 {
     ((1u64 << width) - 1) << start
 }
 
+#[inline]
 fn coord_to_index(coord: [u32; 3], strides: [usize; 3]) -> usize {
     coord[0] as usize * strides[0] + coord[1] as usize * strides[1] + coord[2] as usize * strides[2]
 }
 
+// `ndshape` exposes `linearize`, but not the raw per-axis strides that make
+// the hot loops cheaper to write. Derive them once from unit offsets.
 fn shape_strides<S>(shape: &S, shape_array: [u32; 3]) -> [usize; 3]
 where
     S: Shape<3, Coord = u32>,

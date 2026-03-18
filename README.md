@@ -9,6 +9,23 @@ It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy
 - Reuse `block_mesh` public types (`QuadBuffer`, `UnorientedQuad`, `OrientedBlockFace`).
 - Avoid the voxel remapping and intermediate buffer conversions required by standalone binary mesher crates.
 
+## How It Works
+
+The implementation follows the same public contract as `block_mesh::greedy_quads`,
+but it arrives there with a different internal representation.
+
+1. It treats the queried extent as a padded box.
+   The outer one-voxel shell is only used to decide whether an interior face is visible.
+2. It builds compact occupancy columns for all three axes.
+   Each column is a `u64` whose bits represent voxels along one axis.
+3. It derives visible-face rows by comparing a source column with its neighbour column.
+   This turns face visibility into cheap bitwise operations.
+4. It greedily merges visible cells back into `UnorientedQuad`s, checking
+   `MergeVoxel::merge_value()` only when the visibility mask says a merge is possible.
+
+The 62-voxel interior limit exists because each queried axis needs two padding
+voxels and the full padded run must fit inside one `u64`.
+
 ## Limitations
 
 - Interior query extents are limited to at most `62` voxels per axis.
@@ -82,3 +99,12 @@ cargo test
 cargo bench
 cargo doc --no-deps
 ```
+
+The benchmark suite compares three paths on the same voxel datasets:
+
+- `visible_block_faces`: the fast "one quad per visible face" baseline from `block-mesh`
+- `greedy_quads`: the upstream greedy implementation
+- `binary_greedy_quads`: this crate
+
+That makes it easier to reason about where time is going:
+`visible_block_faces` is the speed target, while `greedy_quads` is the output-shape baseline.
