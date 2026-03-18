@@ -72,8 +72,6 @@ use block_mesh::{
     MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, UnorientedQuad, Voxel, VoxelVisibility,
 };
 use ndshape::Shape;
-#[cfg(feature = "profiling")]
-use std::time::{Duration, Instant};
 
 /// Reusable output and scratch storage for [`binary_greedy_quads`].
 ///
@@ -95,18 +93,6 @@ impl BinaryGreedyQuadsBuffer {
     }
 }
 
-#[cfg(feature = "profiling")]
-#[derive(Clone, Copy, Debug, Default)]
-#[doc(hidden)]
-pub struct BinaryGreedyPhaseProfile {
-    pub source_masks: Duration,
-    pub visibility_masks: Duration,
-    pub scan_masks: Duration,
-    pub unit_emit: Duration,
-    pub merge: Duration,
-    pub total: Duration,
-}
-
 /// Generates greedy quads using a binary-mask-backed implementation.
 ///
 /// The public API mirrors [`block_mesh::greedy_quads`]. Output quads are stored
@@ -126,32 +112,6 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    #[cfg(feature = "profiling")]
-    {
-        let _ = binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output, None);
-        return;
-    }
-
-    #[cfg(not(feature = "profiling"))]
-    {
-        binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output);
-    }
-}
-
-#[cfg(feature = "profiling")]
-#[doc(hidden)]
-pub fn binary_greedy_quads_profile<T, S>(
-    voxels: &[T],
-    voxels_shape: &S,
-    min: [u32; 3],
-    max: [u32; 3],
-    faces: &[OrientedBlockFace; 6],
-    output: &mut BinaryGreedyQuadsBuffer,
-) -> BinaryGreedyPhaseProfile
-where
-    T: MergeVoxel,
-    S: Shape<3, Coord = u32>,
-{
     binary_greedy_quads_impl(
         voxels,
         voxels_shape,
@@ -159,11 +119,9 @@ where
         max,
         faces,
         output,
-        Some(BinaryGreedyPhaseProfile::default()),
     )
 }
 
-#[cfg(feature = "profiling")]
 fn binary_greedy_quads_impl<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -171,128 +129,8 @@ fn binary_greedy_quads_impl<T, S>(
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
     output: &mut BinaryGreedyQuadsBuffer,
-    mut profile: Option<BinaryGreedyPhaseProfile>,
-) -> BinaryGreedyPhaseProfile
+)
 where
-    T: MergeVoxel,
-    S: Shape<3, Coord = u32>,
-{
-    let total_start = Instant::now();
-    binary_greedy_quads_impl_inner(voxels, voxels_shape, min, max, faces, output, &mut profile);
-    let mut result = profile.unwrap_or_default();
-    result.total = total_start.elapsed();
-    result
-}
-
-#[cfg(not(feature = "profiling"))]
-fn binary_greedy_quads_impl<T, S>(
-    voxels: &[T],
-    voxels_shape: &S,
-    min: [u32; 3],
-    max: [u32; 3],
-    faces: &[OrientedBlockFace; 6],
-    output: &mut BinaryGreedyQuadsBuffer,
-) where
-    T: MergeVoxel,
-    S: Shape<3, Coord = u32>,
-{
-    binary_greedy_quads_impl_inner(voxels, voxels_shape, min, max, faces, output);
-}
-
-#[cfg(feature = "profiling")]
-fn binary_greedy_quads_impl_inner<T, S>(
-    voxels: &[T],
-    voxels_shape: &S,
-    min: [u32; 3],
-    max: [u32; 3],
-    faces: &[OrientedBlockFace; 6],
-    output: &mut BinaryGreedyQuadsBuffer,
-    profile: &mut Option<BinaryGreedyPhaseProfile>,
-) where
-    T: MergeVoxel,
-    S: Shape<3, Coord = u32>,
-{
-    assert_in_bounds(voxels, voxels_shape, min, max);
-
-    if max
-        .iter()
-        .zip(min.iter())
-        .any(|(&max_axis, &min_axis)| max_axis <= min_axis + 1)
-    {
-        return;
-    }
-
-    let shape = voxels_shape.as_array();
-    let strides = shape_strides(voxels_shape, shape);
-    let interior_min = [min[0] + 1, min[1] + 1, min[2] + 1];
-    let interior_max = [max[0] - 1, max[1] - 1, max[2] - 1];
-    let interior_shape = [
-        interior_max[0] - interior_min[0] + 1,
-        interior_max[1] - interior_min[1] + 1,
-        interior_max[2] - interior_min[2] + 1,
-    ];
-    let query_shape = [
-        interior_shape[0] as usize + 2,
-        interior_shape[1] as usize + 2,
-        interior_shape[2] as usize + 2,
-    ];
-
-    for extent in interior_shape {
-        assert!(
-            extent <= 62,
-            "binary_greedy_quads supports at most 62 interior voxels per axis; got interior_shape={interior_shape:?}"
-        );
-    }
-
-    output.quads.reset();
-    let interior_start_index = coord_to_index(interior_min, strides);
-
-    let BinaryGreedyQuadsBuffer {
-        quads,
-        opaque_cols,
-        trans_cols,
-        visible_rows,
-        scan_rows,
-    } = output;
-
-    let face_axes = (*faces).map(|face| FaceAxes::new(&face));
-
-    let source_start = Instant::now();
-    reset_columns(opaque_cols, trans_cols, query_shape);
-    build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
-    if let Some(profile) = profile.as_mut() {
-        profile.source_masks += source_start.elapsed();
-    }
-
-    for i in 0..6 {
-        let axes = face_axes[i];
-        mesh_face(
-            voxels,
-            interior_min,
-            interior_shape,
-            query_shape,
-            interior_start_index,
-            strides,
-            axes,
-            &opaque_cols[axes.u_axis],
-            &trans_cols[axes.u_axis],
-            visible_rows,
-            scan_rows,
-            &mut quads.groups[i],
-            profile,
-        );
-    }
-}
-
-#[cfg(not(feature = "profiling"))]
-fn binary_greedy_quads_impl_inner<T, S>(
-    voxels: &[T],
-    voxels_shape: &S,
-    min: [u32; 3],
-    max: [u32; 3],
-    faces: &[OrientedBlockFace; 6],
-    output: &mut BinaryGreedyQuadsBuffer,
-) where
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
@@ -376,7 +214,6 @@ fn mesh_face<T>(
     visible_rows: &mut Vec<u64>,
     scan_rows: &mut Vec<u64>,
     quads: &mut Vec<UnorientedQuad>,
-    #[cfg(feature = "profiling")] profile: &mut Option<BinaryGreedyPhaseProfile>,
 ) where
     T: MergeVoxel,
 {
@@ -387,8 +224,6 @@ fn mesh_face<T>(
     let u_stride = strides[axes.u_axis];
     let v_stride = strides[axes.v_axis];
 
-    #[cfg(feature = "profiling")]
-    let visibility_start = Instant::now();
     reset_visible_rows(visible_rows, interior_rows);
     build_visible_rows(
         query_shape,
@@ -403,17 +238,11 @@ fn mesh_face<T>(
         trans_cols,
         visible_rows,
     );
-    #[cfg(feature = "profiling")]
-    if let Some(profile) = profile.as_mut() {
-        profile.visibility_masks += visibility_start.elapsed();
-    }
 
     let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
     let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
     let outer_len = interior_shape[outer_axis] as usize;
     if all_slices_unit_only(visible_rows, v_len, interior_n_len) {
-        #[cfg(feature = "profiling")]
-        let unit_emit_start = Instant::now();
         for n_local in 0..interior_n_len {
             emit_unit_slice(
                 interior_min,
@@ -426,26 +255,14 @@ fn mesh_face<T>(
                 quads,
             );
         }
-        #[cfg(feature = "profiling")]
-        if let Some(profile) = profile.as_mut() {
-            profile.unit_emit += unit_emit_start.elapsed();
-        }
         return;
     }
 
     if !scan_aligned {
-        #[cfg(feature = "profiling")]
-        let scan_start = Instant::now();
         reset_scan_rows(scan_rows, interior_n_len * outer_len);
         build_transposed_scan_rows(visible_rows, scan_rows, v_len, outer_len, interior_n_len);
-        #[cfg(feature = "profiling")]
-        if let Some(profile) = profile.as_mut() {
-            profile.scan_masks += scan_start.elapsed();
-        }
     }
 
-    #[cfg(feature = "profiling")]
-    let merge_start = Instant::now();
     if scan_aligned {
         mesh_face_aligned(
             voxels,
@@ -477,10 +294,6 @@ fn mesh_face<T>(
             scan_rows,
             quads,
         );
-    }
-    #[cfg(feature = "profiling")]
-    if let Some(profile) = profile.as_mut() {
-        profile.merge += merge_start.elapsed();
     }
 }
 
