@@ -8,6 +8,9 @@ keywords = ["graphics", "mesh", "voxel", "greedy", "binary"]
 categories = ["graphics", "rendering"]
 readme = "README.md"
 
+[features]
+profiling = []
+
 [dependencies]
 block-mesh = "0.2"
 ndshape = "0.3"
@@ -19,3 +22,7 @@ rand = "0.9"
 [[bench]]
 name = "bench"
 harness = false
+
+[[example]]
+name = "profile_phases"
+required-features = ["profiling"]

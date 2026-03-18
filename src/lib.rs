@@ -72,6 +72,8 @@ use block_mesh::{
     MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, UnorientedQuad, Voxel, VoxelVisibility,
 };
 use ndshape::Shape;
+#[cfg(feature = "profiling")]
+use std::time::{Duration, Instant};
 
 /// Reusable output and scratch storage for [`binary_greedy_quads`].
 ///
@@ -80,8 +82,8 @@ use ndshape::Shape;
 #[derive(Default)]
 pub struct BinaryGreedyQuadsBuffer {
     pub quads: QuadBuffer,
-    opaque_rows: Vec<u64>,
-    trans_rows: Vec<u64>,
+    opaque_cols: [Vec<u64>; 3],
+    trans_cols: [Vec<u64>; 3],
     visible_rows: Vec<u64>,
     scan_rows: Vec<u64>,
 }
@@ -93,6 +95,18 @@ impl BinaryGreedyQuadsBuffer {
     }
 }
 
+#[cfg(feature = "profiling")]
+#[derive(Clone, Copy, Debug, Default)]
+#[doc(hidden)]
+pub struct BinaryGreedyPhaseProfile {
+    pub source_masks: Duration,
+    pub visibility_masks: Duration,
+    pub scan_masks: Duration,
+    pub unit_emit: Duration,
+    pub merge: Duration,
+    pub total: Duration,
+}
+
 /// Generates greedy quads using a binary-mask-backed implementation.
 ///
 /// The public API mirrors [`block_mesh::greedy_quads`]. Output quads are stored
@@ -102,6 +116,176 @@ impl BinaryGreedyQuadsBuffer {
 /// axis. This corresponds to a maximum queried extent of `64` voxels on each
 /// axis including the one-voxel padding required by `block-mesh`.
 pub fn binary_greedy_quads<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    #[cfg(feature = "profiling")]
+    {
+        let _ = binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output, None);
+        return;
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    {
+        binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output);
+    }
+}
+
+#[cfg(feature = "profiling")]
+#[doc(hidden)]
+pub fn binary_greedy_quads_profile<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) -> BinaryGreedyPhaseProfile
+where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    binary_greedy_quads_impl(
+        voxels,
+        voxels_shape,
+        min,
+        max,
+        faces,
+        output,
+        Some(BinaryGreedyPhaseProfile::default()),
+    )
+}
+
+#[cfg(feature = "profiling")]
+fn binary_greedy_quads_impl<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+    mut profile: Option<BinaryGreedyPhaseProfile>,
+) -> BinaryGreedyPhaseProfile
+where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    let total_start = Instant::now();
+    binary_greedy_quads_impl_inner(voxels, voxels_shape, min, max, faces, output, &mut profile);
+    let mut result = profile.unwrap_or_default();
+    result.total = total_start.elapsed();
+    result
+}
+
+#[cfg(not(feature = "profiling"))]
+fn binary_greedy_quads_impl<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    binary_greedy_quads_impl_inner(voxels, voxels_shape, min, max, faces, output);
+}
+
+#[cfg(feature = "profiling")]
+fn binary_greedy_quads_impl_inner<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+    profile: &mut Option<BinaryGreedyPhaseProfile>,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    assert_in_bounds(voxels, voxels_shape, min, max);
+
+    if max
+        .iter()
+        .zip(min.iter())
+        .any(|(&max_axis, &min_axis)| max_axis <= min_axis + 1)
+    {
+        return;
+    }
+
+    let shape = voxels_shape.as_array();
+    let strides = shape_strides(voxels_shape, shape);
+    let interior_min = [min[0] + 1, min[1] + 1, min[2] + 1];
+    let interior_max = [max[0] - 1, max[1] - 1, max[2] - 1];
+    let interior_shape = [
+        interior_max[0] - interior_min[0] + 1,
+        interior_max[1] - interior_min[1] + 1,
+        interior_max[2] - interior_min[2] + 1,
+    ];
+    let query_shape = [
+        interior_shape[0] as usize + 2,
+        interior_shape[1] as usize + 2,
+        interior_shape[2] as usize + 2,
+    ];
+
+    for extent in interior_shape {
+        assert!(
+            extent <= 62,
+            "binary_greedy_quads supports at most 62 interior voxels per axis; got interior_shape={interior_shape:?}"
+        );
+    }
+
+    output.quads.reset();
+    let interior_start_index = coord_to_index(interior_min, strides);
+
+    let BinaryGreedyQuadsBuffer {
+        quads,
+        opaque_cols,
+        trans_cols,
+        visible_rows,
+        scan_rows,
+    } = output;
+
+    let face_axes = (*faces).map(|face| FaceAxes::new(&face));
+
+    let source_start = Instant::now();
+    reset_columns(opaque_cols, trans_cols, query_shape);
+    build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
+    if let Some(profile) = profile.as_mut() {
+        profile.source_masks += source_start.elapsed();
+    }
+
+    for i in 0..6 {
+        let axes = face_axes[i];
+        mesh_face(
+            voxels,
+            interior_min,
+            interior_shape,
+            query_shape,
+            interior_start_index,
+            strides,
+            axes,
+            &opaque_cols[axes.u_axis],
+            &trans_cols[axes.u_axis],
+            visible_rows,
+            scan_rows,
+            &mut quads.groups[i],
+            profile,
+        );
+    }
+}
+
+#[cfg(not(feature = "profiling"))]
+fn binary_greedy_quads_impl_inner<T, S>(
     voxels: &[T],
     voxels_shape: &S,
     min: [u32; 3],
@@ -131,6 +315,11 @@ pub fn binary_greedy_quads<T, S>(
         interior_max[1] - interior_min[1] + 1,
         interior_max[2] - interior_min[2] + 1,
     ];
+    let query_shape = [
+        interior_shape[0] as usize + 2,
+        interior_shape[1] as usize + 2,
+        interior_shape[2] as usize + 2,
+    ];
 
     for extent in interior_shape {
         assert!(
@@ -144,137 +333,136 @@ pub fn binary_greedy_quads<T, S>(
 
     let BinaryGreedyQuadsBuffer {
         quads,
-        opaque_rows,
-        trans_rows,
+        opaque_cols,
+        trans_cols,
         visible_rows,
         scan_rows,
     } = output;
 
     let face_axes = (*faces).map(|face| FaceAxes::new(&face));
-    let mut processed = [false; 6];
+
+    reset_columns(opaque_cols, trans_cols, query_shape);
+    build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
 
     for i in 0..6 {
-        if processed[i] {
-            continue;
-        }
-
-        prepare_face_basis(
+        let axes = face_axes[i];
+        mesh_face(
             voxels,
-            min,
-            max,
             interior_min,
             interior_shape,
+            query_shape,
+            interior_start_index,
             strides,
-            face_axes[i],
-            opaque_rows,
-            trans_rows,
+            axes,
+            &opaque_cols[axes.u_axis],
+            &trans_cols[axes.u_axis],
+            visible_rows,
+            scan_rows,
+            &mut quads.groups[i],
         );
-
-        for j in i..6 {
-            if processed[j] || !face_axes[j].same_basis(face_axes[i]) {
-                continue;
-            }
-
-            mesh_face(
-                voxels,
-                interior_min,
-                interior_shape,
-                interior_start_index,
-                strides,
-                face_axes[j],
-                opaque_rows,
-                trans_rows,
-                visible_rows,
-                scan_rows,
-                &mut quads.groups[j],
-            );
-            processed[j] = true;
-        }
     }
-}
-
-fn prepare_face_basis<T>(
-    voxels: &[T],
-    min: [u32; 3],
-    max: [u32; 3],
-    interior_min: [u32; 3],
-    interior_shape: [u32; 3],
-    strides: [usize; 3],
-    axes: FaceAxes,
-    opaque_rows: &mut Vec<u64>,
-    trans_rows: &mut Vec<u64>,
-) where
-    T: MergeVoxel,
-{
-    let u_len = interior_shape[axes.u_axis] as usize;
-    let v_len = interior_shape[axes.v_axis] as usize;
-    let query_n_len = (max[axes.n_axis] - min[axes.n_axis] + 1) as usize;
-    let source_rows = query_n_len * v_len;
-
-    reset_source_rows(opaque_rows, trans_rows, source_rows);
-
-    build_source_rows(
-        voxels,
-        min,
-        interior_min,
-        v_len,
-        u_len,
-        query_n_len,
-        strides,
-        axes,
-        opaque_rows,
-        trans_rows,
-    );
 }
 
 fn mesh_face<T>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_shape: [u32; 3],
+    query_shape: [usize; 3],
     interior_start_index: usize,
     strides: [usize; 3],
     axes: FaceAxes,
-    opaque_rows: &[u64],
-    trans_rows: &[u64],
+    opaque_cols: &[u64],
+    trans_cols: &[u64],
     visible_rows: &mut Vec<u64>,
     scan_rows: &mut Vec<u64>,
     quads: &mut Vec<UnorientedQuad>,
+    #[cfg(feature = "profiling")] profile: &mut Option<BinaryGreedyPhaseProfile>,
 ) where
     T: MergeVoxel,
 {
     let v_len = interior_shape[axes.v_axis] as usize;
+    let u_len = interior_shape[axes.u_axis] as usize;
     let interior_n_len = interior_shape[axes.n_axis] as usize;
     let interior_rows = interior_n_len * v_len;
+    let u_stride = strides[axes.u_axis];
+    let v_stride = strides[axes.v_axis];
 
+    #[cfg(feature = "profiling")]
+    let visibility_start = Instant::now();
     reset_visible_rows(visible_rows, interior_rows);
     build_visible_rows(
+        query_shape,
+        axes.u_axis,
+        u_len,
         v_len,
         interior_n_len,
         axes.n_sign,
-        opaque_rows,
-        trans_rows,
+        axes.n_axis,
+        axes.v_axis,
+        opaque_cols,
+        trans_cols,
         visible_rows,
     );
+    #[cfg(feature = "profiling")]
+    if let Some(profile) = profile.as_mut() {
+        profile.visibility_masks += visibility_start.elapsed();
+    }
 
     let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
     let outer_len = interior_shape[outer_axis] as usize;
+    let unit_only_slices = unit_only_slice_mask(visible_rows, v_len, interior_n_len);
+    let all_slices_mask = (1u64 << interior_n_len) - 1;
+
+    if unit_only_slices == all_slices_mask {
+        #[cfg(feature = "profiling")]
+        let unit_emit_start = Instant::now();
+        for n_local in 0..interior_n_len {
+            emit_unit_slice(
+                interior_min,
+                axes,
+                outer_axis,
+                inner_axis,
+                u_len,
+                interior_min[axes.n_axis] + n_local as u32,
+                &visible_rows[n_local * v_len..n_local * v_len + v_len],
+                quads,
+            );
+        }
+        #[cfg(feature = "profiling")]
+        if let Some(profile) = profile.as_mut() {
+            profile.unit_emit += unit_emit_start.elapsed();
+        }
+        return;
+    }
+
+    #[cfg(feature = "profiling")]
+    let scan_start = Instant::now();
     reset_scan_rows(scan_rows, interior_n_len * outer_len);
     build_scan_rows(
         visible_rows,
         scan_rows,
-        interior_shape,
+        v_len,
+        outer_len,
+        interior_n_len,
         axes,
         outer_axis,
         inner_axis,
     );
+    #[cfg(feature = "profiling")]
+    if let Some(profile) = profile.as_mut() {
+        profile.scan_masks += scan_start.elapsed();
+    }
 
+    #[cfg(feature = "profiling")]
+    let merge_start = Instant::now();
     for n_local in 0..interior_n_len {
         let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
         let n_coord = interior_min[axes.n_axis] + n_local as u32;
+        let slice_start = n_local * v_len;
+        let slice_rows = &mut visible_rows[slice_start..slice_start + v_len];
 
         for outer_local in 0..outer_len {
-            let scan_row_index = n_local * outer_len + outer_local;
-            let mut pending = scan_rows[scan_row_index];
+            let mut pending = scan_rows[n_local * outer_len + outer_local];
             if pending == 0 {
                 continue;
             }
@@ -296,13 +484,13 @@ fn mesh_face<T>(
                         voxels,
                         minimum,
                         row_base_index + u_local * strides[axes.u_axis],
-                        interior_shape,
-                        strides,
-                        axes,
-                        n_local,
+                        u_len,
+                        v_len,
+                        u_stride,
+                        v_stride,
                         u_local,
                         outer_local,
-                        visible_rows,
+                        slice_rows,
                         quads,
                     );
                 }
@@ -323,90 +511,148 @@ fn mesh_face<T>(
                         voxels,
                         minimum,
                         column_base_index + v_local * strides[axes.v_axis],
-                        interior_shape,
-                        strides,
-                        axes,
-                        n_local,
+                        u_len,
+                        v_len,
+                        u_stride,
+                        v_stride,
                         outer_local,
                         v_local,
-                        visible_rows,
+                        slice_rows,
                         quads,
                     );
                 }
             }
         }
     }
+    #[cfg(feature = "profiling")]
+    if let Some(profile) = profile.as_mut() {
+        profile.merge += merge_start.elapsed();
+    }
 }
 
-fn build_source_rows<T>(
+fn reset_columns(
+    opaque_cols: &mut [Vec<u64>; 3],
+    trans_cols: &mut [Vec<u64>; 3],
+    query_shape: [usize; 3],
+) {
+    for bit_axis in 0..3 {
+        let len = column_count(bit_axis, query_shape);
+        opaque_cols[bit_axis].resize(len, 0);
+        trans_cols[bit_axis].resize(len, 0);
+        opaque_cols[bit_axis].fill(0);
+        trans_cols[bit_axis].fill(0);
+    }
+}
+
+fn build_axis_columns<T>(
     voxels: &[T],
     min: [u32; 3],
-    interior_min: [u32; 3],
-    v_len: usize,
-    u_len: usize,
-    query_n_len: usize,
+    query_shape: [usize; 3],
     strides: [usize; 3],
-    axes: FaceAxes,
-    opaque_rows: &mut [u64],
-    trans_rows: &mut [u64],
+    opaque_cols: &mut [Vec<u64>; 3],
+    trans_cols: &mut [Vec<u64>; 3],
 ) where
     T: Voxel,
 {
-    let n_stride = strides[axes.n_axis];
-    let u_stride = strides[axes.u_axis];
-    let v_stride = strides[axes.v_axis];
-    let source_start_index = min[axes.n_axis] as usize * n_stride
-        + interior_min[axes.u_axis] as usize * u_stride
-        + interior_min[axes.v_axis] as usize * v_stride;
+    let base_index = coord_to_index(min, strides);
+    let qx = query_shape[0];
+    let qy = query_shape[1];
+    let qz = query_shape[2];
+    let x_stride = strides[0];
+    let y_stride = strides[1];
+    let z_stride = strides[2];
 
-    for n_local in 0..query_n_len {
-        let n_base_index = source_start_index + n_local * n_stride;
-        for v_local in 0..v_len {
-            let mut index = n_base_index + v_local * v_stride;
-            let row_index = n_local * v_len + v_local;
-            let mut opaque = 0u64;
-            let mut trans = 0u64;
+    for z in 0..qz {
+        let z_base_index = base_index + z * z_stride;
+        let z_bit = 1u64 << z;
+        let z_x_base = z * qx;
+        let z_y_base = z * qy;
 
-            for u_local in 0..u_len {
+        for y in 0..qy {
+            let mut index = z_base_index + y * y_stride;
+            let x_col_index = y + z_y_base;
+            let y_bit = 1u64 << y;
+            let z_col_row_base = y * qx;
+
+            for x in 0..qx {
                 match unsafe { voxels.get_unchecked(index) }.get_visibility() {
                     VoxelVisibility::Empty => {}
-                    VoxelVisibility::Translucent => trans |= 1u64 << u_local,
-                    VoxelVisibility::Opaque => opaque |= 1u64 << u_local,
+                    VoxelVisibility::Translucent => {
+                        trans_cols[0][x_col_index] |= 1u64 << x;
+                        trans_cols[1][x + z_x_base] |= y_bit;
+                        trans_cols[2][x + z_col_row_base] |= z_bit;
+                    }
+                    VoxelVisibility::Opaque => {
+                        opaque_cols[0][x_col_index] |= 1u64 << x;
+                        opaque_cols[1][x + z_x_base] |= y_bit;
+                        opaque_cols[2][x + z_col_row_base] |= z_bit;
+                    }
                 }
 
-                index += u_stride;
+                index += x_stride;
             }
-
-            opaque_rows[row_index] = opaque;
-            trans_rows[row_index] = trans;
         }
     }
 }
 
 fn build_visible_rows(
+    query_shape: [usize; 3],
+    u_axis: usize,
+    u_len: usize,
     v_len: usize,
     interior_n_len: usize,
     n_sign: i32,
-    opaque_rows: &[u64],
-    trans_rows: &[u64],
+    n_axis: usize,
+    v_axis: usize,
+    opaque_cols: &[u64],
+    trans_cols: &[u64],
     visible_rows: &mut [u64],
 ) {
+    let interior_u_mask = bit_mask(0, u_len);
+
     for n_local in 0..interior_n_len {
         let src_n = n_local + 1;
         let neighbour_n = if n_sign > 0 { src_n + 1 } else { src_n - 1 };
 
         for v_local in 0..v_len {
-            let src = src_n * v_len + v_local;
-            let neighbour = neighbour_n * v_len + v_local;
+            let mut coord = [0usize; 3];
+            coord[n_axis] = src_n;
+            coord[v_axis] = v_local + 1;
+            let src = column_index_from_coord(u_axis, coord, query_shape);
 
-            let src_opaque = opaque_rows[src];
-            let src_trans = trans_rows[src];
-            let neighbour_opaque = opaque_rows[neighbour];
-            let neighbour_trans = trans_rows[neighbour];
+            coord[n_axis] = neighbour_n;
+            let neighbour = column_index_from_coord(u_axis, coord, query_shape);
 
-            visible_rows[n_local * v_len + v_local] = (src_opaque & !neighbour_opaque)
+            let src_opaque = opaque_cols[src];
+            let src_trans = trans_cols[src];
+            let neighbour_opaque = opaque_cols[neighbour];
+            let neighbour_trans = trans_cols[neighbour];
+
+            let raw_visible = (src_opaque & !neighbour_opaque)
                 | (src_trans & !(neighbour_opaque | neighbour_trans));
+
+            visible_rows[n_local * v_len + v_local] = (raw_visible >> 1) & interior_u_mask;
         }
+    }
+}
+
+#[inline]
+fn column_count(bit_axis: usize, query_shape: [usize; 3]) -> usize {
+    match bit_axis {
+        0 => query_shape[1] * query_shape[2],
+        1 => query_shape[0] * query_shape[2],
+        2 => query_shape[0] * query_shape[1],
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn column_index_from_coord(bit_axis: usize, coord: [usize; 3], query_shape: [usize; 3]) -> usize {
+    match bit_axis {
+        0 => coord[1] + coord[2] * query_shape[1],
+        1 => coord[0] + coord[2] * query_shape[0],
+        2 => coord[0] + coord[1] * query_shape[0],
+        _ => unreachable!(),
     }
 }
 
@@ -414,10 +660,10 @@ fn mesh_cell<T>(
     voxels: &[T],
     minimum: [u32; 3],
     voxel_index: usize,
-    interior_shape: [u32; 3],
-    strides: [usize; 3],
-    axes: FaceAxes,
-    n_local: usize,
+    u_len: usize,
+    v_len: usize,
+    u_stride: usize,
+    v_stride: usize,
     u_local: usize,
     v_local: usize,
     visible_rows: &mut [u64],
@@ -425,15 +671,14 @@ fn mesh_cell<T>(
 ) where
     T: MergeVoxel,
 {
-    let v_len = interior_shape[axes.v_axis] as usize;
-    let row_index = n_local * v_len + v_local;
+    let row_index = v_local;
     if visible_rows[row_index] & (1u64 << u_local) == 0 {
         return;
     }
 
     let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
 
-    let max_width = interior_shape[axes.u_axis] as usize - u_local;
+    let max_width = u_len - u_local;
     let quad_width = unsafe {
         row_width_start(
             voxels,
@@ -441,15 +686,15 @@ fn mesh_cell<T>(
             u_local,
             max_width,
             voxel_index,
-            strides[axes.u_axis],
+            u_stride,
             &quad_value,
         )
     };
 
     let mut quad_height = 1usize;
-    let max_height = interior_shape[axes.v_axis] as usize - v_local;
+    let max_height = v_len - v_local;
     let mut next_row_index = row_index + 1;
-    let mut next_voxel_index = voxel_index + strides[axes.v_axis];
+    let mut next_voxel_index = voxel_index + v_stride;
 
     if quad_width == 1 {
         while quad_height < max_height {
@@ -466,7 +711,7 @@ fn mesh_cell<T>(
 
             quad_height += 1;
             next_row_index += 1;
-            next_voxel_index += strides[axes.v_axis];
+            next_voxel_index += v_stride;
         }
     } else {
         while quad_height < max_height {
@@ -477,7 +722,7 @@ fn mesh_cell<T>(
                     u_local,
                     quad_width,
                     next_voxel_index,
-                    strides[axes.u_axis],
+                    u_stride,
                     &quad_value,
                 )
             };
@@ -488,7 +733,7 @@ fn mesh_cell<T>(
 
             quad_height += 1;
             next_row_index += 1;
-            next_voxel_index += strides[axes.v_axis];
+            next_voxel_index += v_stride;
         }
     }
 
@@ -599,11 +844,6 @@ impl FaceAxes {
             n_sign: normal.signum(),
         }
     }
-
-    #[inline]
-    fn same_basis(self, other: Self) -> bool {
-        self.n_axis == other.n_axis && self.u_axis == other.u_axis && self.v_axis == other.v_axis
-    }
 }
 
 fn scan_axes(n_axis: usize) -> (usize, usize) {
@@ -623,21 +863,15 @@ fn reset_scan_rows(scan_rows: &mut Vec<u64>, len: usize) {
 fn build_scan_rows(
     visible_rows: &[u64],
     scan_rows: &mut [u64],
-    interior_shape: [u32; 3],
+    v_len: usize,
+    outer_len: usize,
+    interior_n_len: usize,
     axes: FaceAxes,
     outer_axis: usize,
     inner_axis: usize,
 ) {
-    let v_len = interior_shape[axes.v_axis] as usize;
-    let outer_len = interior_shape[outer_axis] as usize;
-    let interior_n_len = interior_shape[axes.n_axis] as usize;
-
     if outer_axis == axes.v_axis && inner_axis == axes.u_axis {
-        for n_local in 0..interior_n_len {
-            let src = &visible_rows[n_local * v_len..n_local * v_len + v_len];
-            let dst = &mut scan_rows[n_local * outer_len..n_local * outer_len + outer_len];
-            dst.copy_from_slice(src);
-        }
+        scan_rows.copy_from_slice(visible_rows);
         return;
     }
 
@@ -657,12 +891,87 @@ fn build_scan_rows(
     }
 }
 
-fn reset_source_rows(opaque_rows: &mut Vec<u64>, trans_rows: &mut Vec<u64>, source_rows: usize) {
-    opaque_rows.resize(source_rows, 0);
-    trans_rows.resize(source_rows, 0);
+#[inline]
+fn unit_only_slice_mask(visible_rows: &[u64], v_len: usize, interior_n_len: usize) -> u64 {
+    let mut unit_only_mask = 0u64;
 
-    opaque_rows.fill(0);
-    trans_rows.fill(0);
+    for n_local in 0..interior_n_len {
+        let slice_rows = &visible_rows[n_local * v_len..n_local * v_len + v_len];
+        let mut previous_row = 0u64;
+        let mut can_merge = false;
+
+        for &row in slice_rows {
+            if (row & (row >> 1)) != 0 || (row & previous_row) != 0 {
+                can_merge = true;
+                break;
+            }
+            previous_row = row;
+        }
+
+        if !can_merge {
+            unit_only_mask |= 1u64 << n_local;
+        }
+    }
+
+    unit_only_mask
+}
+
+fn emit_unit_slice(
+    interior_min: [u32; 3],
+    axes: FaceAxes,
+    outer_axis: usize,
+    inner_axis: usize,
+    u_len: usize,
+    n_coord: u32,
+    visible_rows: &[u64],
+    quads: &mut Vec<UnorientedQuad>,
+) {
+    if outer_axis == axes.v_axis && inner_axis == axes.u_axis {
+        for (v_local, &row_bits) in visible_rows.iter().enumerate() {
+            let mut bits = row_bits;
+            let v_coord = interior_min[axes.v_axis] + v_local as u32;
+
+            while bits != 0 {
+                let u_local = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+
+                let mut minimum = [0; 3];
+                minimum[axes.n_axis] = n_coord;
+                minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
+                minimum[axes.v_axis] = v_coord;
+
+                quads.push(UnorientedQuad {
+                    minimum,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        return;
+    }
+
+    debug_assert_eq!(outer_axis, axes.u_axis);
+    debug_assert_eq!(inner_axis, axes.v_axis);
+    for u_local in 0..u_len {
+        let u_bit = 1u64 << u_local;
+        let u_coord = interior_min[axes.u_axis] + u_local as u32;
+        for (v_local, &row_bits) in visible_rows.iter().enumerate() {
+            if row_bits & u_bit == 0 {
+                continue;
+            }
+
+            let mut minimum = [0; 3];
+            minimum[axes.n_axis] = n_coord;
+            minimum[axes.u_axis] = u_coord;
+            minimum[axes.v_axis] = interior_min[axes.v_axis] + v_local as u32;
+
+            quads.push(UnorientedQuad {
+                minimum,
+                width: 1,
+                height: 1,
+            });
+        }
+    }
 }
 
 fn reset_visible_rows(visible_rows: &mut Vec<u64>, interior_rows: usize) {
