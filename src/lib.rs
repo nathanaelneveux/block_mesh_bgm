@@ -279,19 +279,11 @@ fn mesh_face<T>(
         visible_rows,
     );
 
-    // Some face orientations already match the row-major bit layout, while the
-    // others are faster to scan by first transposing into `[n][u] -> bits over v`.
-    let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
-    let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
-    let outer_len = interior_shape[outer_axis] as usize;
     if unit_only {
         for n_local in 0..interior_n_len {
             emit_unit_slice(
                 interior_min,
                 axes,
-                outer_axis,
-                inner_axis,
-                u_len,
                 interior_min[axes.n_axis] + n_local as u32,
                 &visible_rows[n_local * v_len..n_local * v_len + v_len],
                 quads,
@@ -299,6 +291,12 @@ fn mesh_face<T>(
         }
         return;
     }
+
+    // Some face orientations already match the row-major bit layout, while the
+    // others are faster to scan by first transposing into `[n][u] -> bits over v`.
+    let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
+    let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
+    let outer_len = interior_shape[outer_axis] as usize;
 
     if !scan_aligned {
         reset_scan_rows(scan_rows, interior_n_len * outer_len);
@@ -701,51 +699,22 @@ fn build_transposed_scan_rows(
 fn emit_unit_slice(
     interior_min: [u32; 3],
     axes: FaceAxes,
-    outer_axis: usize,
-    inner_axis: usize,
-    u_len: usize,
     n_coord: u32,
     visible_rows: &[u64],
     quads: &mut Vec<UnorientedQuad>,
 ) {
-    if outer_axis == axes.v_axis && inner_axis == axes.u_axis {
-        for (v_local, &row_bits) in visible_rows.iter().enumerate() {
-            let mut bits = row_bits;
-            let v_coord = interior_min[axes.v_axis] + v_local as u32;
+    for (v_local, &row_bits) in visible_rows.iter().enumerate() {
+        let mut bits = row_bits;
+        let v_coord = interior_min[axes.v_axis] + v_local as u32;
 
-            while bits != 0 {
-                let u_local = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-
-                let mut minimum = [0; 3];
-                minimum[axes.n_axis] = n_coord;
-                minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
-                minimum[axes.v_axis] = v_coord;
-
-                quads.push(UnorientedQuad {
-                    minimum,
-                    width: 1,
-                    height: 1,
-                });
-            }
-        }
-        return;
-    }
-
-    debug_assert_eq!(outer_axis, axes.u_axis);
-    debug_assert_eq!(inner_axis, axes.v_axis);
-    for u_local in 0..u_len {
-        let u_bit = 1u64 << u_local;
-        let u_coord = interior_min[axes.u_axis] + u_local as u32;
-        for (v_local, &row_bits) in visible_rows.iter().enumerate() {
-            if row_bits & u_bit == 0 {
-                continue;
-            }
+        while bits != 0 {
+            let u_local = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
 
             let mut minimum = [0; 3];
             minimum[axes.n_axis] = n_coord;
-            minimum[axes.u_axis] = u_coord;
-            minimum[axes.v_axis] = interior_min[axes.v_axis] + v_local as u32;
+            minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
+            minimum[axes.v_axis] = v_coord;
 
             quads.push(UnorientedQuad {
                 minimum,
