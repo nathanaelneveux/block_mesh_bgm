@@ -46,8 +46,15 @@ struct Case {
     max: [u32; 3],
 }
 
+#[derive(Clone)]
+struct MultiCase {
+    name: &'static str,
+    chunks: Vec<Case>,
+}
+
 fn bench_meshers(c: &mut Criterion) {
     let cases = benchmark_cases();
+    let multi_cases = benchmark_multi_chunk_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
 
@@ -106,6 +113,78 @@ fn bench_meshers(c: &mut Criterion) {
                         &mut buffer,
                     );
                     black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+    }
+
+    for case in &multi_cases {
+        group.bench_with_input(
+            BenchmarkId::new("visible_block_faces", case.name),
+            case,
+            |b, case| {
+                let mut buffer = UnitQuadBuffer::new();
+                b.iter(|| {
+                    let mut total_quads = 0usize;
+                    for chunk in &case.chunks {
+                        buffer.reset();
+                        visible_block_faces(
+                            black_box(&chunk.voxels),
+                            &chunk.shape,
+                            chunk.min,
+                            chunk.max,
+                            &faces,
+                            &mut buffer,
+                        );
+                        total_quads += buffer.num_quads();
+                    }
+                    black_box(total_quads);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = GreedyQuadsBuffer::new(case.chunks[0].voxels.len());
+                b.iter(|| {
+                    let mut total_quads = 0usize;
+                    for chunk in &case.chunks {
+                        greedy_quads(
+                            black_box(&chunk.voxels),
+                            &chunk.shape,
+                            chunk.min,
+                            chunk.max,
+                            &faces,
+                            &mut buffer,
+                        );
+                        total_quads += buffer.quads.num_quads();
+                    }
+                    black_box(total_quads);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    let mut total_quads = 0usize;
+                    for chunk in &case.chunks {
+                        binary_greedy_quads(
+                            black_box(&chunk.voxels),
+                            &chunk.shape,
+                            chunk.min,
+                            chunk.max,
+                            &faces,
+                            &mut buffer,
+                        );
+                        total_quads += buffer.quads.num_quads();
+                    }
+                    black_box(total_quads);
                 });
             },
         );
@@ -201,6 +280,32 @@ fn benchmark_cases() -> Vec<Case> {
     ]
 }
 
+fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
+    vec![build_multi_chunk_case(
+        "layered-caves-2x2x2",
+        [2, 2, 2],
+        |x, y, z| {
+            let base = y <= 22;
+            let cave = hash3(x as u32, y as u32, z as u32, 23) % 100 > 24;
+            let ridge = hash3(x as u32, y as u32, z as u32, 91) % 100 > 14;
+
+            if base && cave && ridge {
+                BenchVoxel {
+                    visibility: VoxelVisibility::Opaque,
+                    material: (1 + (hash3(x as u32, y as u32, z as u32, 7) % 6)) as u8,
+                }
+            } else if y < 11 && (x & 63) < 32 {
+                BenchVoxel {
+                    visibility: VoxelVisibility::Opaque,
+                    material: 2,
+                }
+            } else {
+                BenchVoxel::default()
+            }
+        },
+    )]
+}
+
 fn build_case(
     name: &'static str,
     dims: [u32; 3],
@@ -236,6 +341,50 @@ fn build_case(
         min,
         max,
     }
+}
+
+fn build_multi_chunk_case(
+    name: &'static str,
+    grid: [u32; 3],
+    mut fill_world: impl FnMut(i32, i32, i32) -> BenchVoxel,
+) -> MultiCase {
+    let dims = [34, 34, 34];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let mut chunks = Vec::with_capacity((grid[0] * grid[1] * grid[2]) as usize);
+
+    for chunk_z in 0..grid[2] {
+        for chunk_y in 0..grid[1] {
+            for chunk_x in 0..grid[0] {
+                let world_origin = [
+                    chunk_x as i32 * 32,
+                    chunk_y as i32 * 32,
+                    chunk_z as i32 * 32,
+                ];
+                let mut voxels = Vec::with_capacity(shape.size() as usize);
+
+                for z in 0..dims[2] {
+                    for y in 0..dims[1] {
+                        for x in 0..dims[0] {
+                            let world_x = world_origin[0] + x as i32 - 1;
+                            let world_y = world_origin[1] + y as i32 - 1;
+                            let world_z = world_origin[2] + z as i32 - 1;
+                            voxels.push(fill_world(world_x, world_y, world_z));
+                        }
+                    }
+                }
+
+                chunks.push(Case {
+                    name,
+                    shape: shape.clone(),
+                    voxels,
+                    min: [0; 3],
+                    max: [33; 3],
+                });
+            }
+        }
+    }
+
+    MultiCase { name, chunks }
 }
 
 fn hash3(x: u32, y: u32, z: u32, seed: u32) -> u32 {
