@@ -14,10 +14,11 @@
 //!
 //! 1. Build three axis-specific column tables where each `u64` packs occupancy
 //!    bits along one axis of the queried extent.
-//! 2. Derive per-face visibility rows by comparing each source column with its
-//!    neighbour column in the face normal direction.
-//! 3. Arrange each face slice into scan rows, using a transposed bitset when
-//!    the face's `(u, v)` axes do not match the preferred scan order.
+//! 2. Derive face visibility rows by comparing each source column with its
+//!    neighbours in the face normal direction. Both signs of the same normal
+//!    axis are built together so the column data is only walked once.
+//! 3. Store those rows directly in the preferred scan order for the carry
+//!    merger, so no per-face transpose step is needed.
 //! 4. Carry merge lengths forward from one row to the next so compatible runs
 //!    collapse into large quads with only a small number of `merge_value()`
 //!    comparisons.
@@ -103,11 +104,13 @@ pub struct BinaryGreedyQuadsBuffer {
     opaque_cols: [Vec<u64>; 3],
     // Mirrors `opaque_cols`, but only for translucent voxels.
     trans_cols: [Vec<u64>; 3],
-    // Face-local visibility rows laid out as `[n][v] -> bits over u`.
+    // Face-local visibility rows laid out as `[n][row] -> bits over bit_axis`,
+    // where `row` and `bit_axis` are chosen per face to match the preferred
+    // merge scan order.
     visible_rows: Vec<u64>,
-    // Transposed view of `visible_rows` used when a face prefers scanning by
-    // columns instead of rows.
-    scan_rows: Vec<u64>,
+    // Second visibility buffer so both signs of the same normal axis can be
+    // built in one pass over the source columns.
+    visible_rows_alt: Vec<u64>,
     // Carry lengths used by the row-merging pass.
     carry_runs: Vec<u8>,
 }
@@ -205,11 +208,12 @@ fn binary_greedy_quads_impl<T, S>(
         opaque_cols,
         trans_cols,
         visible_rows,
-        scan_rows,
+        visible_rows_alt,
         carry_runs,
     } = output;
 
     let face_axes = (*faces).map(|face| FaceAxes::new(&face));
+    let face_indices = build_face_index_map(face_axes);
 
     // Build reusable occupancy columns for all three possible bit axes up
     // front, then derive face visibility from those compact masks.
@@ -217,129 +221,119 @@ fn binary_greedy_quads_impl<T, S>(
     let has_translucent =
         build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
 
-    for i in 0..6 {
-        let axes = face_axes[i];
-        mesh_face(
+    for n_axis in 0..3 {
+        let neg_face_index = face_indices[n_axis][0];
+        let pos_face_index = face_indices[n_axis][1];
+        let neg_axes = face_axes[neg_face_index];
+        let pos_axes = face_axes[pos_face_index];
+        let (row_axis, bit_axis) = scan_axes(n_axis);
+        let row_count = interior_shape[row_axis] as usize;
+        let bit_count = interior_shape[bit_axis] as usize;
+        let interior_n_len = interior_shape[n_axis] as usize;
+        let interior_rows = interior_n_len * row_count;
+
+        reset_visible_rows(visible_rows, interior_rows);
+        reset_visible_rows(visible_rows_alt, interior_rows);
+        let (neg_unit_only, pos_unit_only) = build_visible_row_pair(
+            query_shape,
+            bit_axis,
+            bit_count,
+            row_count,
+            interior_n_len,
+            n_axis,
+            row_axis,
+            &opaque_cols[bit_axis],
+            &trans_cols[bit_axis],
+            has_translucent,
+            visible_rows,
+            visible_rows_alt,
+        );
+
+        mesh_face_rows(
             voxels,
             interior_min,
             interior_shape,
-            query_shape,
             interior_start_index,
             strides,
-            axes,
-            &opaque_cols[axes.u_axis],
-            &trans_cols[axes.u_axis],
-            has_translucent,
             visible_rows,
-            scan_rows,
+            neg_unit_only,
+            neg_axes,
+            row_axis,
+            bit_axis,
             carry_runs,
-            &mut quads.groups[i],
+            &mut quads.groups[neg_face_index],
+        );
+        mesh_face_rows(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows_alt,
+            pos_unit_only,
+            pos_axes,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            &mut quads.groups[pos_face_index],
         );
     }
 }
 
-fn mesh_face<T>(
+fn mesh_face_rows<T>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_shape: [u32; 3],
-    query_shape: [usize; 3],
     interior_start_index: usize,
     strides: [usize; 3],
+    visible_rows: &[u64],
+    unit_only: bool,
     axes: FaceAxes,
-    opaque_cols: &[u64],
-    trans_cols: &[u64],
-    has_translucent: bool,
-    visible_rows: &mut Vec<u64>,
-    scan_rows: &mut Vec<u64>,
+    row_axis: usize,
+    bit_axis: usize,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    let v_len = interior_shape[axes.v_axis] as usize;
-    let u_len = interior_shape[axes.u_axis] as usize;
+    let row_count = interior_shape[row_axis] as usize;
+    let bit_count = interior_shape[bit_axis] as usize;
     let interior_n_len = interior_shape[axes.n_axis] as usize;
-    let interior_rows = interior_n_len * v_len;
-    let u_stride = strides[axes.u_axis];
-    let v_stride = strides[axes.v_axis];
-
-    reset_visible_rows(visible_rows, interior_rows);
-    let unit_only = build_visible_rows(
-        query_shape,
-        axes.u_axis,
-        u_len,
-        v_len,
-        interior_n_len,
-        axes.n_sign,
-        axes.n_axis,
-        axes.v_axis,
-        opaque_cols,
-        trans_cols,
-        has_translucent,
-        visible_rows,
-    );
+    let row_stride = strides[row_axis];
+    let bit_stride = strides[bit_axis];
 
     if unit_only {
         for n_local in 0..interior_n_len {
             emit_unit_slice(
                 interior_min,
                 axes,
+                row_axis,
+                bit_axis,
                 interior_min[axes.n_axis] + n_local as u32,
-                &visible_rows[n_local * v_len..n_local * v_len + v_len],
+                &visible_rows[n_local * row_count..n_local * row_count + row_count],
                 quads,
             );
         }
         return;
     }
 
-    // Some face orientations already match the row-major bit layout, while the
-    // others are faster to scan by first transposing into `[n][u] -> bits over v`.
-    let (outer_axis, inner_axis) = scan_axes(axes.n_axis);
-    let scan_aligned = outer_axis == axes.v_axis && inner_axis == axes.u_axis;
-    let outer_len = interior_shape[outer_axis] as usize;
-
-    if !scan_aligned {
-        reset_scan_rows(scan_rows, interior_n_len * outer_len);
-        build_transposed_scan_rows(visible_rows, scan_rows, v_len, outer_len, interior_n_len);
-    }
-
-    if scan_aligned {
-        mesh_face_carry(
-            voxels,
-            interior_min,
-            interior_start_index,
-            strides,
-            axes,
-            v_len,
-            u_len,
-            interior_n_len,
-            v_stride,
-            u_stride,
-            axes.v_axis,
-            axes.u_axis,
-            visible_rows,
-            carry_runs,
-            quads,
-        );
-    } else {
-        mesh_face_carry(
-            voxels,
-            interior_min,
-            interior_start_index,
-            strides,
-            axes,
-            u_len,
-            v_len,
-            interior_n_len,
-            u_stride,
-            v_stride,
-            axes.u_axis,
-            axes.v_axis,
-            scan_rows,
-            carry_runs,
-            quads,
-        );
-    }
+    mesh_face_carry(
+        voxels,
+        interior_min,
+        interior_start_index,
+        strides,
+        axes,
+        row_count,
+        bit_count,
+        interior_n_len,
+        row_stride,
+        bit_stride,
+        row_axis,
+        bit_axis,
+        visible_rows,
+        carry_runs,
+        quads,
+    );
 }
 
 fn mesh_face_carry<T>(
@@ -555,22 +549,22 @@ where
     has_translucent
 }
 
-fn build_visible_rows(
+fn build_visible_row_pair(
     query_shape: [usize; 3],
-    u_axis: usize,
-    u_len: usize,
-    v_len: usize,
+    bit_axis: usize,
+    bit_len: usize,
+    row_count: usize,
     interior_n_len: usize,
-    n_sign: i32,
     n_axis: usize,
-    v_axis: usize,
+    row_axis: usize,
     opaque_cols: &[u64],
     trans_cols: &[u64],
     has_translucent: bool,
-    visible_rows: &mut [u64],
-) -> bool {
-    let interior_u_mask = bit_mask(0, u_len);
-    let (base_offset, n_stride, v_stride) = match (u_axis, n_axis, v_axis) {
+    neg_rows: &mut [u64],
+    pos_rows: &mut [u64],
+) -> (bool, bool) {
+    let interior_bit_mask = bit_mask(0, bit_len);
+    let (base_offset, n_stride, row_stride) = match (bit_axis, n_axis, row_axis) {
         (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
         (0, 2, 1) => (1, query_shape[1], 1),
         (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
@@ -579,39 +573,52 @@ fn build_visible_rows(
         (2, 1, 0) => (1, query_shape[0], 1),
         _ => unreachable!(),
     };
-
-    let mut unit_only = true;
+    let mut neg_unit_only = true;
+    let mut pos_unit_only = true;
     for n_local in 0..interior_n_len {
         let src_n = n_local + 1;
-        let neighbour_n = if n_sign > 0 { src_n + 1 } else { src_n - 1 };
-        let row_start = n_local * v_len;
+        let neg_n = src_n - 1;
+        let pos_n = src_n + 1;
+        let row_start = n_local * row_count;
         let mut src = base_offset + src_n * n_stride;
-        let mut neighbour = base_offset + neighbour_n * n_stride;
-        let mut previous_row = 0u64;
+        let mut neg = base_offset + neg_n * n_stride;
+        let mut pos = base_offset + pos_n * n_stride;
+        let mut previous_neg = 0u64;
+        let mut previous_pos = 0u64;
 
-        for row in &mut visible_rows[row_start..row_start + v_len] {
+        for row_local in 0..row_count {
             let src_opaque = opaque_cols[src];
-            let neighbour_opaque = opaque_cols[neighbour];
-            let raw_visible = if has_translucent {
+            let neg_opaque = opaque_cols[neg];
+            let pos_opaque = opaque_cols[pos];
+            let (neg_raw_visible, pos_raw_visible) = if has_translucent {
                 let src_trans = trans_cols[src];
-                let neighbour_trans = trans_cols[neighbour];
-                (src_opaque & !neighbour_opaque)
-                    | (src_trans & !(neighbour_opaque | neighbour_trans))
+                let neg_trans = trans_cols[neg];
+                let pos_trans = trans_cols[pos];
+                (
+                    (src_opaque & !neg_opaque) | (src_trans & !(neg_opaque | neg_trans)),
+                    (src_opaque & !pos_opaque) | (src_trans & !(pos_opaque | pos_trans)),
+                )
             } else {
-                src_opaque & !neighbour_opaque
+                (src_opaque & !neg_opaque, src_opaque & !pos_opaque)
             };
 
-            let visible = (raw_visible >> 1) & interior_u_mask;
-            unit_only &= (visible & (visible >> 1)) == 0;
-            unit_only &= (visible & previous_row) == 0;
-            *row = visible;
-            previous_row = visible;
-            src += v_stride;
-            neighbour += v_stride;
+            let neg_visible = (neg_raw_visible >> 1) & interior_bit_mask;
+            let pos_visible = (pos_raw_visible >> 1) & interior_bit_mask;
+            neg_unit_only &= (neg_visible & (neg_visible >> 1)) == 0;
+            neg_unit_only &= (neg_visible & previous_neg) == 0;
+            pos_unit_only &= (pos_visible & (pos_visible >> 1)) == 0;
+            pos_unit_only &= (pos_visible & previous_pos) == 0;
+            neg_rows[row_start + row_local] = neg_visible;
+            pos_rows[row_start + row_local] = pos_visible;
+            previous_neg = neg_visible;
+            previous_pos = pos_visible;
+            src += row_stride;
+            neg += row_stride;
+            pos += row_stride;
         }
     }
 
-    unit_only
+    (neg_unit_only, pos_unit_only)
 }
 
 #[inline]
@@ -628,7 +635,6 @@ fn column_count(bit_axis: usize, query_shape: [usize; 3]) -> usize {
 struct FaceAxes {
     n_axis: usize,
     u_axis: usize,
-    v_axis: usize,
     n_sign: i32,
 }
 
@@ -644,17 +650,32 @@ impl FaceAxes {
         let u_axis = SignedAxis::from_vector(corners[1].as_ivec3() - corners[0].as_ivec3())
             .expect("axis-aligned face edge")
             .unsigned_axis();
-        let v_axis = SignedAxis::from_vector(corners[2].as_ivec3() - corners[0].as_ivec3())
+        let _v_axis = SignedAxis::from_vector(corners[2].as_ivec3() - corners[0].as_ivec3())
             .expect("axis-aligned face edge")
             .unsigned_axis();
 
         Self {
             n_axis: normal.unsigned_axis().index(),
             u_axis: u_axis.index(),
-            v_axis: v_axis.index(),
             n_sign: normal.signum(),
         }
     }
+}
+
+fn build_face_index_map(face_axes: [FaceAxes; 6]) -> [[usize; 2]; 3] {
+    let mut indices = [[usize::MAX; 2]; 3];
+
+    for (i, axes) in face_axes.into_iter().enumerate() {
+        let sign_index = if axes.n_sign < 0 { 0 } else { 1 };
+        indices[axes.n_axis][sign_index] = i;
+    }
+
+    for axis_indices in indices {
+        debug_assert!(axis_indices[0] != usize::MAX);
+        debug_assert!(axis_indices[1] != usize::MAX);
+    }
+
+    indices
 }
 
 fn scan_axes(n_axis: usize) -> (usize, usize) {
@@ -666,55 +687,27 @@ fn scan_axes(n_axis: usize) -> (usize, usize) {
     }
 }
 
-fn reset_scan_rows(scan_rows: &mut Vec<u64>, len: usize) {
-    scan_rows.resize(len, 0);
-    scan_rows.fill(0);
-}
-
-fn build_transposed_scan_rows(
-    visible_rows: &[u64],
-    scan_rows: &mut [u64],
-    v_len: usize,
-    outer_len: usize,
-    interior_n_len: usize,
-) {
-    // `visible_rows` is stored as `[n][v] -> bits over u`. Some face
-    // orientations are cheaper to scan as `[n][u] -> bits over v`, so we build
-    // that transposed view once per face instead of re-walking rows for every
-    // probe.
-    for n_local in 0..interior_n_len {
-        let src = &visible_rows[n_local * v_len..n_local * v_len + v_len];
-        let dst = &mut scan_rows[n_local * outer_len..n_local * outer_len + outer_len];
-        for (v_local, &row_bits) in src.iter().enumerate() {
-            let mut bits = row_bits;
-            while bits != 0 {
-                let u_local = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                dst[u_local] |= 1u64 << v_local;
-            }
-        }
-    }
-}
-
 fn emit_unit_slice(
     interior_min: [u32; 3],
     axes: FaceAxes,
+    row_axis: usize,
+    bit_axis: usize,
     n_coord: u32,
     visible_rows: &[u64],
     quads: &mut Vec<UnorientedQuad>,
 ) {
-    for (v_local, &row_bits) in visible_rows.iter().enumerate() {
+    for (row_local, &row_bits) in visible_rows.iter().enumerate() {
         let mut bits = row_bits;
-        let v_coord = interior_min[axes.v_axis] + v_local as u32;
+        let row_coord = interior_min[row_axis] + row_local as u32;
 
         while bits != 0 {
-            let u_local = bits.trailing_zeros() as usize;
+            let bit_local = bits.trailing_zeros() as usize;
             bits &= bits - 1;
 
             let mut minimum = [0; 3];
             minimum[axes.n_axis] = n_coord;
-            minimum[axes.u_axis] = interior_min[axes.u_axis] + u_local as u32;
-            minimum[axes.v_axis] = v_coord;
+            minimum[row_axis] = row_coord;
+            minimum[bit_axis] = interior_min[bit_axis] + bit_local as u32;
 
             quads.push(UnorientedQuad {
                 minimum,
