@@ -609,20 +609,24 @@ fn build_visible_rows(
     visible_rows: &mut [u64],
 ) {
     let interior_u_mask = bit_mask(0, u_len);
+    let (base_offset, n_stride, v_stride) = match (u_axis, n_axis, v_axis) {
+        (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
+        (0, 2, 1) => (1, query_shape[1], 1),
+        (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
+        (1, 2, 0) => (1, query_shape[0], 1),
+        (2, 0, 1) => (query_shape[0], 1, query_shape[0]),
+        (2, 1, 0) => (1, query_shape[0], 1),
+        _ => unreachable!(),
+    };
 
     for n_local in 0..interior_n_len {
         let src_n = n_local + 1;
         let neighbour_n = if n_sign > 0 { src_n + 1 } else { src_n - 1 };
+        let row_start = n_local * v_len;
+        let mut src = base_offset + src_n * n_stride;
+        let mut neighbour = base_offset + neighbour_n * n_stride;
 
-        for v_local in 0..v_len {
-            let mut coord = [0usize; 3];
-            coord[n_axis] = src_n;
-            coord[v_axis] = v_local + 1;
-            let src = column_index_from_coord(u_axis, coord, query_shape);
-
-            coord[n_axis] = neighbour_n;
-            let neighbour = column_index_from_coord(u_axis, coord, query_shape);
-
+        for row in &mut visible_rows[row_start..row_start + v_len] {
             let src_opaque = opaque_cols[src];
             let src_trans = trans_cols[src];
             let neighbour_opaque = opaque_cols[neighbour];
@@ -631,7 +635,9 @@ fn build_visible_rows(
             let raw_visible = (src_opaque & !neighbour_opaque)
                 | (src_trans & !(neighbour_opaque | neighbour_trans));
 
-            visible_rows[n_local * v_len + v_local] = (raw_visible >> 1) & interior_u_mask;
+            *row = (raw_visible >> 1) & interior_u_mask;
+            src += v_stride;
+            neighbour += v_stride;
         }
     }
 }
@@ -642,16 +648,6 @@ fn column_count(bit_axis: usize, query_shape: [usize; 3]) -> usize {
         0 => query_shape[1] * query_shape[2],
         1 => query_shape[0] * query_shape[2],
         2 => query_shape[0] * query_shape[1],
-        _ => unreachable!(),
-    }
-}
-
-#[inline]
-fn column_index_from_coord(bit_axis: usize, coord: [usize; 3], query_shape: [usize; 3]) -> usize {
-    match bit_axis {
-        0 => coord[1] + coord[2] * query_shape[1],
-        1 => coord[0] + coord[2] * query_shape[0],
-        2 => coord[0] + coord[1] * query_shape[0],
         _ => unreachable!(),
     }
 }
