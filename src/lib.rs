@@ -599,6 +599,8 @@ fn build_axis_columns<T>(
 where
     T: Voxel,
 {
+    let [opaque_x_cols, opaque_y_cols, opaque_z_cols] = opaque_cols;
+    let [trans_x_cols, trans_y_cols, trans_z_cols] = trans_cols;
     let base_index = coord_to_index(min, strides);
     let qx = query_shape[0];
     let qy = query_shape[1];
@@ -613,32 +615,46 @@ where
         let z_bit = 1u64 << z;
         let z_x_base = z * qx;
         let z_y_base = z * qy;
+        let mut opaque_y_plane = [0u64; 64];
+        let mut trans_y_plane = [0u64; 64];
 
         for y in 0..qy {
             let mut index = z_base_index + y * y_stride;
             let x_col_index = y + z_y_base;
             let y_bit = 1u64 << y;
             let z_col_row_base = y * qx;
+            let opaque_z_row = &mut opaque_z_cols[z_col_row_base..z_col_row_base + qx];
+            let trans_z_row = &mut trans_z_cols[z_col_row_base..z_col_row_base + qx];
+            let mut opaque_x_mask = 0u64;
+            let mut trans_x_mask = 0u64;
+            let mut x_bit = 1u64;
 
             for x in 0..qx {
                 match unsafe { voxels.get_unchecked(index) }.get_visibility() {
                     VoxelVisibility::Empty => {}
                     VoxelVisibility::Translucent => {
                         has_translucent = true;
-                        trans_cols[0][x_col_index] |= 1u64 << x;
-                        trans_cols[1][x + z_x_base] |= y_bit;
-                        trans_cols[2][x + z_col_row_base] |= z_bit;
+                        trans_x_mask |= x_bit;
+                        trans_y_plane[x] |= y_bit;
+                        trans_z_row[x] |= z_bit;
                     }
                     VoxelVisibility::Opaque => {
-                        opaque_cols[0][x_col_index] |= 1u64 << x;
-                        opaque_cols[1][x + z_x_base] |= y_bit;
-                        opaque_cols[2][x + z_col_row_base] |= z_bit;
+                        opaque_x_mask |= x_bit;
+                        opaque_y_plane[x] |= y_bit;
+                        opaque_z_row[x] |= z_bit;
                     }
                 }
 
                 index += x_stride;
+                x_bit <<= 1;
             }
+
+            opaque_x_cols[x_col_index] = opaque_x_mask;
+            trans_x_cols[x_col_index] = trans_x_mask;
         }
+
+        opaque_y_cols[z_x_base..z_x_base + qx].copy_from_slice(&opaque_y_plane[..qx]);
+        trans_y_cols[z_x_base..z_x_base + qx].copy_from_slice(&trans_y_plane[..qx]);
     }
 
     has_translucent
