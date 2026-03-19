@@ -1,4 +1,11 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -19,15 +26,22 @@ use bevy_voxel_world::{
     prelude::*,
     rendering::ATTRIBUTE_TEX_INDEX,
 };
-use block_mesh::RIGHT_HANDED_Y_UP_CONFIG;
+use block_mesh::{
+    greedy_quads, visible_block_faces, GreedyQuadsBuffer, OrientedBlockFace, QuadBuffer,
+    UnitQuadBuffer, UnorientedQuad, RIGHT_HANDED_Y_UP_CONFIG,
+};
 use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
 
+const PADDED_CHUNK_EDGE: usize = CHUNK_SIZE_U as usize + 2;
+const PADDED_CHUNK_LEN: usize = PADDED_CHUNK_EDGE * PADDED_CHUNK_EDGE * PADDED_CHUNK_EDGE;
+
 thread_local! {
-    // Meshing runs on Bevy's async worker pool, so keep one scratch buffer per
-    // worker thread and reuse its allocations across chunk jobs.
-    static MESH_BUFFER: RefCell<BinaryGreedyQuadsBuffer> =
+    static SIMPLE_BUFFER: RefCell<UnitQuadBuffer> = RefCell::new(UnitQuadBuffer::new());
+    static GREEDY_BUFFER: RefCell<GreedyQuadsBuffer> =
+        RefCell::new(GreedyQuadsBuffer::new(PADDED_CHUNK_LEN));
+    static BINARY_BUFFER: RefCell<BinaryGreedyQuadsBuffer> =
         RefCell::new(BinaryGreedyQuadsBuffer::new());
 }
 
@@ -37,8 +51,133 @@ struct ColumnSample {
     surface_y: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MeshingAlgorithm {
+    VisibleFaces,
+    GreedyQuads,
+    #[default]
+    BinaryGreedyQuads,
+}
+
+impl MeshingAlgorithm {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::VisibleFaces => 0,
+            Self::GreedyQuads => 1,
+            Self::BinaryGreedyQuads => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::VisibleFaces,
+            1 => Self::GreedyQuads,
+            _ => Self::BinaryGreedyQuads,
+        }
+    }
+
+    fn from_input(keyboard: &ButtonInput<KeyCode>) -> Option<Self> {
+        if keyboard.just_pressed(KeyCode::Digit1) {
+            Some(Self::VisibleFaces)
+        } else if keyboard.just_pressed(KeyCode::Digit2) {
+            Some(Self::GreedyQuads)
+        } else if keyboard.just_pressed(KeyCode::Digit3) {
+            Some(Self::BinaryGreedyQuads)
+        } else {
+            None
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::VisibleFaces => "visible faces",
+            Self::GreedyQuads => "greedy quads",
+            Self::BinaryGreedyQuads => "binary greedy quads",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MeshingSharedState {
+    algorithm: Arc<AtomicU8>,
+    timing_generation: Arc<AtomicU64>,
+    total_nanos: Arc<AtomicU64>,
+    sample_count: Arc<AtomicU64>,
+}
+
+impl Default for MeshingSharedState {
+    fn default() -> Self {
+        Self {
+            algorithm: Arc::new(AtomicU8::new(MeshingAlgorithm::default().as_u8())),
+            timing_generation: Arc::new(AtomicU64::new(0)),
+            total_nanos: Arc::new(AtomicU64::new(0)),
+            sample_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl MeshingSharedState {
+    fn algorithm(&self) -> MeshingAlgorithm {
+        MeshingAlgorithm::from_u8(self.algorithm.load(Ordering::Acquire))
+    }
+
+    fn timing_generation(&self) -> u64 {
+        self.timing_generation.load(Ordering::Acquire)
+    }
+
+    fn select_algorithm(&self, algorithm: MeshingAlgorithm) -> bool {
+        let previous = self.algorithm.swap(algorithm.as_u8(), Ordering::AcqRel);
+        if previous == algorithm.as_u8() {
+            return false;
+        }
+
+        self.timing_generation.fetch_add(1, Ordering::AcqRel);
+        self.total_nanos.store(0, Ordering::Release);
+        self.sample_count.store(0, Ordering::Release);
+        true
+    }
+
+    fn record_sample(&self, generation: u64, elapsed: Duration) {
+        if self.timing_generation() != generation {
+            return;
+        }
+
+        let elapsed_nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.total_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.sample_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> MeshingTimingSnapshot {
+        let algorithm = self.algorithm();
+        let sample_count = self.sample_count.load(Ordering::Acquire);
+        let total_nanos = self.total_nanos.load(Ordering::Acquire);
+        let average = if sample_count == 0 {
+            None
+        } else {
+            Some(Duration::from_nanos(total_nanos / sample_count))
+        };
+
+        MeshingTimingSnapshot {
+            algorithm,
+            sample_count,
+            average,
+        }
+    }
+}
+
+struct MeshingTimingSnapshot {
+    algorithm: MeshingAlgorithm,
+    sample_count: u64,
+    average: Option<Duration>,
+}
+
 #[derive(Resource, Clone, Default)]
-struct MainWorld;
+struct MainWorld {
+    meshing: MeshingSharedState,
+}
+
+#[derive(Component)]
+struct OverlayText;
 
 impl VoxelWorldConfig for MainWorld {
     type MaterialIndex = u8;
@@ -65,105 +204,188 @@ impl VoxelWorldConfig for MainWorld {
     fn chunk_meshing_delegate(
         &self,
     ) -> ChunkMeshingDelegate<Self::MaterialIndex, Self::ChunkUserBundle> {
+        let meshing = self.meshing.clone();
         Some(Box::new(
-            |_pos: IVec3, _lod, _data_shape, _mesh_shape, _previous| {
+            move |_pos: IVec3, _lod, _data_shape, _mesh_shape, _previous| {
+                let meshing = meshing.clone();
                 Box::new(
-                    |voxels: VoxelArray<Self::MaterialIndex>,
-                     _data_shape_in: UVec3,
-                     _mesh_shape_in: UVec3,
-                     texture_index_mapper: TextureIndexMapperFn<Self::MaterialIndex>| {
-                        let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
-                        let (num_vertices, indices, positions, normals, tex_coords, material_types) =
-                            MESH_BUFFER.with(|buffer| {
-                                let mut buffer = buffer.borrow_mut();
+                    move |voxels: VoxelArray<Self::MaterialIndex>,
+                          _data_shape_in: UVec3,
+                          _mesh_shape_in: UVec3,
+                          texture_index_mapper: TextureIndexMapperFn<Self::MaterialIndex>| {
+                        let algorithm = meshing.algorithm();
+                        let generation = meshing.timing_generation();
+                        let start = Instant::now();
 
-                                binary_greedy_quads(
-                                    &voxels,
-                                    &PaddedChunkShape {},
-                                    [0; 3],
-                                    [CHUNK_SIZE_U + 1; 3],
-                                    &faces,
-                                    &mut buffer,
-                                );
+                        let render_mesh =
+                            mesh_chunk(algorithm, &voxels, &texture_index_mapper);
 
-                                let num_indices = buffer.quads.num_quads() * 6;
-                                let num_vertices = buffer.quads.num_quads() * 4;
-                                let mut indices = Vec::with_capacity(num_indices);
-                                let mut positions = Vec::with_capacity(num_vertices);
-                                let mut normals = Vec::with_capacity(num_vertices);
-                                let mut tex_coords = Vec::with_capacity(num_vertices);
-                                let mut material_types = Vec::with_capacity(num_vertices);
-
-                                for (group, face) in
-                                    buffer.quads.groups.iter().zip(faces.iter().copied())
-                                {
-                                    for quad in group {
-                                        indices.extend_from_slice(
-                                            &face.quad_mesh_indices(positions.len() as u32),
-                                        );
-                                        positions.extend_from_slice(
-                                            &face.quad_mesh_positions(quad, 1.0),
-                                        );
-                                        normals.extend_from_slice(&face.quad_mesh_normals());
-                                        tex_coords.extend_from_slice(&face.tex_coords(
-                                            RIGHT_HANDED_Y_UP_CONFIG.u_flip_face,
-                                            true,
-                                            quad,
-                                        ));
-
-                                        let voxel_index =
-                                            PaddedChunkShape::linearize(quad.minimum) as usize;
-                                        let material_type = match voxels[voxel_index] {
-                                            WorldVoxel::Solid(mat) => texture_index_mapper(mat),
-                                            _ => [0, 0, 0],
-                                        };
-                                        material_types
-                                            .extend(std::iter::repeat_n(material_type, 4));
-                                    }
-                                }
-
-                                (
-                                    num_vertices,
-                                    indices,
-                                    positions,
-                                    normals,
-                                    tex_coords,
-                                    material_types,
-                                )
-                            });
-
-                        let mut render_mesh = Mesh::new(
-                            PrimitiveTopology::TriangleList,
-                            RenderAssetUsages::RENDER_WORLD,
-                        );
-                        render_mesh.insert_attribute(
-                            Mesh::ATTRIBUTE_POSITION,
-                            VertexAttributeValues::Float32x3(positions),
-                        );
-                        render_mesh.insert_attribute(
-                            Mesh::ATTRIBUTE_NORMAL,
-                            VertexAttributeValues::Float32x3(normals),
-                        );
-                        render_mesh.insert_attribute(
-                            Mesh::ATTRIBUTE_UV_0,
-                            VertexAttributeValues::Float32x2(tex_coords),
-                        );
-                        render_mesh.insert_attribute(
-                            ATTRIBUTE_TEX_INDEX,
-                            VertexAttributeValues::Uint32x3(material_types),
-                        );
-                        render_mesh.insert_attribute(
-                            Mesh::ATTRIBUTE_COLOR,
-                            vec![[1.0; 4]; num_vertices],
-                        );
-                        render_mesh.insert_indices(Indices::U32(indices));
-
+                        meshing.record_sample(generation, start.elapsed());
                         (render_mesh, None)
                     },
                 )
             },
         ))
     }
+}
+
+struct RenderMeshBuffers {
+    indices: Vec<u32>,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    tex_coords: Vec<[f32; 2]>,
+    material_types: Vec<[u32; 3]>,
+}
+
+impl RenderMeshBuffers {
+    fn with_quad_capacity(num_quads: usize) -> Self {
+        let num_indices = num_quads * 6;
+        let num_vertices = num_quads * 4;
+        Self {
+            indices: Vec::with_capacity(num_indices),
+            positions: Vec::with_capacity(num_vertices),
+            normals: Vec::with_capacity(num_vertices),
+            tex_coords: Vec::with_capacity(num_vertices),
+            material_types: Vec::with_capacity(num_vertices),
+        }
+    }
+
+    fn append_quad(
+        &mut self,
+        face: OrientedBlockFace,
+        quad: &UnorientedQuad,
+        voxels: &[WorldVoxel<u8>],
+        texture_index_mapper: &TextureIndexMapperFn<u8>,
+    ) {
+        self.indices
+            .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
+        self.positions
+            .extend_from_slice(&face.quad_mesh_positions(quad, 1.0));
+        self.normals.extend_from_slice(&face.quad_mesh_normals());
+        self.tex_coords.extend_from_slice(&face.tex_coords(
+            RIGHT_HANDED_Y_UP_CONFIG.u_flip_face,
+            true,
+            quad,
+        ));
+
+        let voxel_index = PaddedChunkShape::linearize(quad.minimum) as usize;
+        let material_type = match voxels[voxel_index] {
+            WorldVoxel::Solid(mat) => (*texture_index_mapper)(mat),
+            _ => [0, 0, 0],
+        };
+        self.material_types
+            .extend(std::iter::repeat_n(material_type, 4));
+    }
+
+    fn build(self) -> Mesh {
+        let num_vertices = self.positions.len();
+        let mut render_mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        render_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            VertexAttributeValues::Float32x3(self.positions),
+        );
+        render_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            VertexAttributeValues::Float32x3(self.normals),
+        );
+        render_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            VertexAttributeValues::Float32x2(self.tex_coords),
+        );
+        render_mesh.insert_attribute(
+            ATTRIBUTE_TEX_INDEX,
+            VertexAttributeValues::Uint32x3(self.material_types),
+        );
+        render_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0; 4]; num_vertices]);
+        render_mesh.insert_indices(Indices::U32(self.indices));
+        render_mesh
+    }
+}
+
+fn mesh_chunk(
+    algorithm: MeshingAlgorithm,
+    voxels: &[WorldVoxel<u8>],
+    texture_index_mapper: &TextureIndexMapperFn<u8>,
+) -> Mesh {
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+
+    match algorithm {
+        MeshingAlgorithm::VisibleFaces => SIMPLE_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            buffer.reset();
+            visible_block_faces(
+                voxels,
+                &PaddedChunkShape {},
+                [0; 3],
+                [CHUNK_SIZE_U + 1; 3],
+                &faces,
+                &mut buffer,
+            );
+            build_mesh_from_unit_quad_buffer(&buffer, &faces, voxels, texture_index_mapper)
+        }),
+        MeshingAlgorithm::GreedyQuads => GREEDY_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            greedy_quads(
+                voxels,
+                &PaddedChunkShape {},
+                [0; 3],
+                [CHUNK_SIZE_U + 1; 3],
+                &faces,
+                &mut buffer,
+            );
+            build_mesh_from_quad_buffer(&buffer.quads, &faces, voxels, texture_index_mapper)
+        }),
+        MeshingAlgorithm::BinaryGreedyQuads => BINARY_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            binary_greedy_quads(
+                voxels,
+                &PaddedChunkShape {},
+                [0; 3],
+                [CHUNK_SIZE_U + 1; 3],
+                &faces,
+                &mut buffer,
+            );
+            build_mesh_from_quad_buffer(&buffer.quads, &faces, voxels, texture_index_mapper)
+        }),
+    }
+}
+
+fn build_mesh_from_unit_quad_buffer(
+    buffer: &UnitQuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    voxels: &[WorldVoxel<u8>],
+    texture_index_mapper: &TextureIndexMapperFn<u8>,
+) -> Mesh {
+    let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
+
+    for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
+        for quad in group {
+            let quad: UnorientedQuad = (*quad).into();
+            mesh.append_quad(face, &quad, voxels, texture_index_mapper);
+        }
+    }
+
+    mesh.build()
+}
+
+fn build_mesh_from_quad_buffer(
+    buffer: &QuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    voxels: &[WorldVoxel<u8>],
+    texture_index_mapper: &TextureIndexMapperFn<u8>,
+) -> Mesh {
+    let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
+
+    for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
+        for quad in group {
+            mesh.append_quad(face, quad, voxels, texture_index_mapper);
+        }
+    }
+
+    mesh.build()
 }
 
 fn main() {
@@ -178,18 +400,30 @@ fn main() {
             }),
             WireframePlugin::default(),
         ))
-        .add_plugins(VoxelWorldPlugin::with_config(MainWorld))
+        .add_plugins(VoxelWorldPlugin::with_config(MainWorld::default()))
         .insert_resource(WireframeConfig {
             global: true,
             default_color: WHITE.into(),
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, move_camera)
+        .add_systems(
+            Update,
+            (
+                (switch_meshing_algorithm, update_overlay).chain(),
+                move_camera,
+            ),
+        )
         .run();
 }
 
 fn setup(mut commands: Commands) {
-    info!("bevy_voxel_world custom meshing example using binary greedy meshing");
+    info!("bevy_voxel_world custom meshing example");
+    info!("Press 1 for visible faces, 2 for greedy quads, 3 for binary greedy quads.");
+    info!("Switching the mesher resets average timing and respawns the loaded chunks.");
+    info!(
+        "Initial meshing algorithm: {}",
+        MeshingAlgorithm::default().label()
+    );
 
     commands.spawn((
         Camera3d::default(),
@@ -213,6 +447,73 @@ fn setup(mut commands: Commands) {
         brightness: 100.0,
         affects_lightmapped_meshes: true,
     });
+
+    spawn_overlay(&mut commands);
+}
+
+fn spawn_overlay(commands: &mut Commands) {
+    commands.spawn((
+        OverlayText,
+        Text::new(""),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(12.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+    ));
+}
+
+fn update_overlay(mut overlay: Query<&mut Text, With<OverlayText>>, world: Res<MainWorld>) {
+    let snapshot = world.meshing.snapshot();
+    let average_text = match snapshot.average {
+        Some(average) => format!(
+            "{:.3} ms over {} chunk meshes",
+            average.as_secs_f64() * 1_000.0,
+            snapshot.sample_count,
+        ),
+        None => "waiting for chunk meshes".to_owned(),
+    };
+
+    if let Ok(mut text) = overlay.single_mut() {
+        *text = Text::new(format!(
+            "Custom meshing comparison\n\
+             1: visible faces\n\
+             2: greedy quads\n\
+             3: binary greedy quads\n\
+             Current: {}\n\
+             Average meshing time: {}\n\
+             Switching clears the average and respawns loaded chunks.",
+            snapshot.algorithm.label(),
+            average_text,
+        ));
+    }
+}
+
+fn switch_meshing_algorithm(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    world: Res<MainWorld>,
+    mut commands: Commands,
+    chunks: Query<Entity, (With<Chunk<MainWorld>>, Without<NeedsDespawn>)>,
+) {
+    let Some(next_algorithm) = MeshingAlgorithm::from_input(&keyboard) else {
+        return;
+    };
+
+    if !world.meshing.select_algorithm(next_algorithm) {
+        return;
+    }
+
+    let mut chunk_count = 0usize;
+    for entity in &chunks {
+        commands.entity(entity).try_insert(NeedsDespawn);
+        chunk_count += 1;
+    }
+
+    info!(
+        "Meshing algorithm: {} (respawning {chunk_count} loaded chunks)",
+        next_algorithm.label(),
+    );
 }
 
 fn get_voxel_fn() -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
