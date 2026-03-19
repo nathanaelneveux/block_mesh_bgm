@@ -460,8 +460,8 @@ fn mesh_face_carry<T>(
         let slice_rows = &rows[slice_start..slice_start + row_count];
 
         for outer_local in 0..row_count {
-            let mut bits_here = slice_rows[outer_local];
-            if bits_here == 0 {
+            let row_bits = slice_rows[outer_local];
+            if row_bits == 0 {
                 continue;
             }
 
@@ -471,9 +471,11 @@ fn mesh_face_carry<T>(
                 0
             };
             let row_base_index = n_index_base + outer_local * row_stride;
+            let mut continue_mask = 0u64;
+            let mut overlapping_bits = row_bits & bits_next;
 
-            while bits_here != 0 {
-                let bit_local = bits_here.trailing_zeros() as usize;
+            while overlapping_bits != 0 {
+                let bit_local = overlapping_bits.trailing_zeros() as usize;
                 let bit = 1u64 << bit_local;
                 let voxel_index = row_base_index + bit_local * bit_stride;
                 let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
@@ -481,10 +483,24 @@ fn mesh_face_carry<T>(
                 if unsafe {
                     row_bit_continues(voxels, bits_next, bit, voxel_index, row_stride, &quad_value)
                 } {
-                    carry_runs[bit_local] += 1;
-                    bits_here &= !bit;
-                    continue;
+                    continue_mask |= bit;
                 }
+
+                overlapping_bits &= overlapping_bits - 1;
+            }
+
+            let mut continuing_bits = continue_mask;
+            while continuing_bits != 0 {
+                let bit_local = continuing_bits.trailing_zeros() as usize;
+                carry_runs[bit_local] += 1;
+                continuing_bits &= continuing_bits - 1;
+            }
+
+            let mut bits_here = row_bits & !continue_mask;
+            while bits_here != 0 {
+                let bit_local = bits_here.trailing_zeros() as usize;
+                let voxel_index = row_base_index + bit_local * bit_stride;
+                let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
 
                 let run_length = carry_runs[bit_local] as usize + 1;
                 let mut run_width = 1usize;
@@ -503,19 +519,6 @@ fn mesh_face_carry<T>(
                         .merge_value()
                         .ne(&quad_value)
                     {
-                        break;
-                    }
-
-                    if unsafe {
-                        row_bit_continues(
-                            voxels,
-                            bits_next,
-                            next_bit,
-                            next_index,
-                            row_stride,
-                            &quad_value,
-                        )
-                    } {
                         break;
                     }
 
