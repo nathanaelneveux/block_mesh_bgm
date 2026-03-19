@@ -95,6 +95,9 @@ fn profile_case(
         totals.visible_rows += timings.visible_rows;
         totals.unit_quads += timings.unit_quads;
         totals.carry_merge += timings.carry_merge;
+        totals.carry_continue_mask += timings.carry_continue_mask;
+        totals.carry_continue_bump += timings.carry_continue_bump;
+        totals.carry_end_rows += timings.carry_end_rows;
     }
 
     format_stage_report(case.name, iterations, wall, totals)
@@ -126,6 +129,9 @@ fn profile_multi_case(
             totals.visible_rows += timings.visible_rows;
             totals.unit_quads += timings.unit_quads;
             totals.carry_merge += timings.carry_merge;
+            totals.carry_continue_mask += timings.carry_continue_mask;
+            totals.carry_continue_bump += timings.carry_continue_bump;
+            totals.carry_end_rows += timings.carry_end_rows;
         }
         wall += start.elapsed();
     }
@@ -145,10 +151,13 @@ fn format_stage_report(
     let avg_visible_ns = totals.visible_rows.as_nanos() / iterations as u128;
     let avg_unit_ns = totals.unit_quads.as_nanos() / iterations as u128;
     let avg_carry_ns = totals.carry_merge.as_nanos() / iterations as u128;
+    let avg_carry_continue_mask_ns = totals.carry_continue_mask.as_nanos() / iterations as u128;
+    let avg_carry_continue_bump_ns = totals.carry_continue_bump.as_nanos() / iterations as u128;
+    let avg_carry_end_rows_ns = totals.carry_end_rows.as_nanos() / iterations as u128;
     let avg_stage_ns = (stage_total.as_nanos() / iterations as u128).max(1);
 
     format!(
-        "{name}: wall={:.1}us staged={:.1}% columns={:.1}% visible={:.1}% unit={:.1}% carry={:.1}% avg=[{:.1}us, {:.1}us, {:.1}us, {:.1}us]",
+        "{name}: wall={:.1}us staged={:.1}% columns={:.1}% visible={:.1}% unit={:.1}% carry={:.1}% avg=[{:.1}us, {:.1}us, {:.1}us, {:.1}us] carry_detail=[mask {:.1}%, bump {:.1}%, end_rows {:.1}%]",
         avg_wall_ns as f64 / 1_000.0,
         avg_stage_ns as f64 * 100.0 / avg_wall_ns.max(1) as f64,
         avg_columns_ns as f64 * 100.0 / avg_stage_ns as f64,
@@ -159,6 +168,9 @@ fn format_stage_report(
         avg_visible_ns as f64 / 1_000.0,
         avg_unit_ns as f64 / 1_000.0,
         avg_carry_ns as f64 / 1_000.0,
+        avg_carry_continue_mask_ns as f64 * 100.0 / avg_carry_ns.max(1) as f64,
+        avg_carry_continue_bump_ns as f64 * 100.0 / avg_carry_ns.max(1) as f64,
+        avg_carry_end_rows_ns as f64 * 100.0 / avg_carry_ns.max(1) as f64,
     )
 }
 

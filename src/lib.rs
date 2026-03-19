@@ -130,6 +130,9 @@ pub struct BinaryGreedyStageTimings {
     pub visible_rows: std::time::Duration,
     pub unit_quads: std::time::Duration,
     pub carry_merge: std::time::Duration,
+    pub carry_continue_mask: std::time::Duration,
+    pub carry_continue_bump: std::time::Duration,
+    pub carry_end_rows: std::time::Duration,
 }
 
 impl BinaryGreedyStageTimings {
@@ -513,7 +516,7 @@ fn mesh_face_rows_impl<T, const PROFILE: bool, const N_AXIS: usize, const BIT_IS
     } else {
         None
     };
-    mesh_face_carry::<T, N_AXIS, BIT_IS_U>(
+    mesh_face_carry::<T, PROFILE, N_AXIS, BIT_IS_U>(
         voxels,
         interior_min,
         interior_start_index,
@@ -528,13 +531,14 @@ fn mesh_face_rows_impl<T, const PROFILE: bool, const N_AXIS: usize, const BIT_IS
         visible_rows,
         carry_runs,
         quads,
+        timings,
     );
     if let Some(start) = start {
         timings.carry_merge += start.elapsed();
     }
 }
 
-fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+fn mesh_face_carry<T, const PROFILE: bool, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_start_index: usize,
@@ -549,6 +553,7 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     rows: &[u64],
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
+    timings: &mut BinaryGreedyStageTimings,
 ) where
     T: MergeVoxel,
 {
@@ -578,6 +583,11 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
             let row_base_index = n_index_base + outer_local * row_stride;
             let mut continue_mask = 0u64;
             let mut overlapping_bits = row_bits & bits_next;
+            let continue_mask_start = if PROFILE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             while overlapping_bits != 0 {
                 let bit_local = overlapping_bits.trailing_zeros() as usize;
@@ -589,19 +599,26 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                     row_bit_continues(voxels, bits_next, bit, voxel_index, row_stride, &quad_value)
                 } {
                     continue_mask |= bit;
+                    carry_runs[bit_local] += 1;
                 }
 
                 overlapping_bits &= overlapping_bits - 1;
             }
-
-            let mut continuing_bits = continue_mask;
-            while continuing_bits != 0 {
-                let bit_local = continuing_bits.trailing_zeros() as usize;
-                carry_runs[bit_local] += 1;
-                continuing_bits &= continuing_bits - 1;
+            if let Some(start) = continue_mask_start {
+                timings.carry_continue_mask += start.elapsed();
             }
 
             let mut bits_here = row_bits & !continue_mask;
+            let row_max_quads = bits_here.count_ones() as usize;
+            let base_len = quads.len();
+            quads.reserve(row_max_quads);
+            let spare = quads.spare_capacity_mut();
+            let mut written = 0usize;
+            let end_rows_start = if PROFILE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             while bits_here != 0 {
                 let bit_local = bits_here.trailing_zeros() as usize;
                 let voxel_index = row_base_index + bit_local * bit_stride;
@@ -636,16 +653,23 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                 let start_outer = outer_local - carry_runs[bit_local] as usize;
                 let outer_coord = outer_base + start_outer as u32;
                 let bit_coord = bit_base + bit_local as u32;
-                push_quad::<N_AXIS, BIT_IS_U>(
-                    quads,
+                write_quad::<N_AXIS, BIT_IS_U>(
+                    &mut spare[written],
                     n_coord,
                     outer_coord,
                     bit_coord,
                     run_width as u32,
                     run_length as u32,
                 );
+                written += 1;
 
                 carry_runs[bit_local] = 0;
+            }
+            unsafe {
+                quads.set_len(base_len + written);
+            }
+            if let Some(start) = end_rows_start {
+                timings.carry_end_rows += start.elapsed();
             }
         }
     }
@@ -938,8 +962,8 @@ fn emit_unit_slice<const N_AXIS: usize>(
 }
 
 #[inline(always)]
-fn push_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
-    quads: &mut Vec<UnorientedQuad>,
+fn write_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
+    quad: &mut std::mem::MaybeUninit<UnorientedQuad>,
     n_coord: u32,
     outer_coord: u32,
     bit_coord: u32,
@@ -958,7 +982,7 @@ fn push_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
         (run_length, run_width)
     };
 
-    quads.push(UnorientedQuad {
+    quad.write(UnorientedQuad {
         minimum,
         width,
         height,
