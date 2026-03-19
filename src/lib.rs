@@ -375,9 +375,114 @@ fn mesh_face_rows<T, const PROFILE: bool>(
 ) where
     T: MergeVoxel,
 {
+    match (axes.n_axis, bit_axis == axes.u_axis) {
+        (0, false) => mesh_face_rows_impl::<T, PROFILE, 0, false>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        (0, true) => mesh_face_rows_impl::<T, PROFILE, 0, true>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        (1, false) => mesh_face_rows_impl::<T, PROFILE, 1, false>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        (1, true) => mesh_face_rows_impl::<T, PROFILE, 1, true>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        (2, false) => mesh_face_rows_impl::<T, PROFILE, 2, false>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        (2, true) => mesh_face_rows_impl::<T, PROFILE, 2, true>(
+            voxels,
+            interior_min,
+            interior_shape,
+            interior_start_index,
+            strides,
+            visible_rows,
+            unit_only,
+            row_axis,
+            bit_axis,
+            carry_runs,
+            quads,
+            timings,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn mesh_face_rows_impl<T, const PROFILE: bool, const N_AXIS: usize, const BIT_IS_U: bool>(
+    voxels: &[T],
+    interior_min: [u32; 3],
+    interior_shape: [u32; 3],
+    interior_start_index: usize,
+    strides: [usize; 3],
+    visible_rows: &[u64],
+    unit_only: bool,
+    row_axis: usize,
+    bit_axis: usize,
+    carry_runs: &mut Vec<u8>,
+    quads: &mut Vec<UnorientedQuad>,
+    timings: &mut BinaryGreedyStageTimings,
+) where
+    T: MergeVoxel,
+{
     let row_count = interior_shape[row_axis] as usize;
     let bit_count = interior_shape[bit_axis] as usize;
-    let interior_n_len = interior_shape[axes.n_axis] as usize;
+    let interior_n_len = interior_shape[N_AXIS] as usize;
     let row_stride = strides[row_axis];
     let bit_stride = strides[bit_axis];
 
@@ -388,12 +493,11 @@ fn mesh_face_rows<T, const PROFILE: bool>(
             None
         };
         for n_local in 0..interior_n_len {
-            emit_unit_slice(
+            emit_unit_slice::<N_AXIS>(
                 interior_min,
-                axes,
                 row_axis,
                 bit_axis,
-                interior_min[axes.n_axis] + n_local as u32,
+                interior_min[N_AXIS] + n_local as u32,
                 &visible_rows[n_local * row_count..n_local * row_count + row_count],
                 quads,
             );
@@ -409,12 +513,11 @@ fn mesh_face_rows<T, const PROFILE: bool>(
     } else {
         None
     };
-    mesh_face_carry(
+    mesh_face_carry::<T, N_AXIS, BIT_IS_U>(
         voxels,
         interior_min,
         interior_start_index,
         strides,
-        axes,
         row_count,
         bit_count,
         interior_n_len,
@@ -431,12 +534,11 @@ fn mesh_face_rows<T, const PROFILE: bool>(
     }
 }
 
-fn mesh_face_carry<T>(
+fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_start_index: usize,
     strides: [usize; 3],
-    axes: FaceAxes,
     row_count: usize,
     bit_count: usize,
     interior_n_len: usize,
@@ -451,11 +553,14 @@ fn mesh_face_carry<T>(
     T: MergeVoxel,
 {
     reset_carry_runs(carry_runs, bit_count);
+    let n_base = interior_min[N_AXIS];
+    let bit_base = interior_min[bit_axis];
+    let outer_base = interior_min[outer_axis];
 
     for n_local in 0..interior_n_len {
         carry_runs.fill(0);
-        let n_index_base = interior_start_index + n_local * strides[axes.n_axis];
-        let n_coord = interior_min[axes.n_axis] + n_local as u32;
+        let n_index_base = interior_start_index + n_local * strides[N_AXIS];
+        let n_coord = n_base + n_local as u32;
         let slice_start = n_local * row_count;
         let slice_rows = &rows[slice_start..slice_start + row_count];
 
@@ -529,22 +634,16 @@ fn mesh_face_carry<T>(
                 bits_here &= !bit_mask(bit_local, run_width);
 
                 let start_outer = outer_local - carry_runs[bit_local] as usize;
-                let mut minimum = [0; 3];
-                minimum[axes.n_axis] = n_coord;
-                minimum[outer_axis] = interior_min[outer_axis] + start_outer as u32;
-                minimum[bit_axis] = interior_min[bit_axis] + bit_local as u32;
-
-                let (width, height) = if bit_axis == axes.u_axis {
-                    (run_width as u32, run_length as u32)
-                } else {
-                    (run_length as u32, run_width as u32)
-                };
-
-                quads.push(UnorientedQuad {
-                    minimum,
-                    width,
-                    height,
-                });
+                let outer_coord = outer_base + start_outer as u32;
+                let bit_coord = bit_base + bit_local as u32;
+                push_quad::<N_AXIS, BIT_IS_U>(
+                    quads,
+                    n_coord,
+                    outer_coord,
+                    bit_coord,
+                    run_width as u32,
+                    run_length as u32,
+                );
 
                 carry_runs[bit_local] = 0;
             }
@@ -801,15 +900,16 @@ fn scan_axes(n_axis: usize) -> (usize, usize) {
     }
 }
 
-fn emit_unit_slice(
+fn emit_unit_slice<const N_AXIS: usize>(
     interior_min: [u32; 3],
-    axes: FaceAxes,
     row_axis: usize,
     bit_axis: usize,
     n_coord: u32,
     visible_rows: &[u64],
     quads: &mut Vec<UnorientedQuad>,
 ) {
+    let row_base = interior_min[row_axis];
+    let bit_base = interior_min[bit_axis];
     let additional_quads = visible_rows
         .iter()
         .map(|row_bits| row_bits.count_ones() as usize)
@@ -821,22 +921,13 @@ fn emit_unit_slice(
 
     for (row_local, &row_bits) in visible_rows.iter().enumerate() {
         let mut bits = row_bits;
-        let row_coord = interior_min[row_axis] + row_local as u32;
+        let row_coord = row_base + row_local as u32;
 
         while bits != 0 {
             let bit_local = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-
-            let mut minimum = [0; 3];
-            minimum[axes.n_axis] = n_coord;
-            minimum[row_axis] = row_coord;
-            minimum[bit_axis] = interior_min[bit_axis] + bit_local as u32;
-
-            spare[written].write(UnorientedQuad {
-                minimum,
-                width: 1,
-                height: 1,
-            });
+            let bit_coord = bit_base + bit_local as u32;
+            write_unit_quad::<N_AXIS>(&mut spare[written], n_coord, row_coord, bit_coord);
             written += 1;
         }
     }
@@ -844,6 +935,54 @@ fn emit_unit_slice(
     unsafe {
         quads.set_len(base_len + written);
     }
+}
+
+#[inline(always)]
+fn push_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
+    quads: &mut Vec<UnorientedQuad>,
+    n_coord: u32,
+    outer_coord: u32,
+    bit_coord: u32,
+    run_width: u32,
+    run_length: u32,
+) {
+    let minimum = match N_AXIS {
+        0 => [n_coord, bit_coord, outer_coord],
+        1 => [bit_coord, n_coord, outer_coord],
+        2 => [bit_coord, outer_coord, n_coord],
+        _ => unreachable!(),
+    };
+    let (width, height) = if BIT_IS_U {
+        (run_width, run_length)
+    } else {
+        (run_length, run_width)
+    };
+
+    quads.push(UnorientedQuad {
+        minimum,
+        width,
+        height,
+    });
+}
+
+#[inline(always)]
+fn write_unit_quad<const N_AXIS: usize>(
+    quad: &mut std::mem::MaybeUninit<UnorientedQuad>,
+    n_coord: u32,
+    row_coord: u32,
+    bit_coord: u32,
+) {
+    let minimum = match N_AXIS {
+        0 => [n_coord, bit_coord, row_coord],
+        1 => [bit_coord, n_coord, row_coord],
+        2 => [bit_coord, row_coord, n_coord],
+        _ => unreachable!(),
+    };
+    quad.write(UnorientedQuad {
+        minimum,
+        width: 1,
+        height: 1,
+    });
 }
 
 fn reset_visible_rows(visible_rows: &mut Vec<u64>, interior_rows: usize) {
