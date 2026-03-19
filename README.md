@@ -129,6 +129,8 @@ cargo run -p block-mesh-bgm-examples --example render
 That example places `visible_block_faces`, `greedy_quads`, and
 `binary_greedy_quads` side-by-side and logs their quad counts.
 Press `Space` to toggle wireframe so you can switch between surface shading and quad layout.
+Press `T` to switch between the original striped opaque sphere and a solid-core sphere wrapped in translucent voxels.
+Press `O` to switch the translucent demo between `AlphaToCoverage` and camera-level OIT.
 
 Run the `bevy_voxel_world` integration example with:
 

@@ -39,6 +39,13 @@ impl DemoVoxel {
             material,
         }
     }
+
+    pub const fn translucent(material: u8) -> Self {
+        Self {
+            visibility: VoxelVisibility::Translucent,
+            material,
+        }
+    }
 }
 
 impl Default for DemoVoxel {
@@ -83,6 +90,23 @@ pub fn striped_sphere(coord: [u32; 3], p: Vec3A) -> DemoVoxel {
     DemoVoxel::solid((stripe + 1) as u8)
 }
 
+pub fn translucent_shell_sphere(coord: [u32; 3], p: Vec3A) -> DemoVoxel {
+    const OUTER_RADIUS_VOXELS: f32 = 14.4;
+    const SHELL_THICKNESS_VOXELS: f32 = 3.0;
+
+    let radius_voxels = p.length() * 16.0;
+    if radius_voxels >= OUTER_RADIUS_VOXELS {
+        return EMPTY;
+    }
+
+    if radius_voxels < OUTER_RADIUS_VOXELS - SHELL_THICKNESS_VOXELS {
+        return DemoVoxel::solid(2);
+    }
+
+    let stripe = ((coord[0] / 3) + 2 * (coord[1] / 3) + (coord[2] / 3)) % 4;
+    DemoVoxel::translucent((stripe + 3) as u8)
+}
+
 pub fn into_domain(array_dim: u32, [x, y, z]: [u32; 3]) -> Vec3A {
     (2.0 / array_dim as f32) * Vec3A::new(x as f32, y as f32, z as f32) - 1.0
 }
@@ -93,32 +117,16 @@ pub fn mesh_from_unit_quads(
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
 ) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
-    let num_vertices = num_quads * 4;
-    let mut indices = Vec::with_capacity(num_quads * 6);
-    let mut positions = Vec::with_capacity(num_vertices);
-    let mut normals = Vec::with_capacity(num_vertices);
-    let mut colors = Vec::with_capacity(num_vertices);
+    let mut mesh = MeshBuffers::default();
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
         for quad in group {
             let quad: UnorientedQuad = quad.into();
-            let color = quad_color(samples, quad.minimum);
-
-            indices.extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
-            positions.extend_from_slice(&face.quad_mesh_positions(&quad, 1.0));
-            normals.extend_from_slice(&face.quad_mesh_normals());
-            colors.extend_from_slice(&[color; 4]);
+            append_quad(face, quad, quad_voxel(samples, quad.minimum), &mut mesh);
         }
     }
 
-    (
-        build_render_mesh(indices, positions, normals, colors),
-        MeshStats {
-            quads: num_quads,
-            vertices: num_vertices,
-            triangles: num_quads * 2,
-        },
-    )
+    build_demo_render_mesh(num_quads, mesh)
 }
 
 pub fn mesh_from_quads(
@@ -127,28 +135,57 @@ pub fn mesh_from_quads(
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
 ) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
-    let num_vertices = num_quads * 4;
-    let mut indices = Vec::with_capacity(num_quads * 6);
-    let mut positions = Vec::with_capacity(num_vertices);
-    let mut normals = Vec::with_capacity(num_vertices);
-    let mut colors = Vec::with_capacity(num_vertices);
+    let mut mesh = MeshBuffers::default();
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
         for quad in group {
-            let color = quad_color(samples, quad.minimum);
-
-            indices.extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
-            positions.extend_from_slice(&face.quad_mesh_positions(&quad, 1.0));
-            normals.extend_from_slice(&face.quad_mesh_normals());
-            colors.extend_from_slice(&[color; 4]);
+            append_quad(face, quad, quad_voxel(samples, quad.minimum), &mut mesh);
         }
     }
 
+    build_demo_render_mesh(num_quads, mesh)
+}
+
+#[derive(Default)]
+struct MeshBuffers {
+    indices: Vec<u32>,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+}
+
+impl MeshBuffers {
+    fn push_quad(&mut self, face: OrientedBlockFace, quad: UnorientedQuad, color: [f32; 4]) {
+        self.indices
+            .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
+        self.positions
+            .extend_from_slice(&face.quad_mesh_positions(&quad, 1.0));
+        self.normals.extend_from_slice(&face.quad_mesh_normals());
+        self.colors.extend_from_slice(&[color; 4]);
+    }
+
+    fn build(self) -> Mesh {
+        build_render_mesh(self.indices, self.positions, self.normals, self.colors)
+    }
+}
+
+fn append_quad(
+    face: OrientedBlockFace,
+    quad: UnorientedQuad,
+    voxel: DemoVoxel,
+    mesh: &mut MeshBuffers,
+) {
+    if voxel.visibility != VoxelVisibility::Empty {
+        mesh.push_quad(face, quad, voxel_color(voxel));
+    }
+}
+
+fn build_demo_render_mesh(num_quads: usize, mesh: MeshBuffers) -> (Mesh, MeshStats) {
     (
-        build_render_mesh(indices, positions, normals, colors),
+        mesh.build(),
         MeshStats {
             quads: num_quads,
-            vertices: num_vertices,
+            vertices: num_quads * 4,
             triangles: num_quads * 2,
         },
     )
@@ -184,8 +221,16 @@ fn build_render_mesh(
     render_mesh
 }
 
-fn quad_color(samples: &[DemoVoxel; SampleShape::SIZE as usize], minimum: [u32; 3]) -> [f32; 4] {
-    material_color(samples[SampleShape::linearize(minimum) as usize].material)
+fn quad_voxel(samples: &[DemoVoxel; SampleShape::SIZE as usize], minimum: [u32; 3]) -> DemoVoxel {
+    samples[SampleShape::linearize(minimum) as usize]
+}
+
+fn voxel_color(voxel: DemoVoxel) -> [f32; 4] {
+    let mut color = material_color(voxel.material);
+    if voxel.visibility == VoxelVisibility::Translucent {
+        color[3] = 0.34;
+    }
+    color
 }
 
 fn material_color(material: u8) -> [f32; 4] {
