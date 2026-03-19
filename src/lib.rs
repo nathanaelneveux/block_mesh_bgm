@@ -122,6 +122,23 @@ impl BinaryGreedyQuadsBuffer {
     }
 }
 
+/// Hidden diagnostics for internal benchmarking and profiling.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BinaryGreedyStageTimings {
+    pub column_build: std::time::Duration,
+    pub visible_rows: std::time::Duration,
+    pub unit_quads: std::time::Duration,
+    pub carry_merge: std::time::Duration,
+}
+
+impl BinaryGreedyStageTimings {
+    #[doc(hidden)]
+    pub fn total(&self) -> std::time::Duration {
+        self.column_build + self.visible_rows + self.unit_quads + self.carry_merge
+    }
+}
+
 /// Generates greedy quads using a binary-mask-backed implementation.
 ///
 /// The public API mirrors [`block_mesh::greedy_quads`]. Output quads are stored
@@ -152,20 +169,48 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    binary_greedy_quads_impl(voxels, voxels_shape, min, max, faces, output)
+    let mut unused_timings = BinaryGreedyStageTimings::default();
+    binary_greedy_quads_impl::<T, S, false>(
+        voxels,
+        voxels_shape,
+        min,
+        max,
+        faces,
+        output,
+        &mut unused_timings,
+    )
 }
 
-fn binary_greedy_quads_impl<T, S>(
+/// Hidden diagnostics entry point that records coarse stage timings.
+#[doc(hidden)]
+pub fn binary_greedy_quads_profile<T, S>(
     voxels: &[T],
     voxels_shape: &S,
     min: [u32; 3],
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
     output: &mut BinaryGreedyQuadsBuffer,
+    timings: &mut BinaryGreedyStageTimings,
 ) where
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
+    binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output, timings)
+}
+
+fn binary_greedy_quads_impl<T, S, const PROFILE: bool>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+    timings: &mut BinaryGreedyStageTimings,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    let mut stage_timings = BinaryGreedyStageTimings::default();
     assert_in_bounds(voxels, voxels_shape, min, max);
 
     // `block-mesh` requires a one-voxel border around the actual meshed region.
@@ -218,8 +263,15 @@ fn binary_greedy_quads_impl<T, S>(
     // Build reusable occupancy columns for all three possible bit axes up
     // front, then derive face visibility from those compact masks.
     reset_columns(opaque_cols, trans_cols, query_shape);
-    let has_translucent =
-        build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
+    let has_translucent = if PROFILE {
+        let start = std::time::Instant::now();
+        let has_translucent =
+            build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols);
+        stage_timings.column_build += start.elapsed();
+        has_translucent
+    } else {
+        build_axis_columns(voxels, min, query_shape, strides, opaque_cols, trans_cols)
+    };
 
     for n_axis in 0..3 {
         let neg_face_index = face_indices[n_axis][0];
@@ -234,22 +286,42 @@ fn binary_greedy_quads_impl<T, S>(
 
         reset_visible_rows(visible_rows, interior_rows);
         reset_visible_rows(visible_rows_alt, interior_rows);
-        let (neg_unit_only, pos_unit_only) = build_visible_row_pair(
-            query_shape,
-            bit_axis,
-            bit_count,
-            row_count,
-            interior_n_len,
-            n_axis,
-            row_axis,
-            &opaque_cols[bit_axis],
-            &trans_cols[bit_axis],
-            has_translucent,
-            visible_rows,
-            visible_rows_alt,
-        );
+        let (neg_unit_only, pos_unit_only) = if PROFILE {
+            let start = std::time::Instant::now();
+            let result = build_visible_row_pair(
+                query_shape,
+                bit_axis,
+                bit_count,
+                row_count,
+                interior_n_len,
+                n_axis,
+                row_axis,
+                &opaque_cols[bit_axis],
+                &trans_cols[bit_axis],
+                has_translucent,
+                visible_rows,
+                visible_rows_alt,
+            );
+            stage_timings.visible_rows += start.elapsed();
+            result
+        } else {
+            build_visible_row_pair(
+                query_shape,
+                bit_axis,
+                bit_count,
+                row_count,
+                interior_n_len,
+                n_axis,
+                row_axis,
+                &opaque_cols[bit_axis],
+                &trans_cols[bit_axis],
+                has_translucent,
+                visible_rows,
+                visible_rows_alt,
+            )
+        };
 
-        mesh_face_rows(
+        mesh_face_rows::<T, PROFILE>(
             voxels,
             interior_min,
             interior_shape,
@@ -262,8 +334,9 @@ fn binary_greedy_quads_impl<T, S>(
             bit_axis,
             carry_runs,
             &mut quads.groups[neg_face_index],
+            &mut stage_timings,
         );
-        mesh_face_rows(
+        mesh_face_rows::<T, PROFILE>(
             voxels,
             interior_min,
             interior_shape,
@@ -276,11 +349,16 @@ fn binary_greedy_quads_impl<T, S>(
             bit_axis,
             carry_runs,
             &mut quads.groups[pos_face_index],
+            &mut stage_timings,
         );
+    }
+
+    if PROFILE {
+        *timings = stage_timings;
     }
 }
 
-fn mesh_face_rows<T>(
+fn mesh_face_rows<T, const PROFILE: bool>(
     voxels: &[T],
     interior_min: [u32; 3],
     interior_shape: [u32; 3],
@@ -293,6 +371,7 @@ fn mesh_face_rows<T>(
     bit_axis: usize,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
+    timings: &mut BinaryGreedyStageTimings,
 ) where
     T: MergeVoxel,
 {
@@ -303,6 +382,11 @@ fn mesh_face_rows<T>(
     let bit_stride = strides[bit_axis];
 
     if unit_only {
+        let start = if PROFILE {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         for n_local in 0..interior_n_len {
             emit_unit_slice(
                 interior_min,
@@ -314,9 +398,17 @@ fn mesh_face_rows<T>(
                 quads,
             );
         }
+        if let Some(start) = start {
+            timings.unit_quads += start.elapsed();
+        }
         return;
     }
 
+    let start = if PROFILE {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     mesh_face_carry(
         voxels,
         interior_min,
@@ -334,6 +426,9 @@ fn mesh_face_rows<T>(
         carry_runs,
         quads,
     );
+    if let Some(start) = start {
+        timings.carry_merge += start.elapsed();
+    }
 }
 
 fn mesh_face_carry<T>(
@@ -696,6 +791,15 @@ fn emit_unit_slice(
     visible_rows: &[u64],
     quads: &mut Vec<UnorientedQuad>,
 ) {
+    let additional_quads = visible_rows
+        .iter()
+        .map(|row_bits| row_bits.count_ones() as usize)
+        .sum::<usize>();
+    let base_len = quads.len();
+    quads.reserve(additional_quads);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
+
     for (row_local, &row_bits) in visible_rows.iter().enumerate() {
         let mut bits = row_bits;
         let row_coord = interior_min[row_axis] + row_local as u32;
@@ -709,12 +813,17 @@ fn emit_unit_slice(
             minimum[row_axis] = row_coord;
             minimum[bit_axis] = interior_min[bit_axis] + bit_local as u32;
 
-            quads.push(UnorientedQuad {
+            spare[written].write(UnorientedQuad {
                 minimum,
                 width: 1,
                 height: 1,
             });
+            written += 1;
         }
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
     }
 }
 
