@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -23,6 +23,13 @@ use block_mesh::RIGHT_HANDED_Y_UP_CONFIG;
 use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
+
+thread_local! {
+    // Meshing runs on Bevy's async worker pool, so keep one scratch buffer per
+    // worker thread and reuse its allocations across chunk jobs.
+    static MESH_BUFFER: RefCell<BinaryGreedyQuadsBuffer> =
+        RefCell::new(BinaryGreedyQuadsBuffer::new());
+}
 
 #[derive(Clone, Copy)]
 struct ColumnSample {
@@ -66,45 +73,64 @@ impl VoxelWorldConfig for MainWorld {
                      _mesh_shape_in: UVec3,
                      texture_index_mapper: TextureIndexMapperFn<Self::MaterialIndex>| {
                         let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
-                        let mut buffer = BinaryGreedyQuadsBuffer::new();
+                        let (num_vertices, indices, positions, normals, tex_coords, material_types) =
+                            MESH_BUFFER.with(|buffer| {
+                                let mut buffer = buffer.borrow_mut();
 
-                        binary_greedy_quads(
-                            &voxels,
-                            &PaddedChunkShape {},
-                            [0; 3],
-                            [CHUNK_SIZE_U + 1; 3],
-                            &faces,
-                            &mut buffer,
-                        );
+                                binary_greedy_quads(
+                                    &voxels,
+                                    &PaddedChunkShape {},
+                                    [0; 3],
+                                    [CHUNK_SIZE_U + 1; 3],
+                                    &faces,
+                                    &mut buffer,
+                                );
 
-                        let num_indices = buffer.quads.num_quads() * 6;
-                        let num_vertices = buffer.quads.num_quads() * 4;
-                        let mut indices = Vec::with_capacity(num_indices);
-                        let mut positions = Vec::with_capacity(num_vertices);
-                        let mut normals = Vec::with_capacity(num_vertices);
-                        let mut tex_coords = Vec::with_capacity(num_vertices);
-                        let mut material_types = Vec::with_capacity(num_vertices);
+                                let num_indices = buffer.quads.num_quads() * 6;
+                                let num_vertices = buffer.quads.num_quads() * 4;
+                                let mut indices = Vec::with_capacity(num_indices);
+                                let mut positions = Vec::with_capacity(num_vertices);
+                                let mut normals = Vec::with_capacity(num_vertices);
+                                let mut tex_coords = Vec::with_capacity(num_vertices);
+                                let mut material_types = Vec::with_capacity(num_vertices);
 
-                        for (group, face) in buffer.quads.groups.into_iter().zip(faces.into_iter()) {
-                            for quad in group {
-                                indices
-                                    .extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
-                                positions.extend_from_slice(&face.quad_mesh_positions(&quad, 1.0));
-                                normals.extend_from_slice(&face.quad_mesh_normals());
-                                tex_coords.extend_from_slice(&face.tex_coords(
-                                    RIGHT_HANDED_Y_UP_CONFIG.u_flip_face,
-                                    true,
-                                    &quad,
-                                ));
+                                for (group, face) in
+                                    buffer.quads.groups.iter().zip(faces.iter().copied())
+                                {
+                                    for quad in group {
+                                        indices.extend_from_slice(
+                                            &face.quad_mesh_indices(positions.len() as u32),
+                                        );
+                                        positions.extend_from_slice(
+                                            &face.quad_mesh_positions(quad, 1.0),
+                                        );
+                                        normals.extend_from_slice(&face.quad_mesh_normals());
+                                        tex_coords.extend_from_slice(&face.tex_coords(
+                                            RIGHT_HANDED_Y_UP_CONFIG.u_flip_face,
+                                            true,
+                                            quad,
+                                        ));
 
-                                let voxel_index = PaddedChunkShape::linearize(quad.minimum) as usize;
-                                let material_type = match voxels[voxel_index] {
-                                    WorldVoxel::Solid(mat) => texture_index_mapper(mat),
-                                    _ => [0, 0, 0],
-                                };
-                                material_types.extend(std::iter::repeat_n(material_type, 4));
-                            }
-                        }
+                                        let voxel_index =
+                                            PaddedChunkShape::linearize(quad.minimum) as usize;
+                                        let material_type = match voxels[voxel_index] {
+                                            WorldVoxel::Solid(mat) => texture_index_mapper(mat),
+                                            _ => [0, 0, 0],
+                                        };
+                                        material_types
+                                            .extend(std::iter::repeat_n(material_type, 4));
+                                    }
+                                }
+
+                                (
+                                    num_vertices,
+                                    indices,
+                                    positions,
+                                    normals,
+                                    tex_coords,
+                                    material_types,
+                                )
+                            });
 
                         let mut render_mesh = Mesh::new(
                             PrimitiveTopology::TriangleList,
