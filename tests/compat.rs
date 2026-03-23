@@ -446,6 +446,27 @@ fn benchmark_like_cases() -> Vec<CarryCase> {
             },
         ),
         build_carry_case(
+            "translucent-sphere",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, dims| {
+                let cx = (dims[0] - 1) as f32 * 0.5;
+                let cy = (dims[1] - 1) as f32 * 0.5;
+                let cz = (dims[2] - 1) as f32 * 0.5;
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let dz = z as f32 - cz;
+                let radius = dims[0].min(dims[1]).min(dims[2]) as f32 * 0.46;
+
+                if dx * dx + dy * dy + dz * dz <= radius * radius {
+                    TestVoxel::translucent((1 + ((x + y + z) % 4)) as u8, 0)
+                } else {
+                    TestVoxel::default()
+                }
+            },
+        ),
+        build_carry_case(
             "layered-caves",
             [34, 34, 34],
             [0; 3],
