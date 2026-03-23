@@ -244,6 +244,13 @@ fn benchmark_cases() -> Vec<Case> {
             },
         ),
         build_case(
+            "translucent-shell-sphere",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, dims| translucent_shell_sphere_voxel(x, y, z, dims),
+        ),
+        build_case(
             "layered-caves",
             [34, 34, 34],
             [0; 3],
@@ -430,6 +437,36 @@ fn hash3(x: u32, y: u32, z: u32, seed: u32) -> u32 {
     v ^= z.wrapping_mul(0xC2B2_AE3D);
     v ^= seed.wrapping_mul(0x27D4_EB2D);
     v ^ (v >> 16)
+}
+
+fn translucent_shell_sphere_voxel(x: u32, y: u32, z: u32, dims: [u32; 3]) -> BenchVoxel {
+    const OUTER_RADIUS_VOXELS: f32 = 14.4;
+    const SHELL_THICKNESS_VOXELS: f32 = 3.0;
+
+    let cx = (dims[0] - 1) as f32 * 0.5;
+    let cy = (dims[1] - 1) as f32 * 0.5;
+    let cz = (dims[2] - 1) as f32 * 0.5;
+    let dx = x as f32 - cx;
+    let dy = y as f32 - cy;
+    let dz = z as f32 - cz;
+    let radius_voxels = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    if radius_voxels >= OUTER_RADIUS_VOXELS {
+        return BenchVoxel::default();
+    }
+
+    if radius_voxels < OUTER_RADIUS_VOXELS - SHELL_THICKNESS_VOXELS {
+        return BenchVoxel {
+            visibility: VoxelVisibility::Opaque,
+            material: 2,
+        };
+    }
+
+    let stripe = ((x / 3) + 2 * (y / 3) + (z / 3)) % 4;
+    BenchVoxel {
+        visibility: VoxelVisibility::Translucent,
+        material: (stripe + 3) as u8,
+    }
 }
 
 criterion_group!(benches, bench_meshers);
