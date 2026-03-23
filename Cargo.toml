@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A block-mesh-compatible binary greedy mesher for voxel chunks."
+documentation = "https://docs.rs/block-mesh-bgm"
 keywords = ["graphics", "mesh", "voxel", "greedy", "binary"]
 categories = ["graphics", "rendering"]
 readme = "README.md"

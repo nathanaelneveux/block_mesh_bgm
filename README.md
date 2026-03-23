@@ -27,6 +27,16 @@ but it arrives there with a different internal representation.
 The 62-voxel interior limit exists because each queried axis needs two padding
 voxels and the full padded run must fit inside one `u64`.
 
+## Reading The Source
+
+The crate is split by stage:
+
+- `src/lib.rs`: public API, crate docs, and the top-level pipeline
+- `src/context.rs`: query validation and precomputed indexing/layout facts
+- `src/prep.rs`: occupancy columns and visible-face row construction
+- `src/merge.rs`: unit-quad emission and the carry-based greedy merger
+- `src/face.rs`: translation between `block-mesh` face orientation and the mesher's internal axis naming
+
 ## Limitations
 
 - Interior query extents are limited to at most `62` voxels per axis.
@@ -99,6 +109,8 @@ Release-quality changes should be validated with:
 cargo test
 cargo bench
 cargo doc --no-deps
+cargo check -p block-mesh-bgm-examples --examples
+cargo package --allow-dirty --list
 ```
 
 The benchmark suite compares three paths on the same voxel datasets:
