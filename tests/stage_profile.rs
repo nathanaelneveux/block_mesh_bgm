@@ -247,6 +247,19 @@ fn benchmark_cases() -> Vec<Case> {
             [4, 4, 4],
             [29, 29, 29],
             |x, y, z, _dims| match hash3(x, y, z, 131) % 8 {
+                0..=4 => BenchVoxel {
+                    visibility: VoxelVisibility::Opaque,
+                    material: (1 + (hash3(x, y, z, 11) % 5)) as u8,
+                },
+                _ => BenchVoxel::default(),
+            },
+        ),
+        build_case(
+            "translucent-mix",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| match hash3(x, y, z, 131) % 8 {
                 0..=3 => BenchVoxel {
                     visibility: VoxelVisibility::Opaque,
                     material: (1 + (hash3(x, y, z, 11) % 5)) as u8,

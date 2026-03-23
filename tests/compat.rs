@@ -483,6 +483,16 @@ fn benchmark_like_cases() -> Vec<CarryCase> {
             [4, 4, 4],
             [29, 29, 29],
             |x, y, z, _dims| match hash3(x, y, z, 131) % 8 {
+                0..=4 => TestVoxel::opaque((1 + (hash3(x, y, z, 11) % 5)) as u8, 0),
+                _ => TestVoxel::default(),
+            },
+        ),
+        build_carry_case(
+            "translucent-mix",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| match hash3(x, y, z, 131) % 8 {
                 0..=3 => TestVoxel::opaque((1 + (hash3(x, y, z, 11) % 5)) as u8, 0),
                 4 => TestVoxel::translucent((1 + (hash3(x, y, z, 17) % 3)) as u8, 0),
                 _ => TestVoxel::default(),
