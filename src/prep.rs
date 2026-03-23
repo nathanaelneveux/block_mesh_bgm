@@ -16,6 +16,7 @@ use block_mesh::{Voxel, VoxelVisibility};
 use crate::bit_mask;
 
 /// Resizes and clears the reusable occupancy-column buffers for one query shape.
+#[inline]
 pub(crate) fn reset_columns(
     opaque_cols: &mut [Vec<u64>; 3],
     trans_cols: &mut [Vec<u64>; 3],
@@ -34,6 +35,7 @@ pub(crate) fn reset_columns(
 ///
 /// The function returns `true` if any translucent voxel was seen. That lets the
 /// next stage skip translucent visibility logic entirely for opaque-only inputs.
+#[inline]
 pub(crate) fn build_axis_columns<T>(
     voxels: &[T],
     min: [u32; 3],
@@ -115,6 +117,7 @@ where
 /// directly. A slice is `unit_only` if no visible cell touches another visible
 /// cell horizontally or vertically.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(crate) fn build_visible_row_pair(
     query_shape: [usize; 3],
     bit_axis: usize,

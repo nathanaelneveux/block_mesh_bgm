@@ -21,6 +21,7 @@ use crate::context::{MeshingContext, SlicePlan};
 use crate::face::{write_quad, write_unit_quad, FaceAxes};
 
 /// Chooses the compile-time-specialized merge kernel for one face orientation.
+#[inline(always)]
 pub(crate) fn mesh_face_rows<T>(
     voxels: &[T],
     context: &MeshingContext,
@@ -92,6 +93,7 @@ pub(crate) fn mesh_face_rows<T>(
     }
 }
 
+#[inline(always)]
 fn mesh_face_rows_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     context: &MeshingContext,
@@ -121,6 +123,7 @@ fn mesh_face_rows_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     mesh_face_carry::<T, N_AXIS, BIT_IS_U>(voxels, context, slice, visible_rows, carry_runs, quads);
 }
 
+#[inline(always)]
 fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     context: &MeshingContext,
@@ -222,6 +225,11 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                 continue;
             }
 
+            if ended_bits == 0 {
+                has_incoming_carry = continue_mask != 0;
+                continue;
+            }
+
             emit_mixed_row_runs::<T, N_AXIS, BIT_IS_U>(
                 voxels,
                 ended_bits,
@@ -240,7 +248,7 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 }
 
 /// Builds the mask of bits whose runs continue into the next row.
-#[inline]
+#[inline(always)]
 fn build_continue_mask<T>(
     voxels: &[T],
     mut overlapping_bits: u64,
@@ -272,7 +280,7 @@ where
 }
 
 /// Emits ended runs for a row that also contains some continuing carry.
-#[inline]
+#[inline(always)]
 fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     mut row_bits: u64,
@@ -338,7 +346,7 @@ fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 }
 
 /// Emits horizontal runs for a row with no incoming carry.
-#[inline]
+#[inline(always)]
 fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
@@ -400,7 +408,7 @@ fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 }
 
 /// Emits runs for a row where every visible bit ends on the current row.
-#[inline]
+#[inline(always)]
 fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
@@ -467,6 +475,7 @@ fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 }
 
 /// Emits every visible cell in a fragmented slice as a `1x1` quad.
+#[inline(always)]
 fn emit_unit_slice<const N_AXIS: usize>(
     interior_min: [u32; 3],
     outer_axis: usize,
@@ -508,7 +517,7 @@ fn emit_unit_slice<const N_AXIS: usize>(
     }
 }
 
-#[inline]
+#[inline(always)]
 fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
     carry_runs.resize(len, 0);
     carry_runs.fill(0);
