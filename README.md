@@ -1,5 +1,8 @@
 # block-mesh-bgm
 
+[![Crates.io](https://img.shields.io/crates/v/block-mesh-bgm.svg)](https://crates.io/crates/block-mesh-bgm)
+[![Docs.rs](https://docs.rs/block-mesh-bgm/badge.svg)](https://docs.rs/block-mesh-bgm)
+
 `block-mesh-bgm` is a companion crate for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).
 It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation.
 
