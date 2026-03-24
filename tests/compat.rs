@@ -412,6 +412,57 @@ fn t_junction_free_mode_removes_t_junctions_for_example_torus() {
 }
 
 #[test]
+fn t_junction_free_mode_handles_material_boundaries_conformingly() {
+    let shape = RuntimeShape::<u32, 3>::new([9, 5, 9]);
+    let voxels = make_voxels([9, 5, 9], |x, y, z| {
+        if x == 0 || y == 0 || z == 0 || x == 8 || y == 4 || z == 8 {
+            return TestVoxel::empty(0);
+        }
+
+        let voxel = match (y, z) {
+            (2, 2) if (2..=6).contains(&x) => Some(TestVoxel::opaque(1, 0)),
+            (2, 3) if (2..=4).contains(&x) => Some(TestVoxel::opaque(1, 0)),
+            (2, 3) if (5..=6).contains(&x) => Some(TestVoxel::opaque(2, 0)),
+            _ => None,
+        };
+
+        voxel.unwrap_or_else(|| TestVoxel::empty(0))
+    });
+
+    let no_t_junctions = mesh_with_binary_bgm_config(
+        &voxels,
+        &shape,
+        [0; 3],
+        [8, 4, 8],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        BinaryGreedyQuadsConfig {
+            ambient_occlusion_safe: false,
+            eliminate_t_junctions: true,
+        },
+    );
+    let vanilla = mesh_with_binary_bgm(
+        &voxels,
+        &shape,
+        [0; 3],
+        [8, 4, 8],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+
+    assert_same_geometry_buffers(
+        &voxels,
+        &shape,
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        &vanilla,
+        &no_t_junctions,
+    );
+
+    assert!(!has_coplanar_t_junctions(
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        &no_t_junctions
+    ));
+}
+
+#[test]
 fn combined_mode_preserves_geometry_and_enforces_both_invariants() {
     let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
     let voxels = make_voxels([8, 6, 8], |x, y, z| {
@@ -844,8 +895,12 @@ fn plane_has_t_junctions(quads: &[PlaneQuad]) -> bool {
             });
     }
 
-    vertical.values().any(|segments| line_has_t_junctions(segments))
-        || horizontal.values().any(|segments| line_has_t_junctions(segments))
+    vertical
+        .values()
+        .any(|segments| line_has_t_junctions(segments))
+        || horizontal
+            .values()
+            .any(|segments| line_has_t_junctions(segments))
 }
 
 fn line_has_t_junctions(segments: &[Segment]) -> bool {

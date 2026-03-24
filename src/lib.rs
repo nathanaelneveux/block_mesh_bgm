@@ -183,8 +183,9 @@ pub struct BinaryGreedyQuadsConfig {
     /// Splits slice-local quads until no coplanar T-junctions remain within a
     /// face group.
     ///
-    /// This mode only subdivides the rectangles produced by the merge pass; it
-    /// does not change visibility.
+    /// This mode uses a dedicated conforming merge kernel and applies a small
+    /// slice-local cleanup split only when needed. It does not change
+    /// visibility.
     pub eliminate_t_junctions: bool,
 }
 
@@ -260,9 +261,9 @@ pub fn binary_greedy_quads<T, S>(
 /// `ambient_occlusion_safe` only affects opaque faces. Translucent faces keep
 /// the same merge rule they use in the vanilla path.
 ///
-/// `eliminate_t_junctions` runs a conservative slice-local split pass after
-/// the merge stage. It only subdivides rectangles; it never changes the set of
-/// visible unit faces.
+/// `eliminate_t_junctions` switches to a dedicated conforming merge rule and
+/// may apply a conservative slice-local cleanup split. It never changes the
+/// set of visible unit faces.
 pub fn binary_greedy_quads_with_config<T, S>(
     voxels: &[T],
     voxels_shape: &S,

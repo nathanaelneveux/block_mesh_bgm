@@ -143,6 +143,24 @@ fn bench_meshers(c: &mut Criterion) {
                 });
             },
         );
+
+        for (name, config) in configs {
+            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads_with_config(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &config,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            });
+        }
     }
 
     for case in &multi_cases {
@@ -240,6 +258,64 @@ fn bench_meshers(c: &mut Criterion) {
     }
 
     for case in &strategy_cases {
+        group.bench_with_input(
+            BenchmarkId::new("visible_block_faces", case.name),
+            case,
+            |b, case| {
+                let mut buffer = UnitQuadBuffer::new();
+                b.iter(|| {
+                    buffer.reset();
+                    visible_block_faces(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = GreedyQuadsBuffer::new(case.voxels.len());
+                b.iter(|| {
+                    greedy_quads(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+
         for (name, config) in configs {
             group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
                 let mut buffer = BinaryGreedyQuadsBuffer::new();
@@ -423,16 +499,24 @@ fn strategy_benchmark_cases() -> Vec<Case> {
     let base_cases = benchmark_cases();
 
     vec![
-        base_cases
-            .iter()
-            .find(|case| case.name == "dense-sphere")
-            .expect("dense-sphere benchmark case")
-            .clone(),
-        base_cases
-            .iter()
-            .find(|case| case.name == "translucent-shell-sphere")
-            .expect("translucent-shell-sphere benchmark case")
-            .clone(),
+        {
+            let mut case = base_cases
+                .iter()
+                .find(|case| case.name == "dense-sphere")
+                .expect("dense-sphere benchmark case")
+                .clone();
+            case.name = "dense-sphere-merge-modes";
+            case
+        },
+        {
+            let mut case = base_cases
+                .iter()
+                .find(|case| case.name == "translucent-shell-sphere")
+                .expect("translucent-shell-sphere benchmark case")
+                .clone();
+            case.name = "translucent-shell-sphere-merge-modes";
+            case
+        },
         build_case(
             "ao-t-junction-stress",
             [34, 34, 34],
