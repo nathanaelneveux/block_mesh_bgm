@@ -19,3 +19,7 @@ path = "render/main.rs"
 [[example]]
 name = "custom_meshing"
 path = "custom_meshing/main.rs"
+
+[[example]]
+name = "merge_modes"
+path = "merge_modes/main.rs"

@@ -6,6 +6,12 @@
 `block-mesh-bgm` is a companion crate for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).
 It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation.
 
+The default entry point keeps the current maximum-merge behavior. A second
+configurable entry point can optionally:
+
+- stop merges that would cross differing ambient-occlusion corner signatures on opaque faces
+- split coplanar quads until no intra-face-group T-junctions remain
+
 ## Goals
 
 - Match `block_mesh::greedy_quads` visible-face geometry for supported inputs.
@@ -53,7 +59,10 @@ use block_mesh::ndshape::{ConstShape, ConstShape3u32};
 use block_mesh::{
     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{
+    binary_greedy_quads, binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
+    BinaryGreedyQuadsConfig,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoolVoxel(bool);
@@ -102,7 +111,34 @@ binary_greedy_quads(
 );
 
 assert!(buffer.quads.num_quads() > 0);
+
+let config = BinaryGreedyQuadsConfig {
+    ambient_occlusion_safe: true,
+    eliminate_t_junctions: true,
+};
+
+binary_greedy_quads_with_config(
+    &voxels,
+    &ChunkShape {},
+    [0; 3],
+    [17; 3],
+    &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    &config,
+    &mut buffer,
+);
 ```
+
+## Merge Modes
+
+`binary_greedy_quads` is still the zero-extra-work path.
+
+`binary_greedy_quads_with_config` adds two independent toggles:
+
+- `ambient_occlusion_safe`: only merges opaque faces when their four ambient-occlusion corner values match. It does not compute or emit lighting data for you; it only keeps the mesh compatible with per-vertex AO shading.
+- `eliminate_t_junctions`: runs a conservative slice-local split pass after greedy merging so coplanar quads within a face group line up on shared boundaries.
+
+These modes can be enabled independently or together. They may increase quad
+count and meshing time, but they do not change the visible unit-face geometry.
 
 ## Development
 
@@ -168,6 +204,19 @@ That example places `visible_block_faces`, `greedy_quads`, and
 Press `Space` to toggle wireframe so you can switch between surface shading and quad layout.
 Press `T` to switch between the original striped opaque sphere and a solid-core sphere wrapped in translucent voxels.
 Press `O` to switch the translucent demo between `AlphaToCoverage` and camera-level OIT.
+
+Run the merge-mode viewer with:
+
+```text
+cargo run -p block-mesh-bgm-examples --example merge_modes
+```
+
+That example renders one opaque sphere with wireframe always enabled so you can
+inspect how the configurable merge policies change the quad layout.
+Press `U` to toggle between binary greedy output and unit quads, `S` to toggle
+between an opaque sphere and an opaque torus, `A` to toggle AO-safe merging
+together with AO vertex shading, and `T` to toggle coplanar
+T-junction elimination.
 
 Run the `bevy_voxel_world` integration example with:
 

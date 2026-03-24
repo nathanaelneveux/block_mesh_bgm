@@ -15,7 +15,16 @@
 //! - `context`: query validation and precomputed layout facts
 //! - `prep`: occupancy columns and visible-face rows
 //! - `merge`: unit emission and carry-based greedy merging
+//! - `merge_modes`: AO-safe and T-junction-free alternate merge policies
 //! - `face`: face-orientation helpers shared by the other stages
+//!
+//! The crate exposes two public entry points:
+//!
+//! - [`binary_greedy_quads`]: the current maximum-merge implementation with no
+//!   extra policy checks
+//! - [`binary_greedy_quads_with_config`]: the same visibility pipeline, but
+//!   with optional merge restrictions for AO-friendly quads and coplanar
+//!   T-junction elimination
 //!
 //! # Terminology
 //!
@@ -98,18 +107,86 @@
 //!
 //! assert!(buffer.quads.num_quads() > 0);
 //! ```
+//!
+//! The configurable entry point uses the same buffer type:
+//!
+//! ```
+//! # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
+//! # use block_mesh::{
+//! #     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
+//! # };
+//! # use block_mesh_bgm::{
+//! #     binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
+//! #     BinaryGreedyQuadsConfig,
+//! # };
+//! # #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+//! # struct BoolVoxel(bool);
+//! # impl Voxel for BoolVoxel {
+//! #     fn get_visibility(&self) -> VoxelVisibility {
+//! #         if self.0 {
+//! #             VoxelVisibility::Opaque
+//! #         } else {
+//! #             VoxelVisibility::Empty
+//! #         }
+//! #     }
+//! # }
+//! # impl MergeVoxel for BoolVoxel {
+//! #     type MergeValue = Self;
+//! #     fn merge_value(&self) -> Self::MergeValue {
+//! #         *self
+//! #     }
+//! # }
+//! # type ChunkShape = ConstShape3u32<4, 4, 4>;
+//! # let voxels = [BoolVoxel(false); ChunkShape::SIZE as usize];
+//! let mut buffer = BinaryGreedyQuadsBuffer::new();
+//! let config = BinaryGreedyQuadsConfig {
+//!     ambient_occlusion_safe: true,
+//!     eliminate_t_junctions: true,
+//! };
+//!
+//! binary_greedy_quads_with_config(
+//!     &voxels,
+//!     &ChunkShape {},
+//!     [0; 3],
+//!     [3; 3],
+//!     &RIGHT_HANDED_Y_UP_CONFIG.faces,
+//!     &config,
+//!     &mut buffer,
+//! );
+//! ```
 #![warn(missing_docs)]
 
 mod context;
 mod face;
 mod merge;
+mod merge_modes;
 mod prep;
 
 use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
 use merge::mesh_face_rows;
+use merge_modes::{mesh_face_rows_with_features, FeatureScratch};
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
+
+/// Additional merge-policy controls for [`binary_greedy_quads_with_config`].
+///
+/// The default configuration keeps the current maximum-merge behavior and does
+/// not change the output of [`binary_greedy_quads`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BinaryGreedyQuadsConfig {
+    /// Prevents merges of opaque faces whose four ambient-occlusion corner
+    /// values differ.
+    ///
+    /// This only changes the merge policy. It does not emit AO data.
+    pub ambient_occlusion_safe: bool,
+    /// Splits slice-local quads until no coplanar T-junctions remain within a
+    /// face group.
+    ///
+    /// This mode only subdivides the rectangles produced by the merge pass; it
+    /// does not change visibility.
+    pub eliminate_t_junctions: bool,
+}
 
 /// Reusable output and scratch storage for [`binary_greedy_quads`].
 ///
@@ -129,6 +206,8 @@ pub struct BinaryGreedyQuadsBuffer {
     visible_rows_alt: Vec<u64>,
     // Stage 4 scratch: carry lengths for the current face slice.
     carry_runs: Vec<u8>,
+    // Alternate-mode scratch: AO keys, slice-local quads, and split workspace.
+    feature_scratch: FeatureScratch,
 }
 
 impl BinaryGreedyQuadsBuffer {
@@ -169,6 +248,88 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
+    binary_greedy_quads_impl::<T, S, false, false>(voxels, voxels_shape, min, max, faces, output);
+}
+
+/// Generates greedy quads with configurable merge restrictions.
+///
+/// [`BinaryGreedyQuadsConfig::default`] matches [`binary_greedy_quads`]
+/// exactly. Alternate configurations may emit more quads in exchange for AO-
+/// safe merging, coplanar T-junction elimination, or both.
+///
+/// `ambient_occlusion_safe` only affects opaque faces. Translucent faces keep
+/// the same merge rule they use in the vanilla path.
+///
+/// `eliminate_t_junctions` runs a conservative slice-local split pass after
+/// the merge stage. It only subdivides rectangles; it never changes the set of
+/// visible unit faces.
+pub fn binary_greedy_quads_with_config<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    config: &BinaryGreedyQuadsConfig,
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    match (config.ambient_occlusion_safe, config.eliminate_t_junctions) {
+        (false, false) => {
+            binary_greedy_quads_impl::<T, S, false, false>(
+                voxels,
+                voxels_shape,
+                min,
+                max,
+                faces,
+                output,
+            );
+        }
+        (true, false) => {
+            binary_greedy_quads_impl::<T, S, true, false>(
+                voxels,
+                voxels_shape,
+                min,
+                max,
+                faces,
+                output,
+            );
+        }
+        (false, true) => {
+            binary_greedy_quads_impl::<T, S, false, true>(
+                voxels,
+                voxels_shape,
+                min,
+                max,
+                faces,
+                output,
+            );
+        }
+        (true, true) => {
+            binary_greedy_quads_impl::<T, S, true, true>(
+                voxels,
+                voxels_shape,
+                min,
+                max,
+                faces,
+                output,
+            );
+        }
+    }
+}
+
+fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool, const NO_T_JUNCTIONS: bool>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
     let Some(context) = MeshingContext::new(voxels, voxels_shape, min, max, faces) else {
         output.quads.reset();
         return;
@@ -183,6 +344,7 @@ pub fn binary_greedy_quads<T, S>(
         visible_rows,
         visible_rows_alt,
         carry_runs,
+        feature_scratch,
     } = output;
 
     // Stage 1: build reusable occupancy columns for all three candidate bit axes.
@@ -220,27 +382,52 @@ pub fn binary_greedy_quads<T, S>(
             visible_rows_alt,
         );
 
-        // Stage 3 and 4: emit unit quads for fragmented slices, otherwise carry-merge rows.
-        mesh_face_rows(
-            voxels,
-            &context,
-            slice,
-            visible_rows,
-            neg_unit_only,
-            neg_axes,
-            carry_runs,
-            &mut quads.groups[neg_face_index],
-        );
-        mesh_face_rows(
-            voxels,
-            &context,
-            slice,
-            visible_rows_alt,
-            pos_unit_only,
-            pos_axes,
-            carry_runs,
-            &mut quads.groups[pos_face_index],
-        );
+        // Stage 3 and 4: emit unit quads for fragmented slices, otherwise
+        // merge rows with either the vanilla maximum-merge path or one of the
+        // alternate merge policies.
+        if AO_SAFE || NO_T_JUNCTIONS {
+            mesh_face_rows_with_features::<T, AO_SAFE, NO_T_JUNCTIONS>(
+                voxels,
+                &context,
+                slice,
+                visible_rows,
+                neg_unit_only,
+                neg_axes,
+                feature_scratch,
+                &mut quads.groups[neg_face_index],
+            );
+            mesh_face_rows_with_features::<T, AO_SAFE, NO_T_JUNCTIONS>(
+                voxels,
+                &context,
+                slice,
+                visible_rows_alt,
+                pos_unit_only,
+                pos_axes,
+                feature_scratch,
+                &mut quads.groups[pos_face_index],
+            );
+        } else {
+            mesh_face_rows(
+                voxels,
+                &context,
+                slice,
+                visible_rows,
+                neg_unit_only,
+                neg_axes,
+                carry_runs,
+                &mut quads.groups[neg_face_index],
+            );
+            mesh_face_rows(
+                voxels,
+                &context,
+                slice,
+                visible_rows_alt,
+                pos_unit_only,
+                pos_axes,
+                carry_runs,
+                &mut quads.groups[pos_face_index],
+            );
+        }
     }
 }
 

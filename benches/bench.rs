@@ -5,7 +5,10 @@ use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, MergeVoxel, UnitQuadBuffer, Voxel,
     VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{
+    binary_greedy_quads, binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
+    BinaryGreedyQuadsConfig,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +58,7 @@ struct MultiCase {
 fn bench_meshers(c: &mut Criterion) {
     let cases = benchmark_cases();
     let multi_cases = benchmark_multi_chunk_cases();
+    let strategy_cases = strategy_benchmark_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
 
@@ -188,6 +192,50 @@ fn bench_meshers(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    let configs = [
+        (
+            "binary_greedy_quads_ao_safe",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: true,
+                eliminate_t_junctions: false,
+            },
+        ),
+        (
+            "binary_greedy_quads_no_t_junctions",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: false,
+                eliminate_t_junctions: true,
+            },
+        ),
+        (
+            "binary_greedy_quads_ao_safe_no_t_junctions",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: true,
+                eliminate_t_junctions: true,
+            },
+        ),
+    ];
+
+    for case in &strategy_cases {
+        for (name, config) in configs {
+            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads_with_config(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &config,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            });
+        }
     }
 
     group.finish();
@@ -348,6 +396,45 @@ fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
             }
         },
     )]
+}
+
+fn strategy_benchmark_cases() -> Vec<Case> {
+    let base_cases = benchmark_cases();
+
+    vec![
+        base_cases
+            .iter()
+            .find(|case| case.name == "dense-sphere")
+            .expect("dense-sphere benchmark case")
+            .clone(),
+        base_cases
+            .iter()
+            .find(|case| case.name == "translucent-shell-sphere")
+            .expect("translucent-shell-sphere benchmark case")
+            .clone(),
+        build_case(
+            "ao-t-junction-stress",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| {
+                let terrace = y == 16
+                    && ((8..=11).contains(&z) && (8..=25).contains(&x)
+                        || (12..=15).contains(&z) && (8..=19).contains(&x)
+                        || (16..=19).contains(&z) && (8..=13).contains(&x));
+                let ribs = y == 16 && matches!((x, z), (8, 12..=19) | (14, 12..=19) | (20, 8..=15));
+
+                if terrace || ribs {
+                    BenchVoxel {
+                        visibility: VoxelVisibility::Opaque,
+                        material: 1,
+                    }
+                } else {
+                    BenchVoxel::default()
+                }
+            },
+        ),
+    ]
 }
 
 fn build_case(
