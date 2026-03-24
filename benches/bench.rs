@@ -61,6 +61,29 @@ fn bench_meshers(c: &mut Criterion) {
     let strategy_cases = strategy_benchmark_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
+    let configs = [
+        (
+            "binary_greedy_quads_ao_safe",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: true,
+                eliminate_t_junctions: false,
+            },
+        ),
+        (
+            "binary_greedy_quads_no_t_junctions",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: false,
+                eliminate_t_junctions: true,
+            },
+        ),
+        (
+            "binary_greedy_quads_ao_safe_no_t_junctions",
+            BinaryGreedyQuadsConfig {
+                ambient_occlusion_safe: true,
+                eliminate_t_junctions: true,
+            },
+        ),
+    ];
 
     for case in &cases {
         group.bench_with_input(
@@ -192,31 +215,29 @@ fn bench_meshers(c: &mut Criterion) {
                 });
             },
         );
-    }
 
-    let configs = [
-        (
-            "binary_greedy_quads_ao_safe",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: true,
-                eliminate_t_junctions: false,
-            },
-        ),
-        (
-            "binary_greedy_quads_no_t_junctions",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: false,
-                eliminate_t_junctions: true,
-            },
-        ),
-        (
-            "binary_greedy_quads_ao_safe_no_t_junctions",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: true,
-                eliminate_t_junctions: true,
-            },
-        ),
-    ];
+        for (name, config) in configs {
+            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    let mut total_quads = 0usize;
+                    for chunk in &case.chunks {
+                        binary_greedy_quads_with_config(
+                            black_box(&chunk.voxels),
+                            &chunk.shape,
+                            chunk.min,
+                            chunk.max,
+                            &faces,
+                            &config,
+                            &mut buffer,
+                        );
+                        total_quads += buffer.quads.num_quads();
+                    }
+                    black_box(total_quads);
+                });
+            });
+        }
+    }
 
     for case in &strategy_cases {
         for (name, config) in configs {

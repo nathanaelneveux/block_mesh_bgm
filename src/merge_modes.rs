@@ -517,59 +517,68 @@ fn subdivide_slice_quads(
     bit_splits: &mut Vec<u8>,
     outer_splits: &mut Vec<u8>,
 ) {
-    vertical_cuts.resize(bit_len + 1, 0);
-    vertical_cuts.fill(0);
-    horizontal_cuts.resize(outer_len + 1, 0);
-    horizontal_cuts.fill(0);
+    loop {
+        vertical_cuts.resize(bit_len + 1, 0);
+        vertical_cuts.fill(0);
+        horizontal_cuts.resize(outer_len + 1, 0);
+        horizontal_cuts.fill(0);
 
-    for quad in slice_quads.iter().copied() {
-        let outer_mask = boundary_mask(quad.outer as usize, quad.height as usize);
-        vertical_cuts[quad.bit as usize] |= outer_mask;
-        vertical_cuts[quad.bit_end()] |= outer_mask;
+        for quad in slice_quads.iter().copied() {
+            let outer_mask = boundary_mask(quad.outer as usize, quad.height as usize);
+            vertical_cuts[quad.bit as usize] |= outer_mask;
+            vertical_cuts[quad.bit_end()] |= outer_mask;
 
-        let bit_mask_bits = boundary_mask(quad.bit as usize, quad.width as usize);
-        horizontal_cuts[quad.outer as usize] |= bit_mask_bits;
-        horizontal_cuts[quad.outer_end()] |= bit_mask_bits;
+            let bit_mask_bits = boundary_mask(quad.bit as usize, quad.width as usize);
+            horizontal_cuts[quad.outer as usize] |= bit_mask_bits;
+            horizontal_cuts[quad.outer_end()] |= bit_mask_bits;
+        }
+
+        split_quads.clear();
+        let mut changed = false;
+
+        for quad in slice_quads.iter().copied() {
+            bit_splits.clear();
+            bit_splits.push(quad.bit);
+
+            let outer_mask = boundary_mask(quad.outer as usize, quad.height as usize);
+            for boundary in quad.bit as usize + 1..quad.bit_end() {
+                if vertical_cuts[boundary] & outer_mask != 0 {
+                    bit_splits.push(boundary as u8);
+                }
+            }
+            bit_splits.push(quad.bit as usize as u8 + quad.width);
+
+            outer_splits.clear();
+            outer_splits.push(quad.outer);
+
+            let bit_mask_bits = boundary_mask(quad.bit as usize, quad.width as usize);
+            for boundary in quad.outer as usize + 1..quad.outer_end() {
+                if horizontal_cuts[boundary] & bit_mask_bits != 0 {
+                    outer_splits.push(boundary as u8);
+                }
+            }
+            outer_splits.push(quad.outer as usize as u8 + quad.height);
+
+            changed |= bit_splits.len() > 2 || outer_splits.len() > 2;
+
+            for outer_window in outer_splits.windows(2) {
+                for bit_window in bit_splits.windows(2) {
+                    split_quads.push(LocalQuad {
+                        bit: bit_window[0],
+                        outer: outer_window[0],
+                        width: bit_window[1] - bit_window[0],
+                        height: outer_window[1] - outer_window[0],
+                    });
+                }
+            }
+        }
+
+        if !changed {
+            return;
+        }
+
+        std::mem::swap(slice_quads, split_quads);
     }
-
-    split_quads.clear();
-
-    for quad in slice_quads.iter().copied() {
-        bit_splits.clear();
-        bit_splits.push(quad.bit);
-
-        let outer_mask = boundary_mask(quad.outer as usize, quad.height as usize);
-        for boundary in quad.bit as usize + 1..quad.bit_end() {
-            if vertical_cuts[boundary] & outer_mask != 0 {
-                bit_splits.push(boundary as u8);
-            }
-        }
-        bit_splits.push(quad.bit as usize as u8 + quad.width);
-
-        outer_splits.clear();
-        outer_splits.push(quad.outer);
-
-        let bit_mask_bits = boundary_mask(quad.bit as usize, quad.width as usize);
-        for boundary in quad.outer as usize + 1..quad.outer_end() {
-            if horizontal_cuts[boundary] & bit_mask_bits != 0 {
-                outer_splits.push(boundary as u8);
-            }
-        }
-        outer_splits.push(quad.outer as usize as u8 + quad.height);
-
-        for outer_window in outer_splits.windows(2) {
-            for bit_window in bit_splits.windows(2) {
-                split_quads.push(LocalQuad {
-                    bit: bit_window[0],
-                    outer: outer_window[0],
-                    width: bit_window[1] - bit_window[0],
-                    height: outer_window[1] - outer_window[0],
-                });
-            }
-        }
-    }
-
-    std::mem::swap(slice_quads, split_quads);
 }
 
 #[inline]

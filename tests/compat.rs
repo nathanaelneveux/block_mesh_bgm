@@ -375,6 +375,43 @@ fn t_junction_free_mode_preserves_geometry_and_removes_coplanar_t_junctions() {
 }
 
 #[test]
+fn t_junction_free_mode_removes_t_junctions_for_example_torus() {
+    let shape = RuntimeShape::<u32, 3>::new([34, 34, 34]);
+    let voxels = make_voxels([34, 34, 34], |x, y, z| {
+        if x == 0 || y == 0 || z == 0 || x == 33 || y == 33 || z == 33 {
+            return TestVoxel::empty(0);
+        }
+
+        let p = into_example_domain([x, y, z]);
+        let radial = (p[0] * p[0] + p[2] * p[2]).sqrt();
+        let ring = radial - 0.56;
+
+        if ring * ring + p[1] * p[1] < 0.24 * 0.24 {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+
+    let no_t_junctions = mesh_with_binary_bgm_config(
+        &voxels,
+        &shape,
+        [0; 3],
+        [33; 3],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        BinaryGreedyQuadsConfig {
+            ambient_occlusion_safe: false,
+            eliminate_t_junctions: true,
+        },
+    );
+
+    assert!(!has_coplanar_t_junctions(
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        &no_t_junctions
+    ));
+}
+
+#[test]
 fn combined_mode_preserves_geometry_and_enforces_both_invariants() {
     let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
     let voxels = make_voxels([8, 6, 8], |x, y, z| {
@@ -768,11 +805,8 @@ fn has_coplanar_t_junctions(faces: &[OrientedBlockFace; 6], buffer: &QuadBuffer)
                 });
         }
 
-        for mut quads in planes.into_values() {
-            let mut subdivided = subdivide_plane_quads(&quads);
-            quads.sort_unstable();
-            subdivided.sort_unstable();
-            if quads != subdivided {
+        for quads in planes.into_values() {
+            if plane_has_t_junctions(&quads) {
                 return true;
             }
         }
@@ -781,69 +815,52 @@ fn has_coplanar_t_junctions(faces: &[OrientedBlockFace; 6], buffer: &QuadBuffer)
     false
 }
 
-fn subdivide_plane_quads(quads: &[PlaneQuad]) -> Vec<PlaneQuad> {
-    let mut max_u = 0usize;
-    let mut max_v = 0usize;
-    for quad in quads {
-        max_u = max_u.max((quad.u + quad.width) as usize);
-        max_v = max_v.max((quad.v + quad.height) as usize);
-    }
-
-    let mut vertical_cuts = vec![0u64; max_u + 1];
-    let mut horizontal_cuts = vec![0u64; max_v + 1];
+fn plane_has_t_junctions(quads: &[PlaneQuad]) -> bool {
+    let mut vertical = BTreeMap::<u32, Vec<Segment>>::new();
+    let mut horizontal = BTreeMap::<u32, Vec<Segment>>::new();
 
     for quad in quads {
-        let v_mask = boundary_mask(quad.v, quad.height);
-        vertical_cuts[quad.u as usize] |= v_mask;
-        vertical_cuts[(quad.u + quad.width) as usize] |= v_mask;
-
-        let u_mask = boundary_mask(quad.u, quad.width);
-        horizontal_cuts[quad.v as usize] |= u_mask;
-        horizontal_cuts[(quad.v + quad.height) as usize] |= u_mask;
+        vertical.entry(quad.u).or_default().push(Segment {
+            start: quad.v,
+            end: quad.v + quad.height,
+        });
+        vertical
+            .entry(quad.u + quad.width)
+            .or_default()
+            .push(Segment {
+                start: quad.v,
+                end: quad.v + quad.height,
+            });
+        horizontal.entry(quad.v).or_default().push(Segment {
+            start: quad.u,
+            end: quad.u + quad.width,
+        });
+        horizontal
+            .entry(quad.v + quad.height)
+            .or_default()
+            .push(Segment {
+                start: quad.u,
+                end: quad.u + quad.width,
+            });
     }
 
-    let mut split = Vec::new();
-    let mut u_splits = Vec::new();
-    let mut v_splits = Vec::new();
-
-    for quad in quads {
-        u_splits.clear();
-        u_splits.push(quad.u);
-        let v_mask = boundary_mask(quad.v, quad.height);
-        for boundary in quad.u + 1..quad.u + quad.width {
-            if vertical_cuts[boundary as usize] & v_mask != 0 {
-                u_splits.push(boundary);
-            }
-        }
-        u_splits.push(quad.u + quad.width);
-
-        v_splits.clear();
-        v_splits.push(quad.v);
-        let u_mask = boundary_mask(quad.u, quad.width);
-        for boundary in quad.v + 1..quad.v + quad.height {
-            if horizontal_cuts[boundary as usize] & u_mask != 0 {
-                v_splits.push(boundary);
-            }
-        }
-        v_splits.push(quad.v + quad.height);
-
-        for v_window in v_splits.windows(2) {
-            for u_window in u_splits.windows(2) {
-                split.push(PlaneQuad {
-                    u: u_window[0],
-                    v: v_window[0],
-                    width: u_window[1] - u_window[0],
-                    height: v_window[1] - v_window[0],
-                });
-            }
-        }
-    }
-
-    split
+    vertical.values().any(|segments| line_has_t_junctions(segments))
+        || horizontal.values().any(|segments| line_has_t_junctions(segments))
 }
 
-fn boundary_mask(start: u32, len_in_cells: u32) -> u64 {
-    ((1u64 << (len_in_cells + 1)) - 1) << start
+fn line_has_t_junctions(segments: &[Segment]) -> bool {
+    for segment in segments {
+        for endpoint in [segment.start, segment.end] {
+            if segments
+                .iter()
+                .any(|other| other.start < endpoint && endpoint < other.end)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -854,6 +871,12 @@ struct PlaneQuad {
     height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Segment {
+    start: u32,
+    end: u32,
+}
+
 fn face_merge_key(voxels: &[TestVoxel], shape: &RuntimeShape<u32, 3>, coord: [u32; 3]) -> u16 {
     let voxel = voxels[shape.linearize(coord) as usize];
     merge_key(voxel.merge_value())
@@ -861,6 +884,14 @@ fn face_merge_key(voxels: &[TestVoxel], shape: &RuntimeShape<u32, 3>, coord: [u3
 
 fn merge_key((visibility, material): (VoxelVisibility, u8)) -> u16 {
     ((visibility_key(visibility) as u16) << 8) | material as u16
+}
+
+fn into_example_domain([x, y, z]: [u32; 3]) -> [f32; 3] {
+    [
+        (2.0 / 32.0) * x as f32 - 1.0,
+        (2.0 / 32.0) * y as f32 - 1.0,
+        (2.0 / 32.0) * z as f32 - 1.0,
+    ]
 }
 
 fn visibility_key(visibility: VoxelVisibility) -> u8 {
