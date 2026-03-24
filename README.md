@@ -122,6 +122,28 @@ The benchmark suite compares three paths on the same voxel datasets:
 That makes it easier to reason about where time is going:
 `visible_block_faces` is the speed target, while `greedy_quads` is the output-shape baseline.
 
+## Benchmark Snapshot
+
+Recent local `cargo bench --bench bench` Criterion medians on my machine:
+
+| Case | `visible_block_faces` | `greedy_quads` | `binary_greedy_quads` |
+| --- | ---: | ---: | ---: |
+| `dense-sphere` | `46.47 µs` | `292.20 µs` | `38.15 µs` |
+| `translucent-sphere` | `45.20 µs` | `304.32 µs` | `40.03 µs` |
+| `translucent-shell-sphere` | `43.71 µs` | `331.60 µs` | `46.14 µs` |
+| `layered-caves` | `83.93 µs` | `856.14 µs` | `86.64 µs` |
+| `checkerboard` | `84.74 µs` | `780.25 µs` | `77.45 µs` |
+| `partial-extent` | `41.15 µs` | `290.83 µs` | `50.84 µs` |
+| `translucent-mix` | `97.57 µs` | `1.0524 ms` | `140.54 µs` |
+| `layered-caves-2x2x2` | `795.17 µs` | `4.9070 ms` | `675.18 µs` |
+
+Useful takeaways from that run:
+
+- `binary_greedy_quads` is already faster than `visible_block_faces` on `dense-sphere`, `translucent-sphere`, `checkerboard`, and `layered-caves-2x2x2`.
+- It is essentially at parity on `layered-caves`.
+- The main remaining misses are `partial-extent`, `translucent-shell-sphere`, and especially the deliberately hostile `translucent-mix` case.
+- It remains much faster than upstream `greedy_quads` across every benchmark in the suite.
+
 ## Visual Examples
 
 The workspace includes an `examples_crate` for visual inspection.
@@ -152,3 +174,12 @@ cargo run -p block-mesh-bgm-examples --example custom_meshing
 
 That example is based on the `bevy_voxel_world` custom meshing demo, but swaps in
 this crate's binary greedy mesher.
+
+## License
+
+This crate follows the same dual-license model as `block-mesh`:
+
+- Apache License, Version 2.0, in `LICENSE.Apache-2.0`
+- MIT license, in `LICENSE.MIT`
+
+You may choose either license.
