@@ -124,7 +124,6 @@ fn setup(
     log_stats(sample_mode, mesh_mode, config, stats);
     info!("Press U to toggle binary greedy vs unit quads.");
     info!("Press A to toggle AO-safe merging.");
-    info!("Press T to toggle T-junction elimination.");
     info!("Press S to toggle sphere vs torus.");
 
     commands.insert_resource(MergeModeScene {
@@ -158,11 +157,6 @@ fn toggle_merge_modes(
 
     if keyboard.just_pressed(KeyCode::KeyA) {
         scene.config.ambient_occlusion_safe = !scene.config.ambient_occlusion_safe;
-        changed = true;
-    }
-
-    if keyboard.just_pressed(KeyCode::KeyT) {
-        scene.config.eliminate_t_junctions = !scene.config.eliminate_t_junctions;
         changed = true;
     }
 
@@ -290,7 +284,6 @@ fn overlay_string(
          U: toggle mesh mode [{}]\n\
          S: toggle sample shape [{}]\n\
          A: toggle AO-safe merges + ambient occlusion [{}]\n\
-         T: toggle T-junction elimination [{}]\n\
          Wireframe: always on\n\
          Mesh: {}\n\
          Sample: {}\n\
@@ -300,7 +293,6 @@ fn overlay_string(
         mesh_mode.label(),
         sample_mode.label(),
         toggle_label(config.ambient_occlusion_safe),
-        toggle_label(config.eliminate_t_junctions),
         mesh_mode.label(),
         sample_mode.label(),
         stats.quads,
@@ -355,11 +347,10 @@ fn log_stats(
     stats: MeshStats,
 ) {
     info!(
-        "Mesh: {} | Sample: {} | AO-safe: {} | T-junction-free: {} | quads: {} | vertices: {} | triangles: {}",
+        "Mesh: {} | Sample: {} | AO-safe: {} | quads: {} | vertices: {} | triangles: {}",
         mesh_mode.label(),
         sample_mode.label(),
         toggle_label(config.ambient_occlusion_safe),
-        toggle_label(config.eliminate_t_junctions),
         stats.quads,
         stats.vertices,
         stats.triangles,

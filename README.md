@@ -10,7 +10,6 @@ The default entry point keeps the current maximum-merge behavior. A second
 configurable entry point can optionally:
 
 - stop merges that would cross differing ambient-occlusion corner signatures on opaque faces
-- split coplanar quads until no intra-face-group T-junctions remain
 
 ## Goals
 
@@ -114,7 +113,6 @@ assert!(buffer.quads.num_quads() > 0);
 
 let config = BinaryGreedyQuadsConfig {
     ambient_occlusion_safe: true,
-    eliminate_t_junctions: true,
 };
 
 binary_greedy_quads_with_config(
@@ -132,13 +130,12 @@ binary_greedy_quads_with_config(
 
 `binary_greedy_quads` is still the zero-extra-work path.
 
-`binary_greedy_quads_with_config` adds two independent toggles:
+`binary_greedy_quads_with_config` currently adds one optional merge restriction:
 
 - `ambient_occlusion_safe`: only merges opaque faces when their four ambient-occlusion corner values match. It does not compute or emit lighting data for you; it only keeps the mesh compatible with per-vertex AO shading.
-- `eliminate_t_junctions`: runs a conservative slice-local split pass after greedy merging so coplanar quads within a face group line up on shared boundaries.
 
-These modes can be enabled independently or together. They may increase quad
-count and meshing time, but they do not change the visible unit-face geometry.
+AO-safe mode may increase quad count and meshing time, but it does not change
+the visible unit-face geometry.
 
 ## Development
 
@@ -214,9 +211,8 @@ cargo run -p block-mesh-bgm-examples --example merge_modes
 That example renders one opaque sphere with wireframe always enabled so you can
 inspect how the configurable merge policies change the quad layout.
 Press `U` to toggle between binary greedy output and unit quads, `S` to toggle
-between an opaque sphere and an opaque torus, `A` to toggle AO-safe merging
-together with AO vertex shading, and `T` to toggle coplanar
-T-junction elimination.
+between an opaque sphere and an opaque torus, and `A` to toggle AO-safe
+merging together with AO vertex shading.
 
 Run the `bevy_voxel_world` integration example with:
 

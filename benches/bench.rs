@@ -61,29 +61,12 @@ fn bench_meshers(c: &mut Criterion) {
     let strategy_cases = strategy_benchmark_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
-    let configs = [
-        (
-            "binary_greedy_quads_ao_safe",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: true,
-                eliminate_t_junctions: false,
-            },
-        ),
-        (
-            "binary_greedy_quads_no_t_junctions",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: false,
-                eliminate_t_junctions: true,
-            },
-        ),
-        (
-            "binary_greedy_quads_ao_safe_no_t_junctions",
-            BinaryGreedyQuadsConfig {
-                ambient_occlusion_safe: true,
-                eliminate_t_junctions: true,
-            },
-        ),
-    ];
+    let configs = [(
+        "binary_greedy_quads_ao_safe",
+        BinaryGreedyQuadsConfig {
+            ambient_occlusion_safe: true,
+        },
+    )];
 
     for case in &cases {
         group.bench_with_input(
@@ -518,7 +501,7 @@ fn strategy_benchmark_cases() -> Vec<Case> {
             case
         },
         build_case(
-            "ao-t-junction-stress",
+            "ao-boundary-stress",
             [34, 34, 34],
             [0; 3],
             [33; 3],

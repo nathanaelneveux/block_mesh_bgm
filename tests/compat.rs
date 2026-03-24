@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use block_mesh::ndshape::{RuntimeShape, Shape};
 use block_mesh::{
     greedy_quads, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, Voxel,
@@ -229,7 +227,6 @@ fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
     });
     let config = BinaryGreedyQuadsConfig {
         ambient_occlusion_safe: true,
-        eliminate_t_junctions: false,
     };
 
     let vanilla = mesh_with_binary_bgm(
@@ -300,7 +297,6 @@ fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
         &RIGHT_HANDED_Y_UP_CONFIG.faces,
         BinaryGreedyQuadsConfig {
             ambient_occlusion_safe: true,
-            eliminate_t_junctions: false,
         },
     );
     let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
@@ -317,204 +313,6 @@ fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
         1,
         "AO-safe mode should not split a face whose entire exposed side is empty"
     );
-}
-
-#[test]
-fn t_junction_free_mode_preserves_geometry_and_removes_coplanar_t_junctions() {
-    let shape = RuntimeShape::<u32, 3>::new([8, 5, 8]);
-    let voxels = make_voxels([8, 5, 8], |x, y, z| {
-        if x == 0 || y == 0 || z == 0 || x == 7 || y == 4 || z == 7 {
-            return TestVoxel::empty(0);
-        }
-
-        let filled =
-            y == 2 && matches!((x, z), (2, 2) | (3, 2) | (4, 2) | (5, 2) | (2, 3) | (3, 3));
-
-        if filled {
-            TestVoxel::opaque(1, 0)
-        } else {
-            TestVoxel::empty(0)
-        }
-    });
-    let config = BinaryGreedyQuadsConfig {
-        ambient_occlusion_safe: false,
-        eliminate_t_junctions: true,
-    };
-
-    let vanilla = mesh_with_binary_bgm(
-        &voxels,
-        &shape,
-        [0; 3],
-        [7, 4, 7],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-    );
-    let no_t_junctions = mesh_with_binary_bgm_config(
-        &voxels,
-        &shape,
-        [0; 3],
-        [7, 4, 7],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        config,
-    );
-
-    assert_same_geometry_buffers(
-        &voxels,
-        &shape,
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &vanilla,
-        &no_t_junctions,
-    );
-    assert!(has_coplanar_t_junctions(
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &vanilla
-    ));
-    assert!(!has_coplanar_t_junctions(
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &no_t_junctions
-    ));
-}
-
-#[test]
-fn t_junction_free_mode_removes_t_junctions_for_example_torus() {
-    let shape = RuntimeShape::<u32, 3>::new([34, 34, 34]);
-    let voxels = make_voxels([34, 34, 34], |x, y, z| {
-        if x == 0 || y == 0 || z == 0 || x == 33 || y == 33 || z == 33 {
-            return TestVoxel::empty(0);
-        }
-
-        let p = into_example_domain([x, y, z]);
-        let radial = (p[0] * p[0] + p[2] * p[2]).sqrt();
-        let ring = radial - 0.56;
-
-        if ring * ring + p[1] * p[1] < 0.24 * 0.24 {
-            TestVoxel::opaque(1, 0)
-        } else {
-            TestVoxel::empty(0)
-        }
-    });
-
-    let no_t_junctions = mesh_with_binary_bgm_config(
-        &voxels,
-        &shape,
-        [0; 3],
-        [33; 3],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        BinaryGreedyQuadsConfig {
-            ambient_occlusion_safe: false,
-            eliminate_t_junctions: true,
-        },
-    );
-
-    assert!(!has_coplanar_t_junctions(
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &no_t_junctions
-    ));
-}
-
-#[test]
-fn t_junction_free_mode_handles_material_boundaries_conformingly() {
-    let shape = RuntimeShape::<u32, 3>::new([9, 5, 9]);
-    let voxels = make_voxels([9, 5, 9], |x, y, z| {
-        if x == 0 || y == 0 || z == 0 || x == 8 || y == 4 || z == 8 {
-            return TestVoxel::empty(0);
-        }
-
-        let voxel = match (y, z) {
-            (2, 2) if (2..=6).contains(&x) => Some(TestVoxel::opaque(1, 0)),
-            (2, 3) if (2..=4).contains(&x) => Some(TestVoxel::opaque(1, 0)),
-            (2, 3) if (5..=6).contains(&x) => Some(TestVoxel::opaque(2, 0)),
-            _ => None,
-        };
-
-        voxel.unwrap_or_else(|| TestVoxel::empty(0))
-    });
-
-    let no_t_junctions = mesh_with_binary_bgm_config(
-        &voxels,
-        &shape,
-        [0; 3],
-        [8, 4, 8],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        BinaryGreedyQuadsConfig {
-            ambient_occlusion_safe: false,
-            eliminate_t_junctions: true,
-        },
-    );
-    let vanilla = mesh_with_binary_bgm(
-        &voxels,
-        &shape,
-        [0; 3],
-        [8, 4, 8],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-    );
-
-    assert_same_geometry_buffers(
-        &voxels,
-        &shape,
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &vanilla,
-        &no_t_junctions,
-    );
-
-    assert!(!has_coplanar_t_junctions(
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &no_t_junctions
-    ));
-}
-
-#[test]
-fn combined_mode_preserves_geometry_and_enforces_both_invariants() {
-    let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
-    let voxels = make_voxels([8, 6, 8], |x, y, z| {
-        if x == 0 || y == 0 || z == 0 || x == 7 || y == 5 || z == 7 {
-            return TestVoxel::empty(0);
-        }
-
-        let filled = y == 2
-            && matches!(
-                (x, z),
-                (1, 2) | (2, 2) | (3, 2) | (4, 2) | (5, 2) | (2, 3) | (3, 3)
-            );
-
-        if filled {
-            TestVoxel::opaque(1, 0)
-        } else {
-            TestVoxel::empty(0)
-        }
-    });
-    let config = BinaryGreedyQuadsConfig {
-        ambient_occlusion_safe: true,
-        eliminate_t_junctions: true,
-    };
-
-    let expected = mesh_with_block_mesh(
-        &voxels,
-        &shape,
-        [0; 3],
-        [7, 5, 7],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-    );
-    let combined = mesh_with_binary_bgm_config(
-        &voxels,
-        &shape,
-        [0; 3],
-        [7, 5, 7],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        config,
-    );
-
-    assert_same_geometry_buffers(
-        &voxels,
-        &shape,
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &expected,
-        &combined,
-    );
-    assert_uniform_ao_per_quad(&voxels, &shape, &RIGHT_HANDED_Y_UP_CONFIG.faces, &combined);
-    assert!(!has_coplanar_t_junctions(
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &combined
-    ));
 }
 
 #[test]
@@ -839,99 +637,6 @@ fn offset2_is_opaque(
     voxels[shape.linearize(offset_coord) as usize].visibility == VoxelVisibility::Opaque
 }
 
-fn has_coplanar_t_junctions(faces: &[OrientedBlockFace; 6], buffer: &QuadBuffer) -> bool {
-    for (face_index, face) in faces.iter().enumerate() {
-        let axes = face_axes(face);
-        let mut planes = BTreeMap::<u32, Vec<PlaneQuad>>::new();
-
-        for quad in &buffer.groups[face_index] {
-            planes
-                .entry(quad.minimum[axes.n_axis])
-                .or_default()
-                .push(PlaneQuad {
-                    u: quad.minimum[axes.u_axis],
-                    v: quad.minimum[axes.v_axis],
-                    width: quad.width,
-                    height: quad.height,
-                });
-        }
-
-        for quads in planes.into_values() {
-            if plane_has_t_junctions(&quads) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn plane_has_t_junctions(quads: &[PlaneQuad]) -> bool {
-    let mut vertical = BTreeMap::<u32, Vec<Segment>>::new();
-    let mut horizontal = BTreeMap::<u32, Vec<Segment>>::new();
-
-    for quad in quads {
-        vertical.entry(quad.u).or_default().push(Segment {
-            start: quad.v,
-            end: quad.v + quad.height,
-        });
-        vertical
-            .entry(quad.u + quad.width)
-            .or_default()
-            .push(Segment {
-                start: quad.v,
-                end: quad.v + quad.height,
-            });
-        horizontal.entry(quad.v).or_default().push(Segment {
-            start: quad.u,
-            end: quad.u + quad.width,
-        });
-        horizontal
-            .entry(quad.v + quad.height)
-            .or_default()
-            .push(Segment {
-                start: quad.u,
-                end: quad.u + quad.width,
-            });
-    }
-
-    vertical
-        .values()
-        .any(|segments| line_has_t_junctions(segments))
-        || horizontal
-            .values()
-            .any(|segments| line_has_t_junctions(segments))
-}
-
-fn line_has_t_junctions(segments: &[Segment]) -> bool {
-    for segment in segments {
-        for endpoint in [segment.start, segment.end] {
-            if segments
-                .iter()
-                .any(|other| other.start < endpoint && endpoint < other.end)
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PlaneQuad {
-    u: u32,
-    v: u32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Segment {
-    start: u32,
-    end: u32,
-}
-
 fn face_merge_key(voxels: &[TestVoxel], shape: &RuntimeShape<u32, 3>, coord: [u32; 3]) -> u16 {
     let voxel = voxels[shape.linearize(coord) as usize];
     merge_key(voxel.merge_value())
@@ -939,14 +644,6 @@ fn face_merge_key(voxels: &[TestVoxel], shape: &RuntimeShape<u32, 3>, coord: [u3
 
 fn merge_key((visibility, material): (VoxelVisibility, u8)) -> u16 {
     ((visibility_key(visibility) as u16) << 8) | material as u16
-}
-
-fn into_example_domain([x, y, z]: [u32; 3]) -> [f32; 3] {
-    [
-        (2.0 / 32.0) * x as f32 - 1.0,
-        (2.0 / 32.0) * y as f32 - 1.0,
-        (2.0 / 32.0) * z as f32 - 1.0,
-    ]
 }
 
 fn visibility_key(visibility: VoxelVisibility) -> u8 {
