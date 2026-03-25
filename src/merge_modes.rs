@@ -5,13 +5,12 @@
 //! only handles the AO-safe variant, which keeps the same carry structure but
 //! refuses to merge opaque faces whose four corner AO values differ.
 
-use block_mesh::{MergeVoxel, UnorientedQuad, Voxel, VoxelVisibility};
+use block_mesh::{MergeVoxel, UnorientedQuad};
 
 use crate::bit_mask;
 use crate::context::{MeshingContext, SlicePlan};
 use crate::face::{write_quad, write_unit_quad, FaceAxes};
-
-const NON_OPAQUE_AO_KEY: u16 = 0;
+use crate::prep::column_row_layout;
 
 /// Internal feature bitset for alternate merge policies.
 ///
@@ -41,21 +40,12 @@ impl MergeFeatures {
 /// Reusable scratch that only AO-safe meshing needs.
 #[derive(Default)]
 pub(crate) struct FeatureScratch {
-    ao_keys: Vec<u16>,
+    ao_keys: Vec<u8>,
     carry_runs: Vec<u8>,
-    slice_quads: Vec<LocalQuad>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LocalQuad {
-    bit: u8,
-    outer: u8,
-    width: u8,
-    height: u8,
 }
 
 /// Dispatches one face slice to the requested alternate merge policy.
-#[inline]
+#[inline(always)]
 pub(crate) fn mesh_face_rows_with_features<T>(
     voxels: &[T],
     context: &MeshingContext,
@@ -63,6 +53,7 @@ pub(crate) fn mesh_face_rows_with_features<T>(
     visible_rows: &[u64],
     unit_only: bool,
     axes: FaceAxes,
+    opaque_cols: &[u64],
     features: MergeFeatures,
     scratch: &mut FeatureScratch,
     quads: &mut Vec<UnorientedQuad>,
@@ -82,6 +73,7 @@ pub(crate) fn mesh_face_rows_with_features<T>(
             visible_rows,
             unit_only,
             axes,
+            opaque_cols,
             scratch,
             quads,
         );
@@ -93,7 +85,7 @@ pub(crate) fn mesh_face_rows_with_features<T>(
 
 /// Chooses the compile-time-specialized AO-safe kernel for one face
 /// orientation.
-#[inline]
+#[inline(always)]
 fn mesh_face_rows_ao_safe<T>(
     voxels: &[T],
     context: &MeshingContext,
@@ -101,6 +93,7 @@ fn mesh_face_rows_ao_safe<T>(
     visible_rows: &[u64],
     unit_only: bool,
     axes: FaceAxes,
+    opaque_cols: &[u64],
     scratch: &mut FeatureScratch,
     quads: &mut Vec<UnorientedQuad>,
 ) where
@@ -114,6 +107,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -124,6 +118,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -134,6 +129,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -144,6 +140,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -154,6 +151,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -164,6 +162,7 @@ fn mesh_face_rows_ao_safe<T>(
             visible_rows,
             unit_only,
             axes.n_sign,
+            opaque_cols,
             scratch,
             quads,
         ),
@@ -171,7 +170,7 @@ fn mesh_face_rows_ao_safe<T>(
     }
 }
 
-#[inline]
+#[inline(always)]
 fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     context: &MeshingContext,
@@ -179,6 +178,7 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     visible_rows: &[u64],
     unit_only: bool,
     face_sign: i32,
+    opaque_cols: &[u64],
     scratch: &mut FeatureScratch,
     quads: &mut Vec<UnorientedQuad>,
 ) where
@@ -200,8 +200,6 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     }
 
     let n_base = context.interior_min[N_AXIS];
-    let bit_base = context.interior_min[slice.bit_axis];
-    let outer_base = context.interior_min[slice.outer_axis];
     let outer_stride = context.strides[slice.outer_axis];
     let bit_stride = context.strides[slice.bit_axis];
 
@@ -212,18 +210,17 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
 
         build_slice_ao_keys(
-            voxels,
-            n_index_base,
-            context.strides[N_AXIS] as isize * face_sign as isize,
-            outer_stride,
-            bit_stride,
+            context.query_shape,
+            N_AXIS,
             slice,
+            n_local,
+            face_sign,
+            opaque_cols,
             slice_rows,
             &mut scratch.ao_keys,
         );
 
-        scratch.slice_quads.clear();
-        build_slice_quads_carry(
+        mesh_face_carry_ao::<T, N_AXIS, BIT_IS_U>(
             voxels,
             n_index_base,
             outer_stride,
@@ -232,30 +229,28 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
             slice_rows,
             &scratch.ao_keys,
             &mut scratch.carry_runs,
-            &mut scratch.slice_quads,
-        );
-
-        emit_local_quads::<N_AXIS, BIT_IS_U>(
-            &scratch.slice_quads,
             n_coord,
-            outer_base,
-            bit_base,
+            context.interior_min[slice.outer_axis],
+            context.interior_min[slice.bit_axis],
             quads,
         );
     }
 }
 
-#[inline]
-fn build_slice_quads_carry<T>(
+#[inline(always)]
+fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     n_index_base: usize,
     outer_stride: usize,
     bit_stride: usize,
     slice: SlicePlan,
     slice_rows: &[u64],
-    ao_keys: &[u16],
+    ao_keys: &[u8],
     carry_runs: &mut Vec<u8>,
-    slice_quads: &mut Vec<LocalQuad>,
+    n_coord: u32,
+    outer_base: u32,
+    bit_base: u32,
+    quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
@@ -266,114 +261,113 @@ fn build_slice_quads_carry<T>(
         let row_bits = slice_rows[outer_local];
         if row_bits == 0 {
             has_incoming_carry = false;
-            continue;
-        }
-
-        let next_row_bits = if outer_local + 1 < slice.outer_len {
-            slice_rows[outer_local + 1]
         } else {
-            0
-        };
-        let row_base_index = n_index_base + outer_local * outer_stride;
-        let overlapping_bits = row_bits & next_row_bits;
-
-        if overlapping_bits == 0 {
-            if has_incoming_carry {
-                emit_local_terminal_row_runs(
-                    voxels,
-                    row_bits,
-                    row_base_index,
-                    bit_stride,
-                    slice.bit_len,
-                    outer_local,
-                    ao_keys,
-                    carry_runs,
-                    slice_quads,
-                );
+            let next_row_bits = if outer_local + 1 < slice.outer_len {
+                slice_rows[outer_local + 1]
             } else {
-                emit_local_single_row_runs(
+                0
+            };
+            let row_base_index = n_index_base + outer_local * outer_stride;
+            let row_keys = ao_key_row(ao_keys, outer_local, slice.bit_len);
+            let overlapping_bits = row_bits & next_row_bits;
+
+            if overlapping_bits == 0 {
+                if has_incoming_carry {
+                    emit_terminal_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                        voxels,
+                        row_bits,
+                        row_base_index,
+                        bit_stride,
+                        slice.bit_len,
+                        n_coord,
+                        outer_base + outer_local as u32,
+                        bit_base,
+                        row_keys,
+                        carry_runs,
+                        quads,
+                    );
+                } else {
+                    emit_single_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                        voxels,
+                        row_bits,
+                        row_base_index,
+                        bit_stride,
+                        slice.bit_len,
+                        n_coord,
+                        outer_base + outer_local as u32,
+                        bit_base,
+                        row_keys,
+                        quads,
+                    );
+                }
+                has_incoming_carry = false;
+            } else {
+                let continue_mask = build_continue_mask(
                     voxels,
-                    row_bits,
+                    overlapping_bits,
                     row_base_index,
                     bit_stride,
-                    slice.bit_len,
-                    outer_local,
-                    ao_keys,
-                    slice_quads,
+                    outer_stride,
+                    row_keys,
+                    ao_key_row(ao_keys, outer_local + 1, slice.bit_len),
+                    carry_runs,
                 );
+                let ended_bits = row_bits & !continue_mask;
+
+                if !has_incoming_carry {
+                    if ended_bits != 0 {
+                        emit_single_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                            voxels,
+                            ended_bits,
+                            row_base_index,
+                            bit_stride,
+                            slice.bit_len,
+                            n_coord,
+                            outer_base + outer_local as u32,
+                            bit_base,
+                            row_keys,
+                            quads,
+                        );
+                    }
+                    has_incoming_carry = continue_mask != 0;
+                } else if ended_bits == 0 {
+                    has_incoming_carry = continue_mask != 0;
+                } else {
+                    emit_mixed_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                        voxels,
+                        ended_bits,
+                        row_base_index,
+                        bit_stride,
+                        slice.bit_len,
+                        n_coord,
+                        outer_base + outer_local as u32,
+                        bit_base,
+                        row_keys,
+                        carry_runs,
+                        quads,
+                    );
+                    has_incoming_carry = continue_mask != 0;
+                }
             }
-            has_incoming_carry = false;
-            continue;
         }
-
-        let continue_mask = build_continue_mask(
-            voxels,
-            overlapping_bits,
-            row_base_index,
-            bit_stride,
-            outer_stride,
-            slice.bit_len,
-            outer_local,
-            ao_keys,
-            carry_runs,
-        );
-        let ended_bits = row_bits & !continue_mask;
-
-        if !has_incoming_carry {
-            if ended_bits != 0 {
-                emit_local_single_row_runs(
-                    voxels,
-                    ended_bits,
-                    row_base_index,
-                    bit_stride,
-                    slice.bit_len,
-                    outer_local,
-                    ao_keys,
-                    slice_quads,
-                );
-            }
-            has_incoming_carry = continue_mask != 0;
-            continue;
-        }
-
-        if ended_bits == 0 {
-            has_incoming_carry = continue_mask != 0;
-            continue;
-        }
-
-        emit_local_mixed_row_runs(
-            voxels,
-            ended_bits,
-            row_base_index,
-            bit_stride,
-            slice.bit_len,
-            outer_local,
-            ao_keys,
-            carry_runs,
-            slice_quads,
-        );
-        has_incoming_carry = continue_mask != 0;
     }
 }
 
-#[inline]
+#[inline(always)]
 fn build_continue_mask<T>(
     voxels: &[T],
     mut overlapping_bits: u64,
     row_base_index: usize,
     bit_stride: usize,
     outer_stride: usize,
-    bit_len: usize,
-    outer_local: usize,
-    ao_keys: &[u16],
+    row_ao_keys: &[u8],
+    next_row_ao_keys: &[u8],
     carry_runs: &mut [u8],
 ) -> u64
 where
     T: MergeVoxel,
 {
     let mut continue_mask = 0u64;
-    let row_ao_keys = ao_key_row(ao_keys, outer_local, bit_len);
-    let next_row_ao_keys = ao_key_row(ao_keys, outer_local + 1, bit_len);
 
     while overlapping_bits != 0 {
         let bit_local = overlapping_bits.trailing_zeros() as usize;
@@ -400,21 +394,26 @@ where
     continue_mask
 }
 
-#[inline]
-fn emit_local_mixed_row_runs<T>(
+#[inline(always)]
+fn emit_mixed_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     mut row_bits: u64,
     row_base_index: usize,
     bit_stride: usize,
     bit_len: usize,
-    outer_local: usize,
-    ao_keys: &[u16],
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    row_ao_keys: &[u8],
     carry_runs: &mut [u8],
-    slice_quads: &mut Vec<LocalQuad>,
+    quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    let row_ao_keys = ao_key_row(ao_keys, outer_local, bit_len);
+    let base_len = quads.len();
+    quads.reserve(row_bits.count_ones() as usize);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
 
     while row_bits != 0 {
         let bit_local = row_bits.trailing_zeros() as usize;
@@ -443,30 +442,42 @@ fn emit_local_mixed_row_runs<T>(
         }
 
         row_bits &= !bit_mask(bit_local, run_width);
-        slice_quads.push(LocalQuad {
-            bit: bit_local as u8,
-            outer: (outer_local - run_carry as usize) as u8,
-            width: run_width as u8,
-            height: run_length as u8,
-        });
+        write_quad::<N_AXIS, BIT_IS_U>(
+            &mut spare[written],
+            n_coord,
+            outer_coord - run_carry as u32,
+            bit_base + bit_local as u32,
+            run_width as u32,
+            run_length as u32,
+        );
+        written += 1;
         carry_runs[bit_local] = 0;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
     }
 }
 
-#[inline]
-fn emit_local_single_row_runs<T>(
+#[inline(always)]
+fn emit_single_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
     row_base_index: usize,
     bit_stride: usize,
     bit_len: usize,
-    outer_local: usize,
-    ao_keys: &[u16],
-    slice_quads: &mut Vec<LocalQuad>,
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    row_ao_keys: &[u8],
+    quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    let row_ao_keys = ao_key_row(ao_keys, outer_local, bit_len);
+    let base_len = quads.len();
+    quads.reserve(row_bits.count_ones() as usize);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
     let mut bits_here = row_bits;
 
     while bits_here != 0 {
@@ -493,30 +504,42 @@ fn emit_local_single_row_runs<T>(
         }
 
         bits_here &= !bit_mask(bit_local, run_width);
-        slice_quads.push(LocalQuad {
-            bit: bit_local as u8,
-            outer: outer_local as u8,
-            width: run_width as u8,
-            height: 1,
-        });
+        write_quad::<N_AXIS, BIT_IS_U>(
+            &mut spare[written],
+            n_coord,
+            outer_coord,
+            bit_base + bit_local as u32,
+            run_width as u32,
+            1,
+        );
+        written += 1;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
     }
 }
 
-#[inline]
-fn emit_local_terminal_row_runs<T>(
+#[inline(always)]
+fn emit_terminal_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
     row_base_index: usize,
     bit_stride: usize,
     bit_len: usize,
-    outer_local: usize,
-    ao_keys: &[u16],
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    row_ao_keys: &[u8],
     carry_runs: &mut [u8],
-    slice_quads: &mut Vec<LocalQuad>,
+    quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    let row_ao_keys = ao_key_row(ao_keys, outer_local, bit_len);
+    let base_len = quads.len();
+    quads.reserve(row_bits.count_ones() as usize);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
     let mut bits_here = row_bits;
 
     while bits_here != 0 {
@@ -546,23 +569,30 @@ fn emit_local_terminal_row_runs<T>(
         }
 
         bits_here &= !bit_mask(bit_local, run_width);
-        slice_quads.push(LocalQuad {
-            bit: bit_local as u8,
-            outer: (outer_local - run_carry as usize) as u8,
-            width: run_width as u8,
-            height: run_length as u8,
-        });
+        write_quad::<N_AXIS, BIT_IS_U>(
+            &mut spare[written],
+            n_coord,
+            outer_coord - run_carry as u32,
+            bit_base + bit_local as u32,
+            run_width as u32,
+            run_length as u32,
+        );
+        written += 1;
         carry_runs[bit_local] = 0;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
     }
 }
 
-#[inline]
+#[inline(always)]
 fn cell_matches<T>(
     voxels: &[T],
     voxel_index: usize,
     quad_value: &T::MergeValue,
-    quad_ao_key: u16,
-    cell_ao_key: u16,
+    quad_ao_key: u8,
+    cell_ao_key: u8,
 ) -> bool
 where
     T: MergeVoxel,
@@ -573,105 +603,116 @@ where
         && cell_ao_key == quad_ao_key
 }
 
-#[inline]
-fn ao_key_row(ao_keys: &[u16], outer_local: usize, bit_len: usize) -> &[u16] {
-    &ao_keys[outer_local * bit_len..outer_local * bit_len + bit_len]
-}
-
-#[inline]
+#[inline(always)]
 fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
     carry_runs.resize(len, 0);
     carry_runs.fill(0);
 }
 
-#[inline]
-fn build_slice_ao_keys<T>(
-    voxels: &[T],
-    n_index_base: usize,
-    normal_stride: isize,
-    outer_stride: usize,
-    bit_stride: usize,
+#[inline(always)]
+fn ao_key_row(ao_keys: &[u8], outer_local: usize, bit_len: usize) -> &[u8] {
+    &ao_keys[outer_local * bit_len..outer_local * bit_len + bit_len]
+}
+
+#[inline(always)]
+fn build_slice_ao_keys(
+    query_shape: [usize; 3],
+    n_axis: usize,
     slice: SlicePlan,
+    n_local: usize,
+    face_sign: i32,
+    opaque_cols: &[u64],
     slice_rows: &[u64],
-    ao_keys: &mut Vec<u16>,
-) where
-    T: MergeVoxel,
-{
+    ao_keys: &mut Vec<u8>,
+) {
     let total_cells = slice.outer_len * slice.bit_len;
     if ao_keys.len() < total_cells {
-        ao_keys.resize(total_cells, NON_OPAQUE_AO_KEY);
+        ao_keys.resize(total_cells, 0);
     }
 
+    let interior_bit_mask = bit_mask(0, slice.bit_len);
+    let (base_offset, n_stride, column_outer_stride) =
+        column_row_layout(query_shape, slice.bit_axis, n_axis, slice.outer_axis);
+    let source_n = n_local + 1;
+    let outside_n = if face_sign < 0 {
+        source_n - 1
+    } else {
+        source_n + 1
+    };
+    let source_base = base_offset + source_n * n_stride;
+    let outside_base = base_offset + outside_n * n_stride;
+
     for (outer_local, &row_bits) in slice_rows.iter().enumerate() {
-        let row_base_index = n_index_base + outer_local * outer_stride;
         let row_keys =
             &mut ao_keys[outer_local * slice.bit_len..outer_local * slice.bit_len + slice.bit_len];
+        let source_opaque =
+            (opaque_cols[source_base + outer_local * column_outer_stride] >> 1) & interior_bit_mask;
+        let current_row = (opaque_cols[outside_base + outer_local * column_outer_stride] >> 1)
+            & interior_bit_mask;
+        let prev_row = if outer_local > 0 {
+            (opaque_cols[outside_base + (outer_local - 1) * column_outer_stride] >> 1)
+                & interior_bit_mask
+        } else {
+            0
+        };
+        let next_row = if outer_local + 1 < slice.outer_len {
+            (opaque_cols[outside_base + (outer_local + 1) * column_outer_stride] >> 1)
+                & interior_bit_mask
+        } else {
+            0
+        };
+        let left = current_row << 1;
+        let right = current_row >> 1;
+        let up_left = prev_row << 1;
+        let up_right = prev_row >> 1;
+        let down_left = next_row << 1;
+        let down_right = next_row >> 1;
         let mut bits = row_bits;
 
         while bits != 0 {
             let bit_local = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-
-            let voxel_index = row_base_index + bit_local * bit_stride;
-            let voxel = unsafe { voxels.get_unchecked(voxel_index) };
-            row_keys[bit_local] = if voxel.get_visibility() == VoxelVisibility::Opaque {
-                0x100
-                    | compute_ao_signature(
-                        voxels,
-                        voxel_index,
-                        normal_stride,
-                        bit_stride as isize,
-                        outer_stride as isize,
-                    ) as u16
+            let bit = 1u64 << bit_local;
+            row_keys[bit_local] = if source_opaque & bit != 0 {
+                pack_ao_signature_from_rows(
+                    bit, left, right, prev_row, next_row, up_left, up_right, down_left, down_right,
+                )
             } else {
-                NON_OPAQUE_AO_KEY
+                0
             };
         }
     }
 }
 
-#[inline]
-fn compute_ao_signature<T>(
-    voxels: &[T],
-    voxel_index: usize,
-    normal_stride: isize,
-    bit_stride: isize,
-    outer_stride: isize,
-) -> u8
-where
-    T: Voxel,
-{
-    let face_neighbor_index = voxel_index as isize + normal_stride;
-    let corners = [
-        (-bit_stride, -outer_stride),
-        (bit_stride, -outer_stride),
-        (bit_stride, outer_stride),
-        (-bit_stride, outer_stride),
-    ];
+#[inline(always)]
+fn pack_ao_signature_from_rows(
+    bit: u64,
+    left: u64,
+    right: u64,
+    up: u64,
+    down: u64,
+    up_left: u64,
+    up_right: u64,
+    down_left: u64,
+    down_right: u64,
+) -> u8 {
     let mut signature = 0u8;
-
-    for (corner_index, (bit_delta, outer_delta)) in corners.into_iter().enumerate() {
-        let side1 = is_opaque(voxels, (face_neighbor_index + bit_delta) as usize);
-        let side2 = is_opaque(voxels, (face_neighbor_index + outer_delta) as usize);
-        let corner = is_opaque(
-            voxels,
-            (face_neighbor_index + bit_delta + outer_delta) as usize,
-        );
-        signature |= vertex_ao(side1, side2, corner) << (corner_index * 2);
-    }
-
+    signature |= vertex_ao_masked(left, up, up_left, bit);
+    signature |= vertex_ao_masked(right, up, up_right, bit) << 2;
+    signature |= vertex_ao_masked(right, down, down_right, bit) << 4;
+    signature |= vertex_ao_masked(left, down, down_left, bit) << 6;
     signature
 }
 
-#[inline]
-fn is_opaque<T>(voxels: &[T], voxel_index: usize) -> bool
-where
-    T: Voxel,
-{
-    unsafe { voxels.get_unchecked(voxel_index) }.get_visibility() == VoxelVisibility::Opaque
+#[inline(always)]
+fn vertex_ao_masked(side1_mask: u64, side2_mask: u64, corner_mask: u64, bit: u64) -> u8 {
+    let side1 = side1_mask & bit != 0;
+    let side2 = side2_mask & bit != 0;
+    let corner = corner_mask & bit != 0;
+    vertex_ao(side1, side2, corner)
 }
 
-#[inline]
+#[inline(always)]
 fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
     if side1 && side2 {
         0
@@ -680,35 +721,7 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
     }
 }
 
-#[inline]
-fn emit_local_quads<const N_AXIS: usize, const BIT_IS_U: bool>(
-    local_quads: &[LocalQuad],
-    n_coord: u32,
-    outer_base: u32,
-    bit_base: u32,
-    quads: &mut Vec<UnorientedQuad>,
-) {
-    let base_len = quads.len();
-    quads.reserve(local_quads.len());
-    let spare = quads.spare_capacity_mut();
-
-    for (index, quad) in local_quads.iter().copied().enumerate() {
-        write_quad::<N_AXIS, BIT_IS_U>(
-            &mut spare[index],
-            n_coord,
-            outer_base + quad.outer as u32,
-            bit_base + quad.bit as u32,
-            quad.width as u32,
-            quad.height as u32,
-        );
-    }
-
-    unsafe {
-        quads.set_len(base_len + local_quads.len());
-    }
-}
-
-#[inline]
+#[inline(always)]
 fn emit_unit_slice<const N_AXIS: usize>(
     interior_min: [u32; 3],
     outer_axis: usize,

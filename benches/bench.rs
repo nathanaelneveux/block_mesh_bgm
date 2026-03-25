@@ -522,6 +522,37 @@ fn strategy_benchmark_cases() -> Vec<Case> {
                 }
             },
         ),
+        build_case(
+            "ao-unit-patterns",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| {
+                let lower_plate = y == 16
+                    && ((6..=10).contains(&x) && (6..=10).contains(&z)
+                        || (14..=18).contains(&x) && (6..=10).contains(&z)
+                        || (22..=26).contains(&x) && (6..=10).contains(&z));
+
+                let upper_lips = y == 17
+                    && (
+                        // Interior-corner pattern: a two-sided upper lip.
+                        ((6..=8).contains(&x) && z == 5) || (x == 5 && (6..=8).contains(&z))
+                        // Diagonal-from-corner pattern: a single upper corner.
+                        || (x == 13 && z == 5)
+                        // Side-run corner pattern: a one-voxel-deep upper strip.
+                        || ((22..=24).contains(&x) && z == 5)
+                    );
+
+                if lower_plate || upper_lips {
+                    BenchVoxel {
+                        visibility: VoxelVisibility::Opaque,
+                        material: 1,
+                    }
+                } else {
+                    BenchVoxel::default()
+                }
+            },
+        ),
     ]
 }
 

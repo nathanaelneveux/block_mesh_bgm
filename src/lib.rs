@@ -266,7 +266,7 @@ pub fn binary_greedy_quads_with_config<T, S>(
     if config.ambient_occlusion_safe {
         binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output);
     } else {
-        binary_greedy_quads_impl::<T, S, false>(voxels, voxels_shape, min, max, faces, output);
+        binary_greedy_quads(voxels, voxels_shape, min, max, faces, output);
     }
 }
 
@@ -344,6 +344,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 visible_rows,
                 neg_unit_only,
                 neg_axes,
+                &opaque_cols[slice.bit_axis],
                 MergeFeatures::AO_SAFE,
                 feature_scratch,
                 &mut quads.groups[neg_face_index],
@@ -355,6 +356,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 visible_rows_alt,
                 pos_unit_only,
                 pos_axes,
+                &opaque_cols[slice.bit_axis],
                 MergeFeatures::AO_SAFE,
                 feature_scratch,
                 &mut quads.groups[pos_face_index],
