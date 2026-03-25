@@ -159,6 +159,8 @@ mod face;
 mod merge;
 mod merge_modes;
 mod prep;
+#[cfg(feature = "internal-profiler")]
+mod profile;
 
 use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
@@ -166,6 +168,9 @@ use merge::mesh_face_rows;
 use merge_modes::{mesh_face_rows_with_features, FeatureScratch, MergeFeatures};
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
+#[cfg(feature = "internal-profiler")]
+#[doc(hidden)]
+pub use profile::{with_ao_profile, AoProfile};
 
 /// Additional merge-policy controls for [`binary_greedy_quads_with_config`].
 ///

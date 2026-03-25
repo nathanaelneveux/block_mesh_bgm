@@ -16,6 +16,9 @@ members = ["examples_crate"]
 default-members = ["."]
 resolver = "2"
 
+[features]
+internal-profiler = []
+
 [dependencies]
 block-mesh = "0.2"
 ndshape = "0.3"

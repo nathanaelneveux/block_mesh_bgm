@@ -148,7 +148,6 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         let n_coord = n_base + n_local as u32;
         let slice_start = n_local * slice.outer_len;
         let slice_rows = &rows[slice_start..slice_start + slice.outer_len];
-
         for outer_local in 0..slice.outer_len {
             let row_bits = slice_rows[outer_local];
             if row_bits == 0 {

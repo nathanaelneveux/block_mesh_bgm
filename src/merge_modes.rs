@@ -5,6 +5,9 @@
 //! only handles the AO-safe variant, which keeps the same carry structure but
 //! refuses to merge opaque faces whose four corner AO values differ.
 
+#[cfg(feature = "internal-profiler")]
+use std::time::Instant;
+
 use block_mesh::{MergeVoxel, UnorientedQuad};
 
 use crate::bit_mask;
@@ -106,7 +109,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -117,7 +120,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -128,7 +131,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -139,7 +142,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -150,7 +153,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -161,7 +164,7 @@ fn mesh_face_rows_ao_safe<T>(
             slice,
             visible_rows,
             unit_only,
-            axes.n_sign,
+            axes,
             opaque_cols,
             scratch,
             quads,
@@ -177,16 +180,21 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     slice: SlicePlan,
     visible_rows: &[u64],
     unit_only: bool,
-    face_sign: i32,
+    axes: FaceAxes,
     opaque_cols: &[u64],
     scratch: &mut FeatureScratch,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
+    #[cfg(feature = "internal-profiler")]
+    crate::profile::record_slice(unit_only);
+
     if unit_only {
         for n_local in 0..slice.n_len {
             let row_start = n_local * slice.outer_len;
+            #[cfg(feature = "internal-profiler")]
+            let unit_emit_start = Instant::now();
             emit_unit_slice::<N_AXIS>(
                 context.interior_min,
                 slice.outer_axis,
@@ -195,6 +203,8 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                 &visible_rows[row_start..row_start + slice.outer_len],
                 quads,
             );
+            #[cfg(feature = "internal-profiler")]
+            crate::profile::record_unit_emit(unit_emit_start.elapsed());
         }
         return;
     }
@@ -209,17 +219,23 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         let n_coord = n_base + n_local as u32;
         let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
 
+        #[cfg(feature = "internal-profiler")]
+        let key_build_start = Instant::now();
         build_slice_ao_keys(
             context.query_shape,
             N_AXIS,
             slice,
             n_local,
-            face_sign,
+            axes.n_sign,
             opaque_cols,
             slice_rows,
             &mut scratch.ao_keys,
         );
+        #[cfg(feature = "internal-profiler")]
+        crate::profile::record_key_build(key_build_start.elapsed());
 
+        #[cfg(feature = "internal-profiler")]
+        let carry_start = Instant::now();
         mesh_face_carry_ao::<T, N_AXIS, BIT_IS_U>(
             voxels,
             n_index_base,
@@ -234,6 +250,8 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
             context.interior_min[slice.bit_axis],
             quads,
         );
+        #[cfg(feature = "internal-profiler")]
+        crate::profile::record_carry_total(carry_start.elapsed());
     }
 }
 
@@ -270,9 +288,13 @@ fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
             let row_base_index = n_index_base + outer_local * outer_stride;
             let row_keys = ao_key_row(ao_keys, outer_local, slice.bit_len);
             let overlapping_bits = row_bits & next_row_bits;
+            #[cfg(feature = "internal-profiler")]
+            crate::profile::record_carry_row(row_bits, overlapping_bits);
 
             if overlapping_bits == 0 {
                 if has_incoming_carry {
+                    #[cfg(feature = "internal-profiler")]
+                    let emit_start = Instant::now();
                     emit_terminal_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
                         voxels,
                         row_bits,
@@ -286,7 +308,14 @@ fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                         carry_runs,
                         quads,
                     );
+                    #[cfg(feature = "internal-profiler")]
+                    {
+                        crate::profile::record_terminal_row();
+                        crate::profile::record_emit_terminal(emit_start.elapsed());
+                    }
                 } else {
+                    #[cfg(feature = "internal-profiler")]
+                    let emit_start = Instant::now();
                     emit_single_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
                         voxels,
                         row_bits,
@@ -299,23 +328,90 @@ fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                         row_keys,
                         quads,
                     );
+                    #[cfg(feature = "internal-profiler")]
+                    {
+                        crate::profile::record_single_row();
+                        crate::profile::record_emit_single(emit_start.elapsed());
+                    }
                 }
                 has_incoming_carry = false;
             } else {
+                let next_row_keys = ao_key_row(ao_keys, outer_local + 1, slice.bit_len);
+                let ao_overlap_bits =
+                    match_ao_overlap_bits(overlapping_bits, row_keys, next_row_keys);
+                #[cfg(feature = "internal-profiler")]
+                crate::profile::record_ao_overlap_candidates(ao_overlap_bits);
+
+                if ao_overlap_bits == 0 {
+                    if has_incoming_carry {
+                        #[cfg(feature = "internal-profiler")]
+                        let emit_start = Instant::now();
+                        emit_terminal_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                            voxels,
+                            row_bits,
+                            row_base_index,
+                            bit_stride,
+                            slice.bit_len,
+                            n_coord,
+                            outer_base + outer_local as u32,
+                            bit_base,
+                            row_keys,
+                            carry_runs,
+                            quads,
+                        );
+                        #[cfg(feature = "internal-profiler")]
+                        {
+                            crate::profile::record_terminal_row();
+                            crate::profile::record_emit_terminal(emit_start.elapsed());
+                        }
+                    } else {
+                        #[cfg(feature = "internal-profiler")]
+                        let emit_start = Instant::now();
+                        emit_single_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
+                            voxels,
+                            row_bits,
+                            row_base_index,
+                            bit_stride,
+                            slice.bit_len,
+                            n_coord,
+                            outer_base + outer_local as u32,
+                            bit_base,
+                            row_keys,
+                            quads,
+                        );
+                        #[cfg(feature = "internal-profiler")]
+                        {
+                            crate::profile::record_single_row();
+                            crate::profile::record_emit_single(emit_start.elapsed());
+                        }
+                    }
+                    has_incoming_carry = false;
+                    continue;
+                }
+
+                #[cfg(feature = "internal-profiler")]
+                let continue_start = Instant::now();
                 let continue_mask = build_continue_mask(
                     voxels,
-                    overlapping_bits,
+                    ao_overlap_bits,
                     row_base_index,
                     bit_stride,
                     outer_stride,
                     row_keys,
-                    ao_key_row(ao_keys, outer_local + 1, slice.bit_len),
+                    next_row_keys,
                     carry_runs,
                 );
+                #[cfg(feature = "internal-profiler")]
+                {
+                    crate::profile::record_continue_mask(continue_start.elapsed());
+                    crate::profile::record_continued_bits(continue_mask);
+                }
                 let ended_bits = row_bits & !continue_mask;
 
                 if !has_incoming_carry {
                     if ended_bits != 0 {
+                        #[cfg(feature = "internal-profiler")]
+                        let emit_start = Instant::now();
                         emit_single_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
                             voxels,
                             ended_bits,
@@ -328,11 +424,18 @@ fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                             row_keys,
                             quads,
                         );
+                        #[cfg(feature = "internal-profiler")]
+                        {
+                            crate::profile::record_single_row();
+                            crate::profile::record_emit_single(emit_start.elapsed());
+                        }
                     }
                     has_incoming_carry = continue_mask != 0;
                 } else if ended_bits == 0 {
                     has_incoming_carry = continue_mask != 0;
                 } else {
+                    #[cfg(feature = "internal-profiler")]
+                    let emit_start = Instant::now();
                     emit_mixed_row_runs_ao::<T, N_AXIS, BIT_IS_U>(
                         voxels,
                         ended_bits,
@@ -346,6 +449,11 @@ fn mesh_face_carry_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
                         carry_runs,
                         quads,
                     );
+                    #[cfg(feature = "internal-profiler")]
+                    {
+                        crate::profile::record_mixed_row();
+                        crate::profile::record_emit_mixed(emit_start.elapsed());
+                    }
                     has_incoming_carry = continue_mask != 0;
                 }
             }
@@ -392,6 +500,27 @@ where
     }
 
     continue_mask
+}
+
+#[inline(always)]
+fn match_ao_overlap_bits(
+    overlapping_bits: u64,
+    row_ao_keys: &[u8],
+    next_row_ao_keys: &[u8],
+) -> u64 {
+    let mut matching_bits = 0u64;
+    let mut bits = overlapping_bits;
+
+    while bits != 0 {
+        let bit_local = bits.trailing_zeros() as usize;
+        let bit = 1u64 << bit_local;
+        if row_ao_keys[bit_local] == next_row_ao_keys[bit_local] {
+            matching_bits |= bit;
+        }
+        bits &= bits - 1;
+    }
+
+    matching_bits
 }
 
 #[inline(always)]
@@ -457,6 +586,9 @@ fn emit_mixed_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     unsafe {
         quads.set_len(base_len + written);
     }
+
+    #[cfg(feature = "internal-profiler")]
+    crate::profile::record_mixed_quads(written);
 }
 
 #[inline(always)]
@@ -518,6 +650,9 @@ fn emit_single_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     unsafe {
         quads.set_len(base_len + written);
     }
+
+    #[cfg(feature = "internal-profiler")]
+    crate::profile::record_single_quads(written);
 }
 
 #[inline(always)]
@@ -584,6 +719,9 @@ fn emit_terminal_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     unsafe {
         quads.set_len(base_len + written);
     }
+
+    #[cfg(feature = "internal-profiler")]
+    crate::profile::record_terminal_quads(written);
 }
 
 #[inline(always)]
@@ -668,19 +806,51 @@ fn build_slice_ao_keys(
         let down_left = next_row << 1;
         let down_right = next_row >> 1;
         let mut bits = row_bits;
+        #[cfg(feature = "internal-profiler")]
+        let mut opaque_bits = 0u32;
+        #[cfg(feature = "internal-profiler")]
+        let mut passthrough_bits = 0u32;
+        #[cfg(feature = "internal-profiler")]
+        let mut first_opaque_key = 0u8;
+        #[cfg(feature = "internal-profiler")]
+        let mut saw_opaque_key = false;
+        #[cfg(feature = "internal-profiler")]
+        let mut uniform_opaque = true;
 
         while bits != 0 {
             let bit_local = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let bit = 1u64 << bit_local;
             row_keys[bit_local] = if source_opaque & bit != 0 {
-                pack_ao_signature_from_rows(
+                let key = pack_ao_signature_from_rows(
                     bit, left, right, prev_row, next_row, up_left, up_right, down_left, down_right,
-                )
+                );
+                #[cfg(feature = "internal-profiler")]
+                {
+                    opaque_bits += 1;
+                    if saw_opaque_key {
+                        uniform_opaque &= key == first_opaque_key;
+                    } else {
+                        first_opaque_key = key;
+                        saw_opaque_key = true;
+                    }
+                }
+                key
             } else {
+                #[cfg(feature = "internal-profiler")]
+                {
+                    passthrough_bits += 1;
+                }
                 0
             };
         }
+
+        #[cfg(feature = "internal-profiler")]
+        crate::profile::record_key_row(
+            opaque_bits,
+            passthrough_bits,
+            saw_opaque_key && uniform_opaque,
+        );
     }
 }
 
@@ -736,6 +906,8 @@ fn emit_unit_slice<const N_AXIS: usize>(
         .iter()
         .map(|row_bits| row_bits.count_ones() as usize)
         .sum::<usize>();
+    #[cfg(feature = "internal-profiler")]
+    crate::profile::record_unit_quads(additional_quads);
     let base_len = quads.len();
     quads.reserve(additional_quads);
     let spare = quads.spare_capacity_mut();
