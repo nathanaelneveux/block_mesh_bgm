@@ -307,31 +307,13 @@ fn build_slice_ao_masks(
 
         // Classify the visible opaque bits by the merge directions that remain
         // legal once AO boundaries are respected.
-        let neighbor_curr = ((current_row << 1) | (current_row >> 1)) & interior_bit_mask;
-        let shared_depth = prev_row & current_row & next_row;
-        let vertical = opaque_visible
-            & ((shared_depth << 1) & interior_bit_mask)
-            & (shared_depth >> 1)
-            & (!prev_row)
-            & (!next_row)
-            & interior_bit_mask;
-
-        let edge_from_next =
-            (((next_row << 1) & interior_bit_mask) ^ (next_row >> 1)) & interior_bit_mask;
-        let edge_from_prev =
-            (((prev_row << 1) & interior_bit_mask) ^ (prev_row >> 1)) & interior_bit_mask;
-        let unit = opaque_visible
-            & !vertical
-            & (neighbor_curr | edge_from_next | edge_from_prev)
-            & interior_bit_mask;
-
-        let horiz_from_next = ((next_row << 1) & interior_bit_mask) & (next_row >> 1);
-        let horiz_from_prev = ((prev_row << 1) & interior_bit_mask) & (prev_row >> 1);
-        let horizontal = opaque_visible
-            & !vertical
-            & !unit
-            & (horiz_from_next | horiz_from_prev)
-            & interior_bit_mask;
+        let (unit, horizontal, vertical) = classify_ao_opaque_row(
+            opaque_visible,
+            prev_row,
+            current_row,
+            next_row,
+            interior_bit_mask,
+        );
 
         let bidir = row_bits & !(unit | horizontal | vertical);
 
@@ -340,6 +322,40 @@ fn build_slice_ao_masks(
         vertical_rows[outer_local] = vertical;
         bidir_rows[outer_local] = bidir;
     }
+}
+
+#[inline(always)]
+fn classify_ao_opaque_row(
+    opaque_visible: u64,
+    prev_row: u64,
+    current_row: u64,
+    next_row: u64,
+    interior_bit_mask: u64,
+) -> (u64, u64, u64) {
+    let neighbor_curr = ((current_row << 1) | (current_row >> 1)) & interior_bit_mask;
+    let shared_depth = prev_row & current_row & next_row;
+    let vertical_seed =
+        (((shared_depth << 1) & interior_bit_mask) | (shared_depth >> 1)) & interior_bit_mask;
+    let vertical = opaque_visible & vertical_seed & (!prev_row) & (!next_row) & interior_bit_mask;
+
+    let edge_from_next =
+        (((next_row << 1) & interior_bit_mask) ^ (next_row >> 1)) & interior_bit_mask;
+    let edge_from_prev =
+        (((prev_row << 1) & interior_bit_mask) ^ (prev_row >> 1)) & interior_bit_mask;
+    let unit = opaque_visible
+        & !vertical
+        & (neighbor_curr | edge_from_next | edge_from_prev)
+        & interior_bit_mask;
+
+    let horiz_from_next = ((next_row << 1) & interior_bit_mask) & (next_row >> 1);
+    let horiz_from_prev = ((prev_row << 1) & interior_bit_mask) & (prev_row >> 1);
+    let horizontal = opaque_visible
+        & !vertical
+        & !unit
+        & (horiz_from_next | horiz_from_prev)
+        & interior_bit_mask;
+
+    (unit, horizontal, vertical)
 }
 
 #[inline(always)]
@@ -682,4 +698,41 @@ fn emit_carried_row_unit_quads<const N_AXIS: usize, const BIT_IS_U: bool>(
 fn reset_mask_rows(rows: &mut Vec<u64>, len: usize) {
     rows.resize(len, 0);
     rows.fill(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_ao_opaque_row;
+
+    #[test]
+    fn vertical_rule_matches_updated_binary_proof() {
+        let mask = (1u64 << 7) - 1;
+        let opaque_visible = 0b011_0110;
+        let prev_row = 0b100_0000;
+        let current_row = 0b100_1001;
+        let next_row = 0b100_0001;
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(vertical, 0b010_0000);
+        assert_eq!(horizontal, 0);
+        assert_eq!(unit & vertical, 0);
+    }
+
+    #[test]
+    fn internal_corner_becomes_unit_not_vertical() {
+        let mask = (1u64 << 6) - 1;
+        let opaque_visible = 0b011_101;
+        let prev_row = 0b111_111;
+        let current_row = 0b100_000;
+        let next_row = 0b100_000;
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(vertical, 0);
+        assert_eq!(unit & 0b010_000, 0b010_000);
+        assert_eq!(horizontal & 0b010_000, 0);
+    }
 }
