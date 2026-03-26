@@ -87,9 +87,7 @@ O = N & A           0 0 0 0 0 0 0 (final u mergable quads list)
 Expected output     B B B B B B B
 
 B = bidirectionally mergeable. All cells share the same AO signature here, so
-the cap should merge like vanilla in both directions. The current `M / O / H`
-logic produces no classification at all for this case, which means it cannot be
-the complete AO rule set by itself.
+the cap should merge like vanilla in both directions.
 
 
 Abstract signature-only counterexample: non-flat signature with both right and down match
