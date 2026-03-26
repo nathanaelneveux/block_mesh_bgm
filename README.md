@@ -167,11 +167,12 @@ cargo check -p block-mesh-bgm-examples --examples
 cargo package --allow-dirty --list
 ```
 
-The benchmark suite compares three paths on the same voxel datasets:
+The benchmark suite always includes the main reference points:
 
 - `visible_block_faces`: the fast "one quad per visible face" baseline from `block-mesh`
 - `greedy_quads`: the upstream greedy implementation
 - `binary_greedy_quads`: this crate
+- `binary_greedy_quads_ao_safe`: the AO-safe merge mode from this crate
 
 That makes it easier to reason about where time is going:
 `visible_block_faces` is the speed target, while `greedy_quads` is the output-shape baseline.

@@ -248,7 +248,7 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
 /// Builds the mask of bits whose runs continue into the next row.
 #[inline(always)]
-fn build_continue_mask<T>(
+pub(crate) fn build_continue_mask<T>(
     voxels: &[T],
     mut overlapping_bits: u64,
     row_base_index: usize,
@@ -280,7 +280,7 @@ where
 
 /// Emits ended runs for a row that also contains some continuing carry.
 #[inline(always)]
-fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+pub(crate) fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     mut row_bits: u64,
     row_base_index: usize,
@@ -346,7 +346,7 @@ fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
 /// Emits horizontal runs for a row with no incoming carry.
 #[inline(always)]
-fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+pub(crate) fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
     row_base_index: usize,
@@ -408,7 +408,7 @@ fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
 /// Emits runs for a row where every visible bit ends on the current row.
 #[inline(always)]
-fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+pub(crate) fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     voxels: &[T],
     row_bits: u64,
     row_base_index: usize,
@@ -475,7 +475,7 @@ fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
 /// Emits every visible cell in a fragmented slice as a `1x1` quad.
 #[inline(always)]
-fn emit_unit_slice<const N_AXIS: usize>(
+pub(crate) fn emit_unit_slice<const N_AXIS: usize>(
     interior_min: [u32; 3],
     outer_axis: usize,
     bit_axis: usize,
@@ -517,7 +517,7 @@ fn emit_unit_slice<const N_AXIS: usize>(
 }
 
 #[inline(always)]
-fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
+pub(crate) fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
     carry_runs.resize(len, 0);
     carry_runs.fill(0);
 }

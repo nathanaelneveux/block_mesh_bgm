@@ -10,14 +10,12 @@ repository = "https://github.com/nathanaelneveux/block_mesh_bgm"
 keywords = ["graphics", "mesh", "voxel", "greedy", "binary"]
 categories = ["graphics", "rendering"]
 readme = "README.md"
+exclude = ["tests/AO_binary_tests.md"]
 
 [workspace]
 members = ["examples_crate"]
 default-members = ["."]
 resolver = "2"
-
-[features]
-internal-profiler = []
 
 [dependencies]
 block-mesh = "0.2"
