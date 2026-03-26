@@ -2,16 +2,18 @@
 //!
 //! The default [`crate::binary_greedy_quads`] path stays on the existing
 //! carry-based maximum-merge implementation in [`crate::merge`]. This module
-//! handles the experimental AO-safe variant on this branch. Instead of
-//! materializing one AO signature byte per visible opaque cell, it classifies
-//! each visible row into four merge regimes:
+//! handles the AO-safe variant. Instead of
+//! materializing one AO signature byte per visible opaque cell, it derives
+//! merge constraints directly from binary opaque-occupancy rows in the face's
+//! exterior sample plane.
 //!
-//! - `M`: unit-only cells
-//! - `O`: horizontal-only cells
-//! - `H`: vertical-only cells
-//! - `B`: bidirectionally mergeable / AO-neutral cells
+//! The core idea is:
 //!
-//! The AO path then meshes each class with the cheapest compatible merge rule.
+//! - use `opaque_cols` to build whole-row AO constraint masks with shifts and
+//!   intersections
+//! - peel away cells that are provably unit-only, row-only, or column-only
+//! - run the full greedy carry kernel only on the residual cells that still may
+//!   merge in both directions
 
 #[cfg(feature = "internal-profiler")]
 use std::time::Instant;
@@ -37,7 +39,7 @@ impl MergeFeatures {
     /// No alternate merge restrictions.
     pub(crate) const NONE: Self = Self { bits: 0 };
 
-    /// Restrict merges to cells with matching ambient-occlusion behavior.
+    /// Restrict merges to cells whose AO-compatible boundaries match.
     pub(crate) const AO_SAFE: Self = Self {
         bits: Self::AMBIENT_OCCLUSION_SAFE,
     };
@@ -51,9 +53,14 @@ impl MergeFeatures {
 /// Reusable scratch that only AO-safe meshing needs.
 #[derive(Default)]
 pub(crate) struct FeatureScratch {
+    // Visible cells whose exterior occupancy forces a 1x1 quad.
     unit_rows: Vec<u64>,
+    // Visible cells that may only merge along the packed row axis.
     horizontal_rows: Vec<u64>,
+    // Visible cells that may only merge from row to row, always at width 1.
     vertical_rows: Vec<u64>,
+    // Visible cells that are still free to use the normal bidirectional greedy
+    // merge after the stricter AO-only cases are peeled away.
     bidir_rows: Vec<u64>,
     carry_runs: Vec<u8>,
 }
@@ -252,6 +259,10 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
         #[cfg(feature = "internal-profiler")]
         let carry_start = Instant::now();
+        // Emit the AO-constrained rows in increasing order of generality. The
+        // first three avoid the full carry kernel entirely; only the residual
+        // bidirectionally mergeable rows need the same greedy row merger shape
+        // as vanilla meshing.
         emit_unit_rows::<N_AXIS>(
             &scratch.unit_rows[..slice.outer_len],
             n_coord,
@@ -316,6 +327,16 @@ fn build_slice_ao_masks(
     vertical_rows: &mut Vec<u64>,
     bidir_rows: &mut Vec<u64>,
 ) {
+    // AO-safe meshing only cares about opaque occupancy in the plane just
+    // outside the visible face. From that outside plane we can derive, a row at
+    // a time, whether a visible cell:
+    //
+    // - must stay a unit quad
+    // - may only merge within its current row
+    // - may only merge across rows at width 1
+    // - or is unconstrained enough to fall back to the normal carry merge
+    //
+    // This avoids carrying a per-cell AO signature through the merge loop.
     reset_mask_rows(unit_rows, slice.outer_len);
     reset_mask_rows(horizontal_rows, slice.outer_len);
     reset_mask_rows(vertical_rows, slice.outer_len);
@@ -343,6 +364,8 @@ fn build_slice_ao_masks(
         let opaque_visible = row_bits & source_opaque;
 
         if opaque_visible == 0 {
+            // Translucent and empty-visible faces do not participate in the AO
+            // rule set. They keep the vanilla merge behavior.
             bidir_rows[outer_local] = row_bits;
             #[cfg(feature = "internal-profiler")]
             crate::profile::record_key_row(0, row_bits.count_ones(), true);
@@ -364,6 +387,8 @@ fn build_slice_ao_masks(
             0
         };
 
+        // Classify the visible opaque bits by the merge directions that remain
+        // legal once AO boundaries are respected.
         let neighbor_curr = ((current_row << 1) | (current_row >> 1)) & interior_bit_mask;
         let shared_depth = prev_row & current_row & next_row;
         let vertical = opaque_visible
@@ -491,6 +516,9 @@ fn emit_vertical_rows<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
+    // These rows are only allowed to continue from one row to the next. Since
+    // width can never grow, the carry state only tracks height and this path is
+    // much cheaper than the general greedy kernel.
     reset_carry_runs(carry_runs, bit_len);
     let mut has_incoming_carry = false;
 
@@ -611,6 +639,9 @@ fn mesh_bidir_rows<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
+    // These rows are the residual case: nothing in the exterior-plane AO masks
+    // proves that they must stay unit-width or row-local, so they can reuse
+    // the same bidirectional carry merge shape as the vanilla path.
     reset_carry_runs(carry_runs, bit_len);
     let mut has_incoming_carry = false;
 

@@ -43,6 +43,7 @@ The crate is split by stage:
 - `src/context.rs`: query validation and precomputed indexing/layout facts
 - `src/prep.rs`: occupancy columns and visible-face row construction
 - `src/merge.rs`: unit-quad emission and the carry-based greedy merger
+- `src/merge_modes.rs`: AO-safe alternate merge policy built on binary exterior-plane occupancy masks
 - `src/face.rs`: translation between `block-mesh` face orientation and the mesher's internal axis naming
 
 ## Limitations
@@ -134,8 +135,25 @@ binary_greedy_quads_with_config(
 
 - `ambient_occlusion_safe`: only merges opaque faces when their four ambient-occlusion corner values match. It does not compute or emit lighting data for you; it only keeps the mesh compatible with per-vertex AO shading.
 
-AO-safe mode may increase quad count and meshing time, but it does not change
-the visible unit-face geometry.
+The current AO-safe implementation is binary-mask based.
+
+Instead of attaching a full AO signature to every visible cell and comparing
+those signatures throughout the merge loop, it reuses the packed `opaque_cols`
+built during prep and looks at the opaque occupancy in the plane just outside
+the current face.
+
+From those exterior-plane occupancy rows, the mesher uses shifts,
+intersections, and masks to identify cells that are:
+
+- forced to stay unit quads
+- allowed to merge only within their current row
+- allowed to merge only across rows at width `1`
+- or still free to use the normal bidirectional greedy carry merge
+
+That means most AO splitting work happens as whole-row bitmask logic before the
+hot merge loop starts. In practice, this keeps AO-safe meshing much closer to
+the vanilla fast path than a naive per-cell AO-signature approach, while still
+preserving AO-friendly quad boundaries.
 
 ## Development
 
