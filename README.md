@@ -6,10 +6,9 @@
 `block-mesh-bgm` is a companion crate for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).
 It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation.
 
-The default entry point keeps the current maximum-merge behavior. A second
-configurable entry point can optionally:
-
-- stop merges that would cross differing ambient-occlusion corner signatures on opaque faces
+The default entry point keeps the current maximum-merge behavior.
+`binary_greedy_quads_ao_safe` is the alternate entry point for meshes
+that must not merge across ambient-occlusion boundaries on opaque faces.
 
 ## Goals
 
@@ -43,7 +42,7 @@ The crate is split by stage:
 - `src/context.rs`: query validation and precomputed indexing/layout facts
 - `src/prep.rs`: occupancy columns and visible-face row construction
 - `src/merge.rs`: unit-quad emission and the carry-based greedy merger
-- `src/merge_modes.rs`: AO-safe alternate merge policy built on binary exterior-plane occupancy masks
+- `src/ao.rs`: AO-safe alternate merge policy built on binary exterior-plane occupancy masks
 - `src/face.rs`: translation between `block-mesh` face orientation and the mesher's internal axis naming
 
 ## Limitations
@@ -60,8 +59,7 @@ use block_mesh::{
     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
 use block_mesh_bgm::{
-    binary_greedy_quads, binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
-    BinaryGreedyQuadsConfig,
+    binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,28 +110,23 @@ binary_greedy_quads(
 
 assert!(buffer.quads.num_quads() > 0);
 
-let config = BinaryGreedyQuadsConfig {
-    ambient_occlusion_safe: true,
-};
-
-binary_greedy_quads_with_config(
+binary_greedy_quads_ao_safe(
     &voxels,
     &ChunkShape {},
     [0; 3],
     [17; 3],
     &RIGHT_HANDED_Y_UP_CONFIG.faces,
-    &config,
     &mut buffer,
 );
 ```
 
-## Merge Modes
+## AO-Safe Meshing
 
 `binary_greedy_quads` is still the zero-extra-work path.
 
-`binary_greedy_quads_with_config` currently adds one optional merge restriction:
-
-- `ambient_occlusion_safe`: only merges opaque faces when their four ambient-occlusion corner values match. It does not compute or emit lighting data for you; it only keeps the mesh compatible with per-vertex AO shading.
+`binary_greedy_quads_ao_safe` is the alternate path for meshes that
+need to stay compatible with per-vertex ambient occlusion shading. It only
+changes how opaque faces merge. It does not compute or emit lighting data.
 
 The current AO-safe implementation is binary-mask based.
 
@@ -172,7 +165,7 @@ The benchmark suite always includes the main reference points:
 - `visible_block_faces`: the fast "one quad per visible face" baseline from `block-mesh`
 - `greedy_quads`: the upstream greedy implementation
 - `binary_greedy_quads`: this crate
-- `binary_greedy_quads_ao_safe`: the AO-safe merge mode from this crate
+- `binary_greedy_quads_ao_safe`: the AO-safe path from this crate
 
 That makes it easier to reason about where time is going:
 `visible_block_faces` is the speed target, while `greedy_quads` is the output-shape baseline.
@@ -221,14 +214,14 @@ Press `Space` to toggle wireframe so you can switch between surface shading and 
 Press `T` to switch between the original striped opaque sphere and a solid-core sphere wrapped in translucent voxels.
 Press `O` to switch the translucent demo between `AlphaToCoverage` and camera-level OIT.
 
-Run the merge-mode viewer with:
+Run the ambient-occlusion viewer with:
 
 ```text
-cargo run -p block-mesh-bgm-examples --example merge_modes
+cargo run -p block-mesh-bgm-examples --example ambient_occlusion
 ```
 
 That example renders one opaque sphere with wireframe always enabled so you can
-inspect how the configurable merge policies change the quad layout.
+inspect how AO-safe meshing changes the quad layout.
 Press `U` to toggle between binary greedy output and unit quads, `S` to toggle
 between an opaque sphere and an opaque torus, and `A` to toggle AO-safe
 merging together with AO vertex shading.

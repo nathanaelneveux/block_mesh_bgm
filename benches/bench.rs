@@ -5,10 +5,7 @@ use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, MergeVoxel, UnitQuadBuffer, Voxel,
     VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{
-    binary_greedy_quads, binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
-    BinaryGreedyQuadsConfig,
-};
+use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,16 +55,9 @@ struct MultiCase {
 fn bench_meshers(c: &mut Criterion) {
     let cases = benchmark_cases();
     let multi_cases = benchmark_multi_chunk_cases();
-    let strategy_cases = strategy_benchmark_cases();
+    let ao_cases = ao_benchmark_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
-    let configs = [(
-        "binary_greedy_quads_ao_safe",
-        BinaryGreedyQuadsConfig {
-            ambient_occlusion_safe: true,
-        },
-    )];
-
     for case in &cases {
         group.bench_with_input(
             BenchmarkId::new("visible_block_faces", case.name),
@@ -127,23 +117,24 @@ fn bench_meshers(c: &mut Criterion) {
             },
         );
 
-        for (name, config) in configs {
-            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
                 let mut buffer = BinaryGreedyQuadsBuffer::new();
                 b.iter(|| {
-                    binary_greedy_quads_with_config(
+                    binary_greedy_quads_ao_safe(
                         black_box(&case.voxels),
                         &case.shape,
                         case.min,
                         case.max,
                         &faces,
-                        &config,
                         &mut buffer,
                     );
                     black_box(buffer.quads.num_quads());
                 });
-            });
-        }
+            },
+        );
     }
 
     for case in &multi_cases {
@@ -217,30 +208,31 @@ fn bench_meshers(c: &mut Criterion) {
             },
         );
 
-        for (name, config) in configs {
-            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
                 let mut buffer = BinaryGreedyQuadsBuffer::new();
                 b.iter(|| {
                     let mut total_quads = 0usize;
                     for chunk in &case.chunks {
-                        binary_greedy_quads_with_config(
+                        binary_greedy_quads_ao_safe(
                             black_box(&chunk.voxels),
                             &chunk.shape,
                             chunk.min,
                             chunk.max,
                             &faces,
-                            &config,
                             &mut buffer,
                         );
                         total_quads += buffer.quads.num_quads();
                     }
                     black_box(total_quads);
                 });
-            });
-        }
+            },
+        );
     }
 
-    for case in &strategy_cases {
+    for case in &ao_cases {
         group.bench_with_input(
             BenchmarkId::new("visible_block_faces", case.name),
             case,
@@ -299,23 +291,24 @@ fn bench_meshers(c: &mut Criterion) {
             },
         );
 
-        for (name, config) in configs {
-            group.bench_with_input(BenchmarkId::new(name, case.name), case, |b, case| {
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
                 let mut buffer = BinaryGreedyQuadsBuffer::new();
                 b.iter(|| {
-                    binary_greedy_quads_with_config(
+                    binary_greedy_quads_ao_safe(
                         black_box(&case.voxels),
                         &case.shape,
                         case.min,
                         case.max,
                         &faces,
-                        &config,
                         &mut buffer,
                     );
                     black_box(buffer.quads.num_quads());
                 });
-            });
-        }
+            },
+        );
     }
 
     group.finish();
@@ -478,7 +471,7 @@ fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
     )]
 }
 
-fn strategy_benchmark_cases() -> Vec<Case> {
+fn ao_benchmark_cases() -> Vec<Case> {
     let base_cases = benchmark_cases();
 
     vec![
@@ -488,7 +481,7 @@ fn strategy_benchmark_cases() -> Vec<Case> {
                 .find(|case| case.name == "dense-sphere")
                 .expect("dense-sphere benchmark case")
                 .clone();
-            case.name = "dense-sphere-merge-modes";
+            case.name = "dense-sphere-ao";
             case
         },
         {
@@ -497,7 +490,7 @@ fn strategy_benchmark_cases() -> Vec<Case> {
                 .find(|case| case.name == "translucent-shell-sphere")
                 .expect("translucent-shell-sphere benchmark case")
                 .clone();
-            case.name = "translucent-shell-sphere-merge-modes";
+            case.name = "translucent-shell-sphere-ao";
             case
         },
         build_case(

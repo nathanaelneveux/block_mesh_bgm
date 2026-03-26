@@ -3,10 +3,7 @@ use block_mesh::{
     greedy_quads, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, Voxel,
     VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{
-    binary_greedy_quads, binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
-    BinaryGreedyQuadsConfig,
-};
+use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,40 +173,6 @@ fn matches_block_mesh_geometry_for_alternate_face_config() {
 }
 
 #[test]
-fn default_config_matches_vanilla_exactly() {
-    let shape = RuntimeShape::<u32, 3>::new([18, 18, 18]);
-    let voxels = make_voxels([18, 18, 18], |x, y, z| {
-        if x == 0 || y == 0 || z == 0 || x == 17 || y == 17 || z == 17 {
-            TestVoxel::empty(0)
-        } else {
-            match (x * 13 + y * 7 + z * 3) % 7 {
-                0..=2 => TestVoxel::opaque(((x + z) % 5 + 1) as u8, 0),
-                3 => TestVoxel::translucent(((x + y) % 4 + 1) as u8, 0),
-                _ => TestVoxel::empty(0),
-            }
-        }
-    });
-
-    let vanilla = mesh_with_binary_bgm(
-        &voxels,
-        &shape,
-        [0; 3],
-        [17; 3],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-    );
-    let configured = mesh_with_binary_bgm_config(
-        &voxels,
-        &shape,
-        [0; 3],
-        [17; 3],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        BinaryGreedyQuadsConfig::default(),
-    );
-
-    assert_eq!(vanilla.groups, configured.groups);
-}
-
-#[test]
 fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
     let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
     let voxels = make_voxels([8, 6, 8], |x, y, z| {
@@ -225,10 +188,6 @@ fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
             TestVoxel::empty(0)
         }
     });
-    let config = BinaryGreedyQuadsConfig {
-        ambient_occlusion_safe: true,
-    };
-
     let vanilla = mesh_with_binary_bgm(
         &voxels,
         &shape,
@@ -236,13 +195,12 @@ fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
         [7, 5, 7],
         &RIGHT_HANDED_Y_UP_CONFIG.faces,
     );
-    let ao_safe = mesh_with_binary_bgm_config(
+    let ao_safe = mesh_with_binary_bgm_ao_safe(
         &voxels,
         &shape,
         [0; 3],
         [7, 5, 7],
         &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        config,
     );
     let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
         .faces
@@ -289,15 +247,12 @@ fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
         }
     });
 
-    let ao_safe = mesh_with_binary_bgm_config(
+    let ao_safe = mesh_with_binary_bgm_ao_safe(
         &voxels,
         &shape,
         [0; 3],
         [6, 4, 6],
         &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        BinaryGreedyQuadsConfig {
-            ambient_occlusion_safe: true,
-        },
     );
     let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
         .faces
@@ -440,16 +395,15 @@ fn mesh_with_binary_bgm(
     buffer.quads
 }
 
-fn mesh_with_binary_bgm_config(
+fn mesh_with_binary_bgm_ao_safe(
     voxels: &[TestVoxel],
     shape: &RuntimeShape<u32, 3>,
     min: [u32; 3],
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
-    config: BinaryGreedyQuadsConfig,
 ) -> QuadBuffer {
     let mut buffer = BinaryGreedyQuadsBuffer::new();
-    binary_greedy_quads_with_config(voxels, shape, min, max, faces, &config, &mut buffer);
+    binary_greedy_quads_ao_safe(voxels, shape, min, max, faces, &mut buffer);
     buffer.quads
 }
 

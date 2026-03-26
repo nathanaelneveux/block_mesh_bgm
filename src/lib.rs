@@ -15,15 +15,15 @@
 //! - `context`: query validation and precomputed layout facts
 //! - `prep`: occupancy columns and visible-face rows
 //! - `merge`: unit emission and carry-based greedy merging
-//! - `merge_modes`: AO-safe alternate merge policy built on binary occupancy masks
+//! - `ao`: AO-safe alternate merge policy built on binary occupancy masks
 //! - `face`: face-orientation helpers shared by the other stages
 //!
 //! The crate exposes two public entry points:
 //!
 //! - [`binary_greedy_quads`]: the current maximum-merge implementation with no
 //!   extra policy checks
-//! - [`binary_greedy_quads_with_config`]: the same visibility pipeline, but
-//!   with an optional AO-safe merge restriction for opaque faces
+//! - [`binary_greedy_quads_ao_safe`]: the same visibility pipeline, but with
+//!   AO-safe merge restrictions for opaque faces
 //!
 //! # AO-safe mode
 //!
@@ -123,17 +123,14 @@
 //! assert!(buffer.quads.num_quads() > 0);
 //! ```
 //!
-//! The configurable entry point uses the same buffer type:
+//! The AO-safe entry point uses the same buffer type:
 //!
 //! ```
 //! # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
 //! # use block_mesh::{
 //! #     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 //! # };
-//! # use block_mesh_bgm::{
-//! #     binary_greedy_quads_with_config, BinaryGreedyQuadsBuffer,
-//! #     BinaryGreedyQuadsConfig,
-//! # };
+//! # use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 //! # #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 //! # struct BoolVoxel(bool);
 //! # impl Voxel for BoolVoxel {
@@ -154,51 +151,32 @@
 //! # type ChunkShape = ConstShape3u32<4, 4, 4>;
 //! # let voxels = [BoolVoxel(false); ChunkShape::SIZE as usize];
 //! let mut buffer = BinaryGreedyQuadsBuffer::new();
-//! let config = BinaryGreedyQuadsConfig {
-//!     ambient_occlusion_safe: true,
-//! };
-//!
-//! binary_greedy_quads_with_config(
+//! binary_greedy_quads_ao_safe(
 //!     &voxels,
 //!     &ChunkShape {},
 //!     [0; 3],
 //!     [3; 3],
 //!     &RIGHT_HANDED_Y_UP_CONFIG.faces,
-//!     &config,
 //!     &mut buffer,
 //! );
 //! ```
 #![warn(missing_docs)]
 
+mod ao;
 mod context;
 mod face;
 mod merge;
-mod merge_modes;
 mod prep;
 
+use ao::{mesh_face_rows_ao_safe, AoScratch};
 use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
 use merge::mesh_face_rows;
-use merge_modes::{mesh_face_rows_ao_safe, AoScratch};
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
 
-/// Additional merge-policy controls for [`binary_greedy_quads_with_config`].
-///
-/// The default configuration keeps the current maximum-merge behavior and does
-/// not change the output of [`binary_greedy_quads`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BinaryGreedyQuadsConfig {
-    /// Prevents merges of opaque faces whose four ambient-occlusion corner
-    /// values differ.
-    ///
-    /// This only changes the merge policy. It does not emit AO data or lighting
-    /// values. Translucent faces still use the same merge rules as the vanilla
-    /// path.
-    pub ambient_occlusion_safe: bool,
-}
-
-/// Reusable output and scratch storage for [`binary_greedy_quads`].
+/// Reusable output and scratch storage for [`binary_greedy_quads`] and
+/// [`binary_greedy_quads_ao_safe`].
 ///
 /// Reusing one buffer per worker thread keeps the hot meshing path focused on
 /// bitwise work instead of repeated heap growth.
@@ -262,32 +240,26 @@ pub fn binary_greedy_quads<T, S>(
     binary_greedy_quads_impl::<T, S, false>(voxels, voxels_shape, min, max, faces, output);
 }
 
-/// Generates greedy quads with configurable merge restrictions.
+/// Generates greedy quads with AO-safe merge restrictions for opaque faces.
 ///
-/// [`BinaryGreedyQuadsConfig::default`] matches [`binary_greedy_quads`]
-/// exactly. Alternate configurations may emit more quads in exchange for AO-
-/// safe merging on opaque faces.
+/// This uses the same visibility pipeline as [`binary_greedy_quads`], but it
+/// refuses merges that would cross AO boundaries on opaque faces. Translucent
+/// faces keep the same merge rule they use in the vanilla path.
 ///
-/// `ambient_occlusion_safe` only affects opaque faces. Translucent faces keep
-/// the same merge rule they use in the vanilla path.
-pub fn binary_greedy_quads_with_config<T, S>(
+/// This only changes the merge policy. It does not emit AO values or lighting
+/// data for you.
+pub fn binary_greedy_quads_ao_safe<T, S>(
     voxels: &[T],
     voxels_shape: &S,
     min: [u32; 3],
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
-    config: &BinaryGreedyQuadsConfig,
     output: &mut BinaryGreedyQuadsBuffer,
 ) where
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    if config.ambient_occlusion_safe {
-        binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output);
-        return;
-    }
-
-    binary_greedy_quads(voxels, voxels_shape, min, max, faces, output);
+    binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output);
 }
 
 fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
