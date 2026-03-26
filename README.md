@@ -4,52 +4,117 @@
 [![Docs.rs](https://docs.rs/block-mesh-bgm/badge.svg)](https://docs.rs/block-mesh-bgm)
 
 `block-mesh-bgm` is a companion crate for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).
-It exposes a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation.
 
-The default entry point keeps the current maximum-merge behavior.
-`binary_greedy_quads_ao_safe` is the alternate entry point for meshes
-that must not merge across ambient-occlusion boundaries on opaque faces.
+It provides a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation designed for high performance and low overhead.
+
+The default entry point preserves maximum-merge behavior.
+
+`binary_greedy_quads_ao_safe` is an alternate path that preserves quad boundaries required for correct per-vertex ambient occlusion — **without computing or storing AO signatures during meshing**.
+
+---
 
 ## Goals
 
-- Match `block_mesh::greedy_quads` visible-face geometry for supported inputs.
-- Stay close to `block_mesh::greedy_quads` quad counts while prioritizing speed.
-- Reuse `block_mesh` public types (`QuadBuffer`, `UnorientedQuad`, `OrientedBlockFace`).
-- Avoid the voxel remapping and intermediate buffer conversions required by standalone binary mesher crates.
+- Match `block_mesh::greedy_quads` visible-face geometry for supported inputs
+- Stay close to `block_mesh::greedy_quads` quad counts while prioritizing speed
+- Reuse `block_mesh` public types (`QuadBuffer`, `UnorientedQuad`, `OrientedBlockFace`)
+- Avoid voxel remapping or intermediate buffer conversions
+- Keep AO-safe meshing close to the performance of the non-AO path
+
+---
 
 ## How It Works
 
-The implementation follows the same public contract as `block_mesh::greedy_quads`,
-but it arrives there with a different internal representation.
+The public API mirrors `block_mesh::greedy_quads`, but the internal representation is different.
 
-1. It treats the queried extent as a padded box.
-   The outer one-voxel shell is only used to decide whether an interior face is visible.
-2. It builds compact occupancy columns for all three axes.
-   Each column is a `u64` whose bits represent voxels along one axis.
-3. It derives visible-face rows by comparing a source column with its neighbour column.
-   This turns face visibility into cheap bitwise operations.
-4. It greedily merges visible cells back into `UnorientedQuad`s, checking
-   `MergeVoxel::merge_value()` only when the visibility mask says a merge is possible.
+1. Treat the queried extent as a padded box  
+   The outer one-voxel shell is only used to determine face visibility
+2. Build compact occupancy columns  
+   Each column is stored as a `u64` bitmask representing voxels along one axis
+3. Derive visible-face rows  
+   Face visibility becomes simple bitwise comparisons between adjacent columns
+4. Greedily merge visible cells  
+   Merging only consults `MergeVoxel::merge_value()` when masks indicate a merge is possible
 
-The 62-voxel interior limit exists because each queried axis needs two padding
-voxels and the full padded run must fit inside one `u64`.
+The 62-voxel interior limit exists because each padded axis must fit inside a single `u64`.
+
+---
+
+## AO-Safe Meshing (No AO Signatures)
+
+`binary_greedy_quads` is the zero-extra-work fast path.
+
+`binary_greedy_quads_ao_safe` enforces merge boundaries compatible with ambient occlusion shading — **without computing AO values or storing per-cell AO signatures during meshing**.
+
+### Key Idea
+
+Instead of computing AO first and attaching signatures to each face:
+
+- This implementation derives **AO-compatible merge constraints directly from binary occupancy**
+- Specifically, it examines the **exterior plane of opaque voxels adjacent to each face**
+- Using bitwise shifts and masks, it determines where merges would violate AO consistency
+
+### Merge Classification
+
+From exterior-plane occupancy, each visible cell is classified into one of:
+
+- **unit** → must remain a single quad  
+- **horizontal** → may merge only within its row  
+- **vertical** → may merge only across rows (width = 1)  
+- **bidirectional** → can use full greedy merging  
+
+This classification happens using **whole-row bit operations before the hot merge loop**.
+
+Only the remaining bidirectional cells go through the full greedy carry merge.
+
+### What This Means
+
+- No AO signatures are computed or stored during meshing  
+- No per-cell AO comparisons inside the merge loop  
+- AO-safe constraints are enforced **purely from topology**
+
+After meshing, AO values can still be computed per vertex in the usual way.
+
+---
+
+## Why This Is Fast
+
+Traditional AO-safe greedy meshing:
+
+- Computes AO per vertex or per face
+- Stores AO signatures
+- Compares signatures during merging
+
+This implementation:
+
+- Uses **bitwise row operations instead of per-cell AO computation**
+- Removes AO as a data dependency during merging
+- Pushes most AO work **outside the hot loop**
+
+In practice, this keeps AO-safe meshing much closer to the baseline fast path, and in some cases can outperform naive approaches even without AO.
+
+---
 
 ## Reading The Source
 
 The crate is split by stage:
 
-- `src/lib.rs`: public API, crate docs, and the top-level pipeline
-- `src/context.rs`: query validation and precomputed indexing/layout facts
-- `src/prep.rs`: occupancy columns and visible-face row construction
-- `src/merge.rs`: unit-quad emission and the carry-based greedy merger
-- `src/ao.rs`: AO-safe alternate merge policy built on binary exterior-plane occupancy masks
-- `src/face.rs`: translation between `block-mesh` face orientation and the mesher's internal axis naming
+- `src/lib.rs` — public API and pipeline
+- `src/context.rs` — query validation and layout
+- `src/prep.rs` — occupancy columns and visibility masks
+- `src/merge.rs` — greedy merging
+- `src/ao.rs` — AO-safe merge logic derived from occupancy masks
+- `src/face.rs` — face orientation mapping
+
+---
 
 ## Limitations
 
-- Interior query extents are limited to at most `62` voxels per axis.
-- Transparency semantics intentionally match `block_mesh::VoxelVisibility`.
-- The crate operates directly on the caller's voxel slice; it does not resample or repack chunk data.
+- Interior query extents are limited to `62` voxels per axis
+- Transparency semantics match `block_mesh::VoxelVisibility`
+- Operates directly on the caller’s voxel slice (no repacking)
+
+---
 
 ## Example
 
@@ -99,6 +164,7 @@ for i in 0..ChunkShape::SIZE {
 }
 
 let mut buffer = BinaryGreedyQuadsBuffer::new();
+
 binary_greedy_quads(
     &voxels,
     &ChunkShape {},
@@ -107,8 +173,6 @@ binary_greedy_quads(
     &RIGHT_HANDED_Y_UP_CONFIG.faces,
     &mut buffer,
 );
-
-assert!(buffer.quads.num_quads() > 0);
 
 binary_greedy_quads_ao_safe(
     &voxels,
@@ -119,34 +183,6 @@ binary_greedy_quads_ao_safe(
     &mut buffer,
 );
 ```
-
-## AO-Safe Meshing
-
-`binary_greedy_quads` is still the zero-extra-work path.
-
-`binary_greedy_quads_ao_safe` is the alternate path for meshes that
-need to stay compatible with per-vertex ambient occlusion shading. It only
-changes how opaque faces merge. It does not compute or emit lighting data.
-
-The current AO-safe implementation is binary-mask based.
-
-Instead of attaching a full AO signature to every visible cell and comparing
-those signatures throughout the merge loop, it reuses the packed `opaque_cols`
-built during prep and looks at the opaque occupancy in the plane just outside
-the current face.
-
-From those exterior-plane occupancy rows, the mesher uses shifts,
-intersections, and masks to identify cells that are:
-
-- forced to stay unit quads
-- allowed to merge only within their current row
-- allowed to merge only across rows at width `1`
-- or still free to use the normal bidirectional greedy carry merge
-
-That means most AO splitting work happens as whole-row bitmask logic before the
-hot merge loop starts. In practice, this keeps AO-safe meshing much closer to
-the vanilla fast path than a naive per-cell AO-signature approach, while still
-preserving AO-friendly quad boundaries.
 
 ## Development
 
