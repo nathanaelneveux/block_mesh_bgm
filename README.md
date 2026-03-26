@@ -234,6 +234,9 @@ cargo run -p block-mesh-bgm-examples --example custom_meshing
 
 That example is based on the `bevy_voxel_world` custom meshing demo, but swaps in
 this crate's binary greedy mesher.
+Press `A` to toggle ambient occlusion for the visible-faces path and AO-safe
+binary greedy meshing, so you can compare both shaded output and chunk timing
+inside the same world.
 
 ## License
 
