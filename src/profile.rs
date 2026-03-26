@@ -1,4 +1,5 @@
 #![cfg(feature = "internal-profiler")]
+#![allow(dead_code)]
 
 use std::cell::Cell;
 use std::time::Duration;

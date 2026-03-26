@@ -203,7 +203,7 @@ pub struct BinaryGreedyQuadsBuffer {
     visible_rows_alt: Vec<u64>,
     // Stage 4 scratch: carry lengths for the current face slice.
     carry_runs: Vec<u8>,
-    // Alternate-mode scratch: AO keys and AO-safe local quads.
+    // Alternate-mode scratch: AO row masks and AO-specific carry state.
     feature_scratch: FeatureScratch,
 }
 
