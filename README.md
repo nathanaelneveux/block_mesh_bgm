@@ -174,23 +174,35 @@ That makes it easier to reason about where time is going:
 
 Recent local `cargo bench --bench bench` Criterion medians on my machine:
 
+### Core Cases
+
 | Case | `visible_block_faces` | `greedy_quads` | `binary_greedy_quads` |
 | --- | ---: | ---: | ---: |
-| `dense-sphere` | `46.47 µs` | `292.20 µs` | `38.15 µs` |
-| `translucent-sphere` | `45.20 µs` | `304.32 µs` | `40.03 µs` |
-| `translucent-shell-sphere` | `43.71 µs` | `331.60 µs` | `46.14 µs` |
-| `layered-caves` | `83.93 µs` | `856.14 µs` | `86.64 µs` |
-| `checkerboard` | `84.74 µs` | `780.25 µs` | `77.45 µs` |
-| `partial-extent` | `41.15 µs` | `290.83 µs` | `50.84 µs` |
-| `translucent-mix` | `97.57 µs` | `1.0524 ms` | `140.54 µs` |
-| `layered-caves-2x2x2` | `795.17 µs` | `4.9070 ms` | `675.18 µs` |
+| `dense-sphere` | `40.262 µs` | `252.25 µs` | `33.284 µs` |
+| `translucent-sphere` | `40.621 µs` | `260.87 µs` | `34.820 µs` |
+| `translucent-shell-sphere` | `38.191 µs` | `259.11 µs` | `35.486 µs` |
+| `layered-caves` | `69.536 µs` | `742.53 µs` | `73.930 µs` |
+| `checkerboard` | `74.162 µs` | `656.34 µs` | `67.541 µs` |
+| `partial-extent` | `36.081 µs` | `231.45 µs` | `42.878 µs` |
+| `translucent-mix` | `81.532 µs` | `830.92 µs` | `119.75 µs` |
+| `layered-caves-2x2x2` | `612.30 µs` | `4.1293 ms` | `558.68 µs` |
+
+### AO-Safe Cases
+
+| Case | `visible_block_faces` | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
+| --- | ---: | ---: | ---: |
+| `dense-sphere-ao` | `40.569 µs` | `33.737 µs` | `44.427 µs` |
+| `translucent-shell-sphere-ao` | `38.530 µs` | `36.091 µs` | `48.287 µs` |
+| `layered-caves-2x2x2` | `612.30 µs` | `558.68 µs` | `432.73 µs` |
+| `ao-boundary-stress` | `18.419 µs` | `19.301 µs` | `29.456 µs` |
+| `ao-unit-patterns` | `18.234 µs` | `19.128 µs` | `29.429 µs` |
 
 Useful takeaways from that run:
 
-- `binary_greedy_quads` is already faster than `visible_block_faces` on `dense-sphere`, `translucent-sphere`, `checkerboard`, and `layered-caves-2x2x2`.
-- It is essentially at parity on `layered-caves`.
-- The main remaining misses are `partial-extent`, `translucent-shell-sphere`, and especially the deliberately hostile `translucent-mix` case.
-- It remains much faster than upstream `greedy_quads` across every benchmark in the suite.
+- `binary_greedy_quads` is faster than `visible_block_faces` on `dense-sphere`, `translucent-sphere`, `translucent-shell-sphere`, `checkerboard`, and `layered-caves-2x2x2`.
+- It is still very close on `layered-caves`, and the main remaining misses are `partial-extent` and the deliberately hostile `translucent-mix` case.
+- `binary_greedy_quads` remains much faster than upstream `greedy_quads` across every benchmark in the suite.
+- `binary_greedy_quads_ao_safe` is slower than the vanilla path on the small AO-sensitive microbenchmarks, but on the real multi-chunk `layered-caves-2x2x2` case it is currently faster than both `visible_block_faces` and vanilla binary.
 
 ## Visual Examples
 
