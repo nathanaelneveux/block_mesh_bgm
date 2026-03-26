@@ -15,6 +15,39 @@ use crate::context::{MeshingContext, SlicePlan};
 use crate::face::{write_quad, write_unit_quad, FaceAxes};
 use crate::prep::column_row_layout;
 
+const AO_SIGNATURE_TABLE: [u8; 256] = build_ao_signature_table();
+
+const fn build_ao_signature_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut index = 0usize;
+    while index < 256 {
+        let bits = index as u8;
+        let left = bits & (1 << 0) != 0;
+        let right = bits & (1 << 1) != 0;
+        let up = bits & (1 << 2) != 0;
+        let down = bits & (1 << 3) != 0;
+        let up_left = bits & (1 << 4) != 0;
+        let up_right = bits & (1 << 5) != 0;
+        let down_left = bits & (1 << 6) != 0;
+        let down_right = bits & (1 << 7) != 0;
+
+        table[index] = vertex_ao_const(left, up, up_left)
+            | (vertex_ao_const(right, up, up_right) << 2)
+            | (vertex_ao_const(right, down, down_right) << 4)
+            | (vertex_ao_const(left, down, down_left) << 6);
+        index += 1;
+    }
+    table
+}
+
+const fn vertex_ao_const(side1: bool, side2: bool, corner: bool) -> u8 {
+    if side1 && side2 {
+        0
+    } else {
+        3 - side1 as u8 - side2 as u8 - corner as u8
+    }
+}
+
 /// Internal feature bitset for alternate merge policies.
 ///
 /// The call shape stays stable even as new feature-specific kernels are added.
@@ -539,6 +572,29 @@ fn emit_mixed_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
+    #[cfg(feature = "internal-profiler")]
+    let original_quad_count = row_bits.count_ones() as usize;
+    let no_adjacent_equal_ao = !has_adjacent_equal_ao_keys(row_bits, row_ao_keys);
+    #[cfg(feature = "internal-profiler")]
+    if no_adjacent_equal_ao {
+        crate::profile::record_mixed_no_adjacent_ao_row();
+    }
+    if no_adjacent_equal_ao {
+        emit_carried_row_unit_quads::<N_AXIS, BIT_IS_U>(
+            row_bits,
+            n_coord,
+            outer_coord,
+            bit_base,
+            carry_runs,
+            quads,
+        );
+        #[cfg(feature = "internal-profiler")]
+        {
+            crate::profile::record_mixed_quads(row_bits.count_ones() as usize);
+            crate::profile::record_mixed_unit_row();
+        }
+        return;
+    }
     let base_len = quads.len();
     quads.reserve(row_bits.count_ones() as usize);
     let spare = quads.spare_capacity_mut();
@@ -588,7 +644,12 @@ fn emit_mixed_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     }
 
     #[cfg(feature = "internal-profiler")]
-    crate::profile::record_mixed_quads(written);
+    {
+        crate::profile::record_mixed_quads(written);
+        if written == original_quad_count {
+            crate::profile::record_mixed_unit_row();
+        }
+    }
 }
 
 #[inline(always)]
@@ -606,6 +667,20 @@ fn emit_single_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
+    let no_adjacent_equal_ao = !has_adjacent_equal_ao_keys(row_bits, row_ao_keys);
+    #[cfg(feature = "internal-profiler")]
+    if no_adjacent_equal_ao {
+        crate::profile::record_single_no_adjacent_ao_row();
+    }
+    if no_adjacent_equal_ao {
+        emit_single_row_unit_quads::<N_AXIS>(row_bits, n_coord, outer_coord, bit_base, quads);
+        #[cfg(feature = "internal-profiler")]
+        {
+            crate::profile::record_single_quads(row_bits.count_ones() as usize);
+            crate::profile::record_single_unit_row();
+        }
+        return;
+    }
     let base_len = quads.len();
     quads.reserve(row_bits.count_ones() as usize);
     let spare = quads.spare_capacity_mut();
@@ -652,7 +727,12 @@ fn emit_single_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     }
 
     #[cfg(feature = "internal-profiler")]
-    crate::profile::record_single_quads(written);
+    {
+        crate::profile::record_single_quads(written);
+        if written == row_bits.count_ones() as usize {
+            crate::profile::record_single_unit_row();
+        }
+    }
 }
 
 #[inline(always)]
@@ -671,6 +751,29 @@ fn emit_terminal_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
+    #[cfg(feature = "internal-profiler")]
+    let original_quad_count = row_bits.count_ones() as usize;
+    let no_adjacent_equal_ao = !has_adjacent_equal_ao_keys(row_bits, row_ao_keys);
+    #[cfg(feature = "internal-profiler")]
+    if no_adjacent_equal_ao {
+        crate::profile::record_terminal_no_adjacent_ao_row();
+    }
+    if no_adjacent_equal_ao {
+        emit_carried_row_unit_quads::<N_AXIS, BIT_IS_U>(
+            row_bits,
+            n_coord,
+            outer_coord,
+            bit_base,
+            carry_runs,
+            quads,
+        );
+        #[cfg(feature = "internal-profiler")]
+        {
+            crate::profile::record_terminal_quads(row_bits.count_ones() as usize);
+            crate::profile::record_terminal_unit_row();
+        }
+        return;
+    }
     let base_len = quads.len();
     quads.reserve(row_bits.count_ones() as usize);
     let spare = quads.spare_capacity_mut();
@@ -721,7 +824,12 @@ fn emit_terminal_row_runs_ao<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     }
 
     #[cfg(feature = "internal-profiler")]
-    crate::profile::record_terminal_quads(written);
+    {
+        crate::profile::record_terminal_quads(written);
+        if written == original_quad_count {
+            crate::profile::record_terminal_unit_row();
+        }
+    }
 }
 
 #[inline(always)]
@@ -735,10 +843,92 @@ fn cell_matches<T>(
 where
     T: MergeVoxel,
 {
-    unsafe { voxels.get_unchecked(voxel_index) }
-        .merge_value()
-        .eq(quad_value)
-        && cell_ao_key == quad_ao_key
+    cell_ao_key == quad_ao_key
+        && unsafe { voxels.get_unchecked(voxel_index) }
+            .merge_value()
+            .eq(quad_value)
+}
+
+#[inline(always)]
+fn has_adjacent_equal_ao_keys(row_bits: u64, row_ao_keys: &[u8]) -> bool {
+    let mut adjacent_bits = row_bits & (row_bits >> 1);
+
+    while adjacent_bits != 0 {
+        let bit_local = adjacent_bits.trailing_zeros() as usize;
+        if row_ao_keys[bit_local] == row_ao_keys[bit_local + 1] {
+            return true;
+        }
+        adjacent_bits &= adjacent_bits - 1;
+    }
+
+    false
+}
+
+#[inline(always)]
+fn emit_single_row_unit_quads<const N_AXIS: usize>(
+    mut row_bits: u64,
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    quads: &mut Vec<UnorientedQuad>,
+) {
+    let quad_count = row_bits.count_ones() as usize;
+    let base_len = quads.len();
+    quads.reserve(quad_count);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
+
+    while row_bits != 0 {
+        let bit_local = row_bits.trailing_zeros() as usize;
+        row_bits &= row_bits - 1;
+        write_unit_quad::<N_AXIS>(
+            &mut spare[written],
+            n_coord,
+            outer_coord,
+            bit_base + bit_local as u32,
+        );
+        written += 1;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
+    }
+}
+
+#[inline(always)]
+fn emit_carried_row_unit_quads<const N_AXIS: usize, const BIT_IS_U: bool>(
+    mut row_bits: u64,
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    carry_runs: &mut [u8],
+    quads: &mut Vec<UnorientedQuad>,
+) {
+    let quad_count = row_bits.count_ones() as usize;
+    let base_len = quads.len();
+    quads.reserve(quad_count);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
+
+    while row_bits != 0 {
+        let bit_local = row_bits.trailing_zeros() as usize;
+        row_bits &= row_bits - 1;
+        let run_carry = carry_runs[bit_local] as u32;
+        write_quad::<N_AXIS, BIT_IS_U>(
+            &mut spare[written],
+            n_coord,
+            outer_coord - run_carry,
+            bit_base + bit_local as u32,
+            1,
+            run_carry + 1,
+        );
+        carry_runs[bit_local] = 0;
+        written += 1;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
+    }
 }
 
 #[inline(always)]
@@ -781,6 +971,10 @@ fn build_slice_ao_keys(
     let outside_base = base_offset + outside_n * n_stride;
 
     for (outer_local, &row_bits) in slice_rows.iter().enumerate() {
+        if row_bits == 0 {
+            continue;
+        }
+
         let row_keys =
             &mut ao_keys[outer_local * slice.bit_len..outer_local * slice.bit_len + slice.bit_len];
         let source_opaque =
@@ -822,7 +1016,7 @@ fn build_slice_ao_keys(
             bits &= bits - 1;
             let bit = 1u64 << bit_local;
             row_keys[bit_local] = if source_opaque & bit != 0 {
-                let key = pack_ao_signature_from_rows(
+                let key = pack_ao_signature_from_rows_lookup(
                     bit, left, right, prev_row, next_row, up_left, up_right, down_left, down_right,
                 );
                 #[cfg(feature = "internal-profiler")]
@@ -855,7 +1049,7 @@ fn build_slice_ao_keys(
 }
 
 #[inline(always)]
-fn pack_ao_signature_from_rows(
+fn pack_ao_signature_from_rows_lookup(
     bit: u64,
     left: u64,
     right: u64,
@@ -866,29 +1060,15 @@ fn pack_ao_signature_from_rows(
     down_left: u64,
     down_right: u64,
 ) -> u8 {
-    let mut signature = 0u8;
-    signature |= vertex_ao_masked(left, up, up_left, bit);
-    signature |= vertex_ao_masked(right, up, up_right, bit) << 2;
-    signature |= vertex_ao_masked(right, down, down_right, bit) << 4;
-    signature |= vertex_ao_masked(left, down, down_left, bit) << 6;
-    signature
-}
-
-#[inline(always)]
-fn vertex_ao_masked(side1_mask: u64, side2_mask: u64, corner_mask: u64, bit: u64) -> u8 {
-    let side1 = side1_mask & bit != 0;
-    let side2 = side2_mask & bit != 0;
-    let corner = corner_mask & bit != 0;
-    vertex_ao(side1, side2, corner)
-}
-
-#[inline(always)]
-fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
-    if side1 && side2 {
-        0
-    } else {
-        3 - side1 as u8 - side2 as u8 - corner as u8
-    }
+    let neighbor_bits = ((left & bit != 0) as u8)
+        | (((right & bit != 0) as u8) << 1)
+        | (((up & bit != 0) as u8) << 2)
+        | (((down & bit != 0) as u8) << 3)
+        | (((up_left & bit != 0) as u8) << 4)
+        | (((up_right & bit != 0) as u8) << 5)
+        | (((down_left & bit != 0) as u8) << 6)
+        | (((down_right & bit != 0) as u8) << 7);
+    AO_SIGNATURE_TABLE[neighbor_bits as usize]
 }
 
 #[inline(always)]

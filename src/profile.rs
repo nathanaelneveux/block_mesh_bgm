@@ -60,6 +60,18 @@ pub struct AoProfile {
     pub unit_quads: u64,
     /// Rows whose overlapping bits had no AO-compatible candidates at all.
     pub ao_rejected_rows: u32,
+    /// Single-row emissions that produced only unit-width quads.
+    pub single_unit_rows: u32,
+    /// Terminal-row emissions that produced only unit-width quads.
+    pub terminal_unit_rows: u32,
+    /// Mixed-row emissions whose ended bits produced only unit-width quads.
+    pub mixed_unit_rows: u32,
+    /// Single rows with no horizontally adjacent equal AO keys.
+    pub single_no_adjacent_ao_rows: u32,
+    /// Terminal rows with no horizontally adjacent equal AO keys.
+    pub terminal_no_adjacent_ao_rows: u32,
+    /// Mixed rows whose ended bits had no horizontally adjacent equal AO keys.
+    pub mixed_no_adjacent_ao_rows: u32,
 }
 
 thread_local! {
@@ -178,12 +190,36 @@ pub(crate) fn record_single_quads(quads: usize) {
     with_active_profile(|profile| profile.single_quads += quads as u64);
 }
 
+pub(crate) fn record_single_unit_row() {
+    with_active_profile(|profile| profile.single_unit_rows += 1);
+}
+
+pub(crate) fn record_single_no_adjacent_ao_row() {
+    with_active_profile(|profile| profile.single_no_adjacent_ao_rows += 1);
+}
+
 pub(crate) fn record_terminal_quads(quads: usize) {
     with_active_profile(|profile| profile.terminal_quads += quads as u64);
 }
 
+pub(crate) fn record_terminal_unit_row() {
+    with_active_profile(|profile| profile.terminal_unit_rows += 1);
+}
+
+pub(crate) fn record_terminal_no_adjacent_ao_row() {
+    with_active_profile(|profile| profile.terminal_no_adjacent_ao_rows += 1);
+}
+
 pub(crate) fn record_mixed_quads(quads: usize) {
     with_active_profile(|profile| profile.mixed_quads += quads as u64);
+}
+
+pub(crate) fn record_mixed_unit_row() {
+    with_active_profile(|profile| profile.mixed_unit_rows += 1);
+}
+
+pub(crate) fn record_mixed_no_adjacent_ao_row() {
+    with_active_profile(|profile| profile.mixed_no_adjacent_ao_rows += 1);
 }
 
 pub(crate) fn record_unit_quads(quads: usize) {

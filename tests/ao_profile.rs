@@ -123,11 +123,17 @@ fn accumulate_profile(total: &mut AoProfile, next: &AoProfile) {
     total.mixed_quads += next.mixed_quads;
     total.unit_quads += next.unit_quads;
     total.ao_rejected_rows += next.ao_rejected_rows;
+    total.single_unit_rows += next.single_unit_rows;
+    total.terminal_unit_rows += next.terminal_unit_rows;
+    total.mixed_unit_rows += next.mixed_unit_rows;
+    total.single_no_adjacent_ao_rows += next.single_no_adjacent_ao_rows;
+    total.terminal_no_adjacent_ao_rows += next.terminal_no_adjacent_ao_rows;
+    total.mixed_no_adjacent_ao_rows += next.mixed_no_adjacent_ao_rows;
 }
 
 fn print_profile(name: &str, profile: &AoProfile) {
     println!(
-        "\n{name}\n  key_build={:?}\n  carry_total={:?}\n  continue_mask={:?}\n  emit_single={:?}\n  emit_terminal={:?}\n  emit_mixed={:?}\n  unit_emit={:?}\n  slices={} unit_slices={} carry_slices={}\n  carry_rows={} single_rows={} terminal_rows={} mixed_rows={}\n  visible_bits={} overlapping_bits={} ao_compatible_overlap_bits={} continued_bits={}\n  opaque_key_bits={} passthrough_key_bits={} uniform_opaque_rows={} passthrough_rows={} ao_rejected_rows={}\n  single_quads={} terminal_quads={} mixed_quads={} unit_quads={}",
+        "\n{name}\n  key_build={:?}\n  carry_total={:?}\n  continue_mask={:?}\n  emit_single={:?}\n  emit_terminal={:?}\n  emit_mixed={:?}\n  unit_emit={:?}\n  slices={} unit_slices={} carry_slices={}\n  carry_rows={} single_rows={} terminal_rows={} mixed_rows={}\n  visible_bits={} overlapping_bits={} ao_compatible_overlap_bits={} continued_bits={}\n  opaque_key_bits={} passthrough_key_bits={} uniform_opaque_rows={} passthrough_rows={} ao_rejected_rows={}\n  single_quads={} terminal_quads={} mixed_quads={} unit_quads={}\n  single_unit_rows={} terminal_unit_rows={} mixed_unit_rows={}\n  single_no_adjacent_ao_rows={} terminal_no_adjacent_ao_rows={} mixed_no_adjacent_ao_rows={}",
         profile.key_build,
         profile.carry_total,
         profile.continue_mask,
@@ -155,6 +161,12 @@ fn print_profile(name: &str, profile: &AoProfile) {
         profile.terminal_quads,
         profile.mixed_quads,
         profile.unit_quads,
+        profile.single_unit_rows,
+        profile.terminal_unit_rows,
+        profile.mixed_unit_rows,
+        profile.single_no_adjacent_ao_rows,
+        profile.terminal_no_adjacent_ao_rows,
+        profile.mixed_no_adjacent_ao_rows,
     );
 }
 
