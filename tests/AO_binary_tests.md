@@ -1,27 +1,42 @@
-Current Row     0 1 0 1 1 1 1 1 1 0 1 1 1 0 1 0
+Current Row         1 1 1 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
 
 Depth -1 Rows
--1              1 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0
-0               1 0 1 0 0 0 0 0 0 1 0 0 0 0 0 1
-+1              1 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0
+-1                  1 0 1 0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 0
+0                   1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
++1                  1 0 1 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 1
+
+A = CR - (CR ^ 0)   0 1 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 (opaque visibility of current row)
+
+B = A & 0>>         0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (unit and v mergable)
+C = A & 0<<         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 (unit and v mergable)
+D = B | C           0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 1 0 (unit and v mergable combine)
+
+E = -1 & 0 & +1     1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+F = A & E>>         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+G = A & E<<         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+H = F & G           0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (final v mergable quads list)
+
+I = +1<< & +1>>     0 1 0 0 0 0 0 0 0 0 1 1 1 1 1 0 0 0 0 (u merge)
+J = -1<< & -1>>     0 1 0 0 0 0 1 1 1 1 1 0 0 0 0 0 0 0 0 (u merge)
+K = +1<< ^ +1>>     0 0 0 1 1 1 0 0 0 0 0 1 1 0 0 0 0 1 0 (unit)
+L = -1<< ^ -1>>     0 0 0 1 0 0 0 0 1 1 0 0 0 0 0 1 1 0 0 (unit)
+
+M = (D|K|L)& !H& A  0 0 0 0 1 1 0 0 1 1 0 1 1 0 0 1 1 1 0 (final unit quads list)
+N = (I|J)& !H & !M  0 0 0 0 0 0 1 1 0 0 1 0 0 1 1 0 0 0 0
+O = N & A           0 0 0 0 0 0 1 1 0 0 1 0 0 1 1 0 0 0 0 (final u mergable quads list)
 
 
-A = CR & 0>>    0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0
-B = CR & 0<<    0 1 0 0 0 0 0 0 0 0 0 0 0 0 1 0
-C = A & B       0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (One self mergable type of AO signiture)
-D = A ^ C       0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 (Another self mergable type of AO signiture)
-E = B ^ C       0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 (Another self mergable type of AO signiture)
-
-F = CR & -1     0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0
-Find from F?    0 0 0 0 0 0 0 0 0 0 U U 0 0 0 0 (multiple unit quads)
-G = CR & +1     0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0
-Find from G?    0 0 0 0 U U M M U 0 0 0 0 0 0 0 (multiple unit quads + another self mergable type of AO signiture)
+Match Output        0 N 0 0 U U M M U U M U U M M U U U 0
 
 
-Another case    1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+Second test
 
--1              0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 0
-0               0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-+1              0 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0
+        1 0 0 0 0 0 0
+        1 0 0 1 0 0 1
+        1 0 0 0 0 0 1
 
-Find            U U M M M U U Q Q U U N N N U U (multiple unit quads + remaining two self mergable AO signitures)
+A =     0 1 1 0 1 1 0
+B =     0 1 0 0 1 0 0
+C =     0 0 1 0 0 1 0
+
+G =     0 1 0 0 0 1 0
