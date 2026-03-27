@@ -263,6 +263,8 @@ fn build_slice_ao_masks(
     reset_mask_rows(bidir_rows, slice.outer_len);
 
     let interior_bit_mask = bit_mask(0, slice.bit_len);
+    let padded_bit_mask = bit_mask(0, slice.bit_len + 2);
+    let interior_padded_mask = bit_mask(1, slice.bit_len);
     let (base_offset, n_stride, column_outer_stride) =
         column_row_layout(query_shape, slice.bit_axis, n_axis, slice.outer_axis);
     let source_n = n_local + 1;
@@ -279,9 +281,10 @@ fn build_slice_ao_masks(
             continue;
         }
 
+        let visible_padded = (row_bits << 1) & interior_padded_mask;
         let source_opaque =
-            (opaque_cols[source_base + outer_local * column_outer_stride] >> 1) & interior_bit_mask;
-        let opaque_visible = row_bits & source_opaque;
+            opaque_cols[source_base + outer_local * column_outer_stride] & interior_padded_mask;
+        let opaque_visible = visible_padded & source_opaque;
 
         if opaque_visible == 0 {
             // Translucent and empty-visible faces do not participate in the AO
@@ -290,20 +293,14 @@ fn build_slice_ao_masks(
             continue;
         }
 
-        let current_row = (opaque_cols[outside_base + outer_local * column_outer_stride] >> 1)
-            & interior_bit_mask;
-        let prev_row = if outer_local > 0 {
-            (opaque_cols[outside_base + (outer_local - 1) * column_outer_stride] >> 1)
-                & interior_bit_mask
-        } else {
-            0
-        };
-        let next_row = if outer_local + 1 < slice.outer_len {
-            (opaque_cols[outside_base + (outer_local + 1) * column_outer_stride] >> 1)
-                & interior_bit_mask
-        } else {
-            0
-        };
+        let current_row =
+            opaque_cols[outside_base + outer_local * column_outer_stride] & padded_bit_mask;
+        let prev_row =
+            opaque_cols[outside_base + outer_local * column_outer_stride - column_outer_stride]
+                & padded_bit_mask;
+        let next_row =
+            opaque_cols[outside_base + outer_local * column_outer_stride + column_outer_stride]
+                & padded_bit_mask;
 
         // Classify the visible opaque bits by the merge directions that remain
         // legal once AO boundaries are respected.
@@ -312,9 +309,12 @@ fn build_slice_ao_masks(
             prev_row,
             current_row,
             next_row,
-            interior_bit_mask,
+            interior_padded_mask,
         );
 
+        let unit = (unit >> 1) & interior_bit_mask;
+        let horizontal = (horizontal >> 1) & interior_bit_mask;
+        let vertical = (vertical >> 1) & interior_bit_mask;
         let bidir = row_bits & !(unit | horizontal | vertical);
 
         unit_rows[outer_local] = unit;

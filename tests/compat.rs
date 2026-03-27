@@ -271,6 +271,66 @@ fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
 }
 
 #[test]
+fn ao_safe_mode_uses_padding_columns_on_chunk_boundaries() {
+    let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
+    let voxels = make_voxels([8, 6, 8], |x, y, z| {
+        let lower_plate = y == 2 && (1..=3).contains(&x) && (2..=4).contains(&z);
+        let padded_lip = y == 3 && x == 0 && (2..=4).contains(&z);
+
+        if lower_plate || padded_lip {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+
+    let vanilla = mesh_with_binary_bgm(
+        &voxels,
+        &shape,
+        [0; 3],
+        [7, 5, 7],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+    let ao_safe = mesh_with_binary_bgm_ao_safe(
+        &voxels,
+        &shape,
+        [0; 3],
+        [7, 5, 7],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+    let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
+        .faces
+        .iter()
+        .position(|face| {
+            let axes = face_axes(face);
+            axes.n_axis == 1 && axes.n_sign > 0
+        })
+        .expect("top face should exist");
+    let vanilla_lower_top = vanilla.groups[top_face_index]
+        .iter()
+        .filter(|quad| quad.minimum[1] == 2)
+        .count();
+    let ao_safe_lower_top = ao_safe.groups[top_face_index]
+        .iter()
+        .filter(|quad| quad.minimum[1] == 2)
+        .count();
+
+    assert_same_geometry_buffers(
+        &voxels,
+        &shape,
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        &vanilla,
+        &ao_safe,
+    );
+    assert_eq!(vanilla_lower_top, 1);
+    assert!(
+        ao_safe_lower_top > 1,
+        "AO-safe mode should split the boundary-adjacent top face when padding voxels change AO"
+    );
+    assert_uniform_ao_per_quad(&voxels, &shape, &RIGHT_HANDED_Y_UP_CONFIG.faces, &ao_safe);
+}
+
+#[test]
 fn randomized_property_cases_match_block_mesh_geometry() {
     let mut rng = StdRng::seed_from_u64(0x5eed_baad_f00d);
 
