@@ -3,7 +3,7 @@ use block_mesh::{
     greedy_quads, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, Voxel,
     VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,8 +77,10 @@ struct UnitFace {
 
 #[derive(Clone, Copy)]
 struct FaceAxes {
+    n_axis: usize,
     u_axis: usize,
     v_axis: usize,
+    n_sign: i32,
 }
 
 #[test]
@@ -168,6 +170,104 @@ fn matches_block_mesh_geometry_for_alternate_face_config() {
     });
 
     assert_same_geometry(&voxels, &shape, [0; 3], [11; 3], &faces);
+}
+
+#[test]
+fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
+    let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
+    let voxels = make_voxels([8, 6, 8], |x, y, z| {
+        if x == 0 || y == 0 || z == 0 || x == 7 || y == 5 || z == 7 {
+            return TestVoxel::empty(0);
+        }
+
+        if y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z) {
+            TestVoxel::opaque(1, 0)
+        } else if y == 3 && (2..=4).contains(&x) && z == 1 {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+    let vanilla = mesh_with_binary_bgm(
+        &voxels,
+        &shape,
+        [0; 3],
+        [7, 5, 7],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+    let ao_safe = mesh_with_binary_bgm_ao_safe(
+        &voxels,
+        &shape,
+        [0; 3],
+        [7, 5, 7],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+    let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
+        .faces
+        .iter()
+        .position(|face| {
+            let axes = face_axes(face);
+            axes.n_axis == 1 && axes.n_sign > 0
+        })
+        .expect("top face should exist");
+    let vanilla_lower_top = vanilla.groups[top_face_index]
+        .iter()
+        .filter(|quad| quad.minimum[1] == 2)
+        .count();
+    let ao_safe_lower_top = ao_safe.groups[top_face_index]
+        .iter()
+        .filter(|quad| quad.minimum[1] == 2)
+        .count();
+
+    assert_same_geometry_buffers(
+        &voxels,
+        &shape,
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+        &vanilla,
+        &ao_safe,
+    );
+    assert!(ao_safe.num_quads() > vanilla.num_quads());
+    assert_eq!(vanilla_lower_top, 1);
+    assert_eq!(ao_safe_lower_top, 4);
+    assert_uniform_ao_per_quad(&voxels, &shape, &RIGHT_HANDED_Y_UP_CONFIG.faces, &ao_safe);
+}
+
+#[test]
+fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
+    let shape = RuntimeShape::<u32, 3>::new([7, 5, 7]);
+    let voxels = make_voxels([7, 5, 7], |x, y, z| {
+        if x == 0 || y == 0 || z == 0 || x == 6 || y == 4 || z == 6 {
+            return TestVoxel::empty(0);
+        }
+
+        if y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z) {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+
+    let ao_safe = mesh_with_binary_bgm_ao_safe(
+        &voxels,
+        &shape,
+        [0; 3],
+        [6, 4, 6],
+        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+    );
+    let top_face_index = RIGHT_HANDED_Y_UP_CONFIG
+        .faces
+        .iter()
+        .position(|face| {
+            let axes = face_axes(face);
+            axes.n_axis == 1 && axes.n_sign > 0
+        })
+        .expect("top face should exist");
+
+    assert_eq!(
+        ao_safe.groups[top_face_index].len(),
+        1,
+        "AO-safe mode should not split a face whose entire exposed side is empty"
+    );
 }
 
 #[test]
@@ -295,6 +395,18 @@ fn mesh_with_binary_bgm(
     buffer.quads
 }
 
+fn mesh_with_binary_bgm_ao_safe(
+    voxels: &[TestVoxel],
+    shape: &RuntimeShape<u32, 3>,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+) -> QuadBuffer {
+    let mut buffer = BinaryGreedyQuadsBuffer::new();
+    binary_greedy_quads_ao_safe(voxels, shape, min, max, faces, &mut buffer);
+    buffer.quads
+}
+
 fn assert_same_geometry_buffers(
     voxels: &[TestVoxel],
     shape: &RuntimeShape<u32, 3>,
@@ -360,11 +472,123 @@ fn face_axes(face: &OrientedBlockFace) -> FaceAxes {
     let v_axis = SignedAxis::from_vector(corners[2].as_ivec3() - corners[0].as_ivec3())
         .expect("axis-aligned face edge")
         .unsigned_axis();
+    let normal = SignedAxis::from_vector(face.signed_normal()).expect("axis-aligned face");
 
     FaceAxes {
+        n_axis: normal.unsigned_axis().index(),
         u_axis: u_axis.index(),
         v_axis: v_axis.index(),
+        n_sign: normal.signum(),
     }
+}
+
+fn assert_uniform_ao_per_quad(
+    voxels: &[TestVoxel],
+    shape: &RuntimeShape<u32, 3>,
+    faces: &[OrientedBlockFace; 6],
+    buffer: &QuadBuffer,
+) {
+    for (face_index, face) in faces.iter().enumerate() {
+        let axes = face_axes(face);
+
+        for quad in &buffer.groups[face_index] {
+            let mut expected = None;
+
+            for dv in 0..quad.height {
+                for du in 0..quad.width {
+                    let mut cell = quad.minimum;
+                    cell[axes.u_axis] += du;
+                    cell[axes.v_axis] += dv;
+                    let ao = face_ao_signature(voxels, shape, axes, cell);
+
+                    match expected {
+                        None => expected = Some(ao),
+                        Some(current) => assert_eq!(
+                            current, ao,
+                            "quad spans differing AO signatures: face_index={face_index} quad={quad:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn face_ao_signature(
+    voxels: &[TestVoxel],
+    shape: &RuntimeShape<u32, 3>,
+    axes: FaceAxes,
+    coord: [u32; 3],
+) -> Option<u8> {
+    let voxel = voxels[shape.linearize(coord) as usize];
+    if voxel.visibility != VoxelVisibility::Opaque {
+        return None;
+    }
+
+    let corners = [
+        ([axes.u_axis, axes.v_axis], [-1i32, -1i32]),
+        ([axes.u_axis, axes.v_axis], [1, -1]),
+        ([axes.u_axis, axes.v_axis], [1, 1]),
+        ([axes.u_axis, axes.v_axis], [-1, 1]),
+    ];
+    let mut signature = 0u8;
+
+    for (corner_index, (axes_pair, deltas)) in corners.into_iter().enumerate() {
+        let side1 = offset_is_opaque(shape, voxels, coord, axes, axes_pair[0], deltas[0]);
+        let side2 = offset_is_opaque(shape, voxels, coord, axes, axes_pair[1], deltas[1]);
+        let corner = offset2_is_opaque(
+            shape,
+            voxels,
+            coord,
+            axes,
+            axes_pair[0],
+            deltas[0],
+            axes_pair[1],
+            deltas[1],
+        );
+        signature |= vertex_ao(side1, side2, corner) << (corner_index * 2);
+    }
+
+    Some(signature)
+}
+
+fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
+    if side1 && side2 {
+        0
+    } else {
+        3 - side1 as u8 - side2 as u8 - corner as u8
+    }
+}
+
+fn offset_is_opaque(
+    shape: &RuntimeShape<u32, 3>,
+    voxels: &[TestVoxel],
+    coord: [u32; 3],
+    axes: FaceAxes,
+    axis: usize,
+    delta: i32,
+) -> bool {
+    let mut offset_coord = coord;
+    offset_coord[axes.n_axis] = (offset_coord[axes.n_axis] as i32 + axes.n_sign) as u32;
+    offset_coord[axis] = (offset_coord[axis] as i32 + delta) as u32;
+    voxels[shape.linearize(offset_coord) as usize].visibility == VoxelVisibility::Opaque
+}
+
+fn offset2_is_opaque(
+    shape: &RuntimeShape<u32, 3>,
+    voxels: &[TestVoxel],
+    coord: [u32; 3],
+    axes: FaceAxes,
+    axis_a: usize,
+    delta_a: i32,
+    axis_b: usize,
+    delta_b: i32,
+) -> bool {
+    let mut offset_coord = coord;
+    offset_coord[axes.n_axis] = (offset_coord[axes.n_axis] as i32 + axes.n_sign) as u32;
+    offset_coord[axis_a] = (offset_coord[axis_a] as i32 + delta_a) as u32;
+    offset_coord[axis_b] = (offset_coord[axis_b] as i32 + delta_b) as u32;
+    voxels[shape.linearize(offset_coord) as usize].visibility == VoxelVisibility::Opaque
 }
 
 fn face_merge_key(voxels: &[TestVoxel], shape: &RuntimeShape<u32, 3>, coord: [u32; 3]) -> u16 {

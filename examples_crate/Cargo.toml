@@ -19,3 +19,7 @@ path = "render/main.rs"
 [[example]]
 name = "custom_meshing"
 path = "custom_meshing/main.rs"
+
+[[example]]
+name = "ambient_occlusion"
+path = "ambient_occlusion/main.rs"

@@ -15,7 +15,31 @@
 //! - `context`: query validation and precomputed layout facts
 //! - `prep`: occupancy columns and visible-face rows
 //! - `merge`: unit emission and carry-based greedy merging
+//! - `ao`: AO-safe alternate merge policy built on binary occupancy masks
 //! - `face`: face-orientation helpers shared by the other stages
+//!
+//! The crate exposes two public entry points:
+//!
+//! - [`binary_greedy_quads`]: the current maximum-merge implementation with no
+//!   extra policy checks
+//! - [`binary_greedy_quads_ao_safe`]: the same visibility pipeline, but with
+//!   AO-safe merge restrictions for opaque faces
+//!
+//! # AO-safe mode
+//!
+//! AO-safe mode keeps the same prep pipeline as vanilla meshing. The difference
+//! is only in how face rows are merged:
+//!
+//! - vanilla merging only checks `MergeVoxel::merge_value()`
+//! - AO-safe merging also looks at opaque occupancy in the plane just outside
+//!   the visible face
+//! - from that exterior plane it derives whole-row binary masks that prove
+//!   which cells must stay unit, which may only merge in one direction, and
+//!   which are still free to use the normal carry merge
+//!
+//! That keeps the AO rule in terms of the same binary data the mesher already
+//! uses elsewhere, instead of carrying per-cell lighting data through the hot
+//! merge loop.
 //!
 //! # Terminology
 //!
@@ -98,20 +122,61 @@
 //!
 //! assert!(buffer.quads.num_quads() > 0);
 //! ```
+//!
+//! The AO-safe entry point uses the same buffer type:
+//!
+//! ```
+//! # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
+//! # use block_mesh::{
+//! #     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
+//! # };
+//! # use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
+//! # #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+//! # struct BoolVoxel(bool);
+//! # impl Voxel for BoolVoxel {
+//! #     fn get_visibility(&self) -> VoxelVisibility {
+//! #         if self.0 {
+//! #             VoxelVisibility::Opaque
+//! #         } else {
+//! #             VoxelVisibility::Empty
+//! #         }
+//! #     }
+//! # }
+//! # impl MergeVoxel for BoolVoxel {
+//! #     type MergeValue = Self;
+//! #     fn merge_value(&self) -> Self::MergeValue {
+//! #         *self
+//! #     }
+//! # }
+//! # type ChunkShape = ConstShape3u32<4, 4, 4>;
+//! # let voxels = [BoolVoxel(false); ChunkShape::SIZE as usize];
+//! let mut buffer = BinaryGreedyQuadsBuffer::new();
+//! binary_greedy_quads_ao_safe(
+//!     &voxels,
+//!     &ChunkShape {},
+//!     [0; 3],
+//!     [3; 3],
+//!     &RIGHT_HANDED_Y_UP_CONFIG.faces,
+//!     &mut buffer,
+//! );
+//! ```
 #![warn(missing_docs)]
 
+mod ao;
 mod context;
 mod face;
 mod merge;
 mod prep;
 
+use ao::{mesh_face_rows_ao_safe, AoScratch};
 use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
 use merge::mesh_face_rows;
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
 
-/// Reusable output and scratch storage for [`binary_greedy_quads`].
+/// Reusable output and scratch storage for [`binary_greedy_quads`] and
+/// [`binary_greedy_quads_ao_safe`].
 ///
 /// Reusing one buffer per worker thread keeps the hot meshing path focused on
 /// bitwise work instead of repeated heap growth.
@@ -129,6 +194,9 @@ pub struct BinaryGreedyQuadsBuffer {
     visible_rows_alt: Vec<u64>,
     // Stage 4 scratch: carry lengths for the current face slice.
     carry_runs: Vec<u8>,
+    // AO-safe scratch: row masks derived from exterior-plane occupancy plus
+    // AO-specific carry state.
+    ao_scratch: AoScratch,
 }
 
 impl BinaryGreedyQuadsBuffer {
@@ -169,6 +237,42 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
+    binary_greedy_quads_impl::<T, S, false>(voxels, voxels_shape, min, max, faces, output);
+}
+
+/// Generates greedy quads with AO-safe merge restrictions for opaque faces.
+///
+/// This uses the same visibility pipeline as [`binary_greedy_quads`], but it
+/// refuses merges that would cross AO boundaries on opaque faces. Translucent
+/// faces keep the same merge rule they use in the vanilla path.
+///
+/// This only changes the merge policy. It does not emit AO values or lighting
+/// data for you.
+pub fn binary_greedy_quads_ao_safe<T, S>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
+    binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output);
+}
+
+fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    output: &mut BinaryGreedyQuadsBuffer,
+) where
+    T: MergeVoxel,
+    S: Shape<3, Coord = u32>,
+{
     let Some(context) = MeshingContext::new(voxels, voxels_shape, min, max, faces) else {
         output.quads.reset();
         return;
@@ -183,6 +287,7 @@ pub fn binary_greedy_quads<T, S>(
         visible_rows,
         visible_rows_alt,
         carry_runs,
+        ao_scratch,
     } = output;
 
     // Stage 1: build reusable occupancy columns for all three candidate bit axes.
@@ -220,27 +325,54 @@ pub fn binary_greedy_quads<T, S>(
             visible_rows_alt,
         );
 
-        // Stage 3 and 4: emit unit quads for fragmented slices, otherwise carry-merge rows.
-        mesh_face_rows(
-            voxels,
-            &context,
-            slice,
-            visible_rows,
-            neg_unit_only,
-            neg_axes,
-            carry_runs,
-            &mut quads.groups[neg_face_index],
-        );
-        mesh_face_rows(
-            voxels,
-            &context,
-            slice,
-            visible_rows_alt,
-            pos_unit_only,
-            pos_axes,
-            carry_runs,
-            &mut quads.groups[pos_face_index],
-        );
+        // Stage 3 and 4: emit unit quads for fragmented slices, otherwise
+        // merge rows with either the vanilla maximum-merge path or one of the
+        // alternate merge policies.
+        if AO_SAFE {
+            mesh_face_rows_ao_safe(
+                voxels,
+                &context,
+                slice,
+                visible_rows,
+                neg_unit_only,
+                neg_axes,
+                &opaque_cols[slice.bit_axis],
+                ao_scratch,
+                &mut quads.groups[neg_face_index],
+            );
+            mesh_face_rows_ao_safe(
+                voxels,
+                &context,
+                slice,
+                visible_rows_alt,
+                pos_unit_only,
+                pos_axes,
+                &opaque_cols[slice.bit_axis],
+                ao_scratch,
+                &mut quads.groups[pos_face_index],
+            );
+        } else {
+            mesh_face_rows(
+                voxels,
+                &context,
+                slice,
+                visible_rows,
+                neg_unit_only,
+                neg_axes,
+                carry_runs,
+                &mut quads.groups[neg_face_index],
+            );
+            mesh_face_rows(
+                voxels,
+                &context,
+                slice,
+                visible_rows_alt,
+                pos_unit_only,
+                pos_axes,
+                carry_runs,
+                &mut quads.groups[pos_face_index],
+            );
+        }
     }
 }
 

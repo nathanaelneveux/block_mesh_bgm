@@ -116,13 +116,37 @@ pub fn mesh_from_unit_quads(
     faces: &[OrientedBlockFace; 6],
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
 ) -> (Mesh, MeshStats) {
+    mesh_from_unit_quads_impl(buffer, faces, samples, false)
+}
+
+pub fn mesh_from_unit_quads_with_ao(
+    buffer: UnitQuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+) -> (Mesh, MeshStats) {
+    mesh_from_unit_quads_impl(buffer, faces, samples, true)
+}
+
+fn mesh_from_unit_quads_impl(
+    buffer: UnitQuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+    apply_ao: bool,
+) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
     let mut mesh = MeshBuffers::default();
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
         for quad in group {
             let quad: UnorientedQuad = quad.into();
-            append_quad(face, quad, quad_voxel(samples, quad.minimum), &mut mesh);
+            append_quad(
+                face,
+                quad,
+                quad_voxel(samples, quad.minimum),
+                samples,
+                apply_ao,
+                &mut mesh,
+            );
         }
     }
 
@@ -134,12 +158,36 @@ pub fn mesh_from_quads(
     faces: &[OrientedBlockFace; 6],
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
 ) -> (Mesh, MeshStats) {
+    mesh_from_quads_impl(buffer, faces, samples, false)
+}
+
+pub fn mesh_from_quads_with_ao(
+    buffer: QuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+) -> (Mesh, MeshStats) {
+    mesh_from_quads_impl(buffer, faces, samples, true)
+}
+
+fn mesh_from_quads_impl(
+    buffer: QuadBuffer,
+    faces: &[OrientedBlockFace; 6],
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+    apply_ao: bool,
+) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
     let mut mesh = MeshBuffers::default();
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
         for quad in group {
-            append_quad(face, quad, quad_voxel(samples, quad.minimum), &mut mesh);
+            append_quad(
+                face,
+                quad,
+                quad_voxel(samples, quad.minimum),
+                samples,
+                apply_ao,
+                &mut mesh,
+            );
         }
     }
 
@@ -164,6 +212,20 @@ impl MeshBuffers {
         self.colors.extend_from_slice(&[color; 4]);
     }
 
+    fn push_quad_colors(
+        &mut self,
+        face: OrientedBlockFace,
+        quad: UnorientedQuad,
+        colors: [[f32; 4]; 4],
+    ) {
+        self.indices
+            .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
+        self.positions
+            .extend_from_slice(&face.quad_mesh_positions(&quad, 1.0));
+        self.normals.extend_from_slice(&face.quad_mesh_normals());
+        self.colors.extend_from_slice(&colors);
+    }
+
     fn build(self) -> Mesh {
         build_render_mesh(self.indices, self.positions, self.normals, self.colors)
     }
@@ -173,10 +235,20 @@ fn append_quad(
     face: OrientedBlockFace,
     quad: UnorientedQuad,
     voxel: DemoVoxel,
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+    apply_ao: bool,
     mesh: &mut MeshBuffers,
 ) {
     if voxel.visibility != VoxelVisibility::Empty {
-        mesh.push_quad(face, quad, voxel_color(voxel));
+        if apply_ao && voxel.visibility == VoxelVisibility::Opaque {
+            mesh.push_quad_colors(
+                face,
+                quad,
+                quad_vertex_colors_with_ao(face, quad, voxel, samples),
+            );
+        } else {
+            mesh.push_quad(face, quad, voxel_color(voxel));
+        }
     }
 }
 
@@ -242,5 +314,146 @@ fn material_color(material: u8) -> [f32; 4] {
         5 => [0.48, 0.36, 0.84, 1.0],
         6 => [0.86, 0.41, 0.69, 1.0],
         _ => [0.85, 0.85, 0.85, 1.0],
+    }
+}
+
+fn quad_vertex_colors_with_ao(
+    face: OrientedBlockFace,
+    quad: UnorientedQuad,
+    voxel: DemoVoxel,
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+) -> [[f32; 4]; 4] {
+    let ao = face_aos(face, quad.minimum, samples);
+    let base = voxel_color(voxel);
+    ao.map(|ao_value| shade_color_with_ao(base, ao_value))
+}
+
+fn shade_color_with_ao(mut color: [f32; 4], ao_value: u32) -> [f32; 4] {
+    let shade = match ao_value {
+        0 => 0.10,
+        1 => 0.30,
+        2 => 0.50,
+        _ => 1.00,
+    };
+    color[0] *= shade;
+    color[1] *= shade;
+    color[2] *= shade;
+    color
+}
+
+fn face_aos(
+    face: OrientedBlockFace,
+    minimum: [u32; 3],
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+) -> [u32; 4] {
+    let normal = face.signed_normal();
+    let [x, y, z] = minimum;
+
+    match [normal.x, normal.y, normal.z] {
+        [-1, 0, 0] => side_aos(
+            samples,
+            [
+                [x - 1, y, z - 1],
+                [x - 1, y - 1, z - 1],
+                [x - 1, y - 1, z],
+                [x - 1, y - 1, z + 1],
+                [x - 1, y, z + 1],
+                [x - 1, y + 1, z + 1],
+                [x - 1, y + 1, z],
+                [x - 1, y + 1, z - 1],
+            ],
+        ),
+        [1, 0, 0] => side_aos(
+            samples,
+            [
+                [x + 1, y, z - 1],
+                [x + 1, y - 1, z - 1],
+                [x + 1, y - 1, z],
+                [x + 1, y - 1, z + 1],
+                [x + 1, y, z + 1],
+                [x + 1, y + 1, z + 1],
+                [x + 1, y + 1, z],
+                [x + 1, y + 1, z - 1],
+            ],
+        ),
+        [0, -1, 0] => side_aos(
+            samples,
+            [
+                [x, y - 1, z - 1],
+                [x - 1, y - 1, z - 1],
+                [x - 1, y - 1, z],
+                [x - 1, y - 1, z + 1],
+                [x, y - 1, z + 1],
+                [x + 1, y - 1, z + 1],
+                [x + 1, y - 1, z],
+                [x + 1, y - 1, z - 1],
+            ],
+        ),
+        [0, 1, 0] => side_aos(
+            samples,
+            [
+                [x, y + 1, z - 1],
+                [x - 1, y + 1, z - 1],
+                [x - 1, y + 1, z],
+                [x - 1, y + 1, z + 1],
+                [x, y + 1, z + 1],
+                [x + 1, y + 1, z + 1],
+                [x + 1, y + 1, z],
+                [x + 1, y + 1, z - 1],
+            ],
+        ),
+        [0, 0, -1] => side_aos(
+            samples,
+            [
+                [x - 1, y, z - 1],
+                [x - 1, y - 1, z - 1],
+                [x, y - 1, z - 1],
+                [x + 1, y - 1, z - 1],
+                [x + 1, y, z - 1],
+                [x + 1, y + 1, z - 1],
+                [x, y + 1, z - 1],
+                [x - 1, y + 1, z - 1],
+            ],
+        ),
+        [0, 0, 1] => side_aos(
+            samples,
+            [
+                [x - 1, y, z + 1],
+                [x - 1, y - 1, z + 1],
+                [x, y - 1, z + 1],
+                [x + 1, y - 1, z + 1],
+                [x + 1, y, z + 1],
+                [x + 1, y + 1, z + 1],
+                [x, y + 1, z + 1],
+                [x - 1, y + 1, z + 1],
+            ],
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn side_aos(
+    samples: &[DemoVoxel; SampleShape::SIZE as usize],
+    neighbors: [[u32; 3]; 8],
+) -> [u32; 4] {
+    let opaque = neighbors.map(|coord| voxel_is_opaque(samples, coord));
+    [
+        ao_value(opaque[0], opaque[1], opaque[2]),
+        ao_value(opaque[2], opaque[3], opaque[4]),
+        ao_value(opaque[6], opaque[7], opaque[0]),
+        ao_value(opaque[4], opaque[5], opaque[6]),
+    ]
+}
+
+fn voxel_is_opaque(samples: &[DemoVoxel; SampleShape::SIZE as usize], coord: [u32; 3]) -> bool {
+    samples[SampleShape::linearize(coord) as usize].visibility == VoxelVisibility::Opaque
+}
+
+fn ao_value(side1: bool, corner: bool, side2: bool) -> u32 {
+    match (side1, corner, side2) {
+        (true, _, true) => 0,
+        (true, true, false) | (false, true, true) => 1,
+        (false, false, false) => 3,
+        _ => 2,
     }
 }

@@ -5,7 +5,7 @@ use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, MergeVoxel, UnitQuadBuffer, Voxel,
     VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,9 +55,9 @@ struct MultiCase {
 fn bench_meshers(c: &mut Criterion) {
     let cases = benchmark_cases();
     let multi_cases = benchmark_multi_chunk_cases();
+    let ao_cases = ao_benchmark_cases();
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
     let mut group = c.benchmark_group("meshers");
-
     for case in &cases {
         group.bench_with_input(
             BenchmarkId::new("visible_block_faces", case.name),
@@ -105,6 +105,25 @@ fn bench_meshers(c: &mut Criterion) {
                 let mut buffer = BinaryGreedyQuadsBuffer::new();
                 b.iter(|| {
                     binary_greedy_quads(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads_ao_safe(
                         black_box(&case.voxels),
                         &case.shape,
                         case.min,
@@ -185,6 +204,108 @@ fn bench_meshers(c: &mut Criterion) {
                         total_quads += buffer.quads.num_quads();
                     }
                     black_box(total_quads);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    let mut total_quads = 0usize;
+                    for chunk in &case.chunks {
+                        binary_greedy_quads_ao_safe(
+                            black_box(&chunk.voxels),
+                            &chunk.shape,
+                            chunk.min,
+                            chunk.max,
+                            &faces,
+                            &mut buffer,
+                        );
+                        total_quads += buffer.quads.num_quads();
+                    }
+                    black_box(total_quads);
+                });
+            },
+        );
+    }
+
+    for case in &ao_cases {
+        group.bench_with_input(
+            BenchmarkId::new("visible_block_faces", case.name),
+            case,
+            |b, case| {
+                let mut buffer = UnitQuadBuffer::new();
+                b.iter(|| {
+                    buffer.reset();
+                    visible_block_faces(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = GreedyQuadsBuffer::new(case.voxels.len());
+                b.iter(|| {
+                    greedy_quads(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("binary_greedy_quads_ao_safe", case.name),
+            case,
+            |b, case| {
+                let mut buffer = BinaryGreedyQuadsBuffer::new();
+                b.iter(|| {
+                    binary_greedy_quads_ao_safe(
+                        black_box(&case.voxels),
+                        &case.shape,
+                        case.min,
+                        case.max,
+                        &faces,
+                        &mut buffer,
+                    );
+                    black_box(buffer.quads.num_quads());
                 });
             },
         );
@@ -348,6 +469,84 @@ fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
             }
         },
     )]
+}
+
+fn ao_benchmark_cases() -> Vec<Case> {
+    let base_cases = benchmark_cases();
+
+    vec![
+        {
+            let mut case = base_cases
+                .iter()
+                .find(|case| case.name == "dense-sphere")
+                .expect("dense-sphere benchmark case")
+                .clone();
+            case.name = "dense-sphere-ao";
+            case
+        },
+        {
+            let mut case = base_cases
+                .iter()
+                .find(|case| case.name == "translucent-shell-sphere")
+                .expect("translucent-shell-sphere benchmark case")
+                .clone();
+            case.name = "translucent-shell-sphere-ao";
+            case
+        },
+        build_case(
+            "ao-boundary-stress",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| {
+                let terrace = y == 16
+                    && ((8..=11).contains(&z) && (8..=25).contains(&x)
+                        || (12..=15).contains(&z) && (8..=19).contains(&x)
+                        || (16..=19).contains(&z) && (8..=13).contains(&x));
+                let ribs = y == 16 && matches!((x, z), (8, 12..=19) | (14, 12..=19) | (20, 8..=15));
+
+                if terrace || ribs {
+                    BenchVoxel {
+                        visibility: VoxelVisibility::Opaque,
+                        material: 1,
+                    }
+                } else {
+                    BenchVoxel::default()
+                }
+            },
+        ),
+        build_case(
+            "ao-unit-patterns",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |x, y, z, _dims| {
+                let lower_plate = y == 16
+                    && ((6..=10).contains(&x) && (6..=10).contains(&z)
+                        || (14..=18).contains(&x) && (6..=10).contains(&z)
+                        || (22..=26).contains(&x) && (6..=10).contains(&z));
+
+                let upper_lips = y == 17
+                    && (
+                        // Interior-corner pattern: a two-sided upper lip.
+                        ((6..=8).contains(&x) && z == 5) || (x == 5 && (6..=8).contains(&z))
+                        // Diagonal-from-corner pattern: a single upper corner.
+                        || (x == 13 && z == 5)
+                        // Side-run corner pattern: a one-voxel-deep upper strip.
+                        || ((22..=24).contains(&x) && z == 5)
+                    );
+
+                if lower_plate || upper_lips {
+                    BenchVoxel {
+                        visibility: VoxelVisibility::Opaque,
+                        material: 1,
+                    }
+                } else {
+                    BenchVoxel::default()
+                }
+            },
+        ),
+    ]
 }
 
 fn build_case(

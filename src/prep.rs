@@ -133,15 +133,8 @@ pub(crate) fn build_visible_row_pair(
     pos_rows: &mut [u64],
 ) -> (bool, bool) {
     let interior_bit_mask = bit_mask(0, bit_len);
-    let (base_offset, n_stride, outer_stride) = match (bit_axis, n_axis, outer_axis) {
-        (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
-        (0, 2, 1) => (1, query_shape[1], 1),
-        (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
-        (1, 2, 0) => (1, query_shape[0], 1),
-        (2, 0, 1) => (query_shape[0], 1, query_shape[0]),
-        (2, 1, 0) => (1, query_shape[0], 1),
-        _ => unreachable!(),
-    };
+    let (base_offset, n_stride, outer_stride) =
+        column_row_layout(query_shape, bit_axis, n_axis, outer_axis);
     let mut neg_unit_only = true;
     let mut pos_unit_only = true;
 
@@ -189,6 +182,27 @@ pub(crate) fn build_visible_row_pair(
     }
 
     (neg_unit_only, pos_unit_only)
+}
+
+/// Returns the index layout for scanning rows out of one occupancy-column table.
+///
+/// The result is `(base_offset, n_stride, outer_stride)`.
+#[inline(always)]
+pub(crate) fn column_row_layout(
+    query_shape: [usize; 3],
+    bit_axis: usize,
+    n_axis: usize,
+    outer_axis: usize,
+) -> (usize, usize, usize) {
+    match (bit_axis, n_axis, outer_axis) {
+        (0, 1, 2) => (query_shape[1], 1, query_shape[1]),
+        (0, 2, 1) => (1, query_shape[1], 1),
+        (1, 0, 2) => (query_shape[0], 1, query_shape[0]),
+        (1, 2, 0) => (1, query_shape[0], 1),
+        (2, 0, 1) => (query_shape[0], 1, query_shape[0]),
+        (2, 1, 0) => (1, query_shape[0], 1),
+        _ => unreachable!(),
+    }
 }
 
 /// Resizes the reusable visible-row buffer for the current axis family.

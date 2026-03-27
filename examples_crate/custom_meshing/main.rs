@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -28,9 +28,9 @@ use bevy_voxel_world::{
 };
 use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, OrientedBlockFace, QuadBuffer,
-    UnitQuadBuffer, UnorientedQuad, RIGHT_HANDED_Y_UP_CONFIG,
+    UnitQuadBuffer, UnorientedQuad, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
 
@@ -95,11 +95,16 @@ impl MeshingAlgorithm {
             Self::BinaryGreedyQuads => "binary greedy quads",
         }
     }
+
+    fn supports_ao(self) -> bool {
+        matches!(self, Self::VisibleFaces | Self::BinaryGreedyQuads)
+    }
 }
 
 #[derive(Clone)]
 struct MeshingSharedState {
     algorithm: Arc<AtomicU8>,
+    ao_safe: Arc<AtomicBool>,
     timing_generation: Arc<AtomicU64>,
     total_nanos: Arc<AtomicU64>,
     sample_count: Arc<AtomicU64>,
@@ -109,6 +114,7 @@ impl Default for MeshingSharedState {
     fn default() -> Self {
         Self {
             algorithm: Arc::new(AtomicU8::new(MeshingAlgorithm::default().as_u8())),
+            ao_safe: Arc::new(AtomicBool::new(false)),
             timing_generation: Arc::new(AtomicU64::new(0)),
             total_nanos: Arc::new(AtomicU64::new(0)),
             sample_count: Arc::new(AtomicU64::new(0)),
@@ -121,8 +127,18 @@ impl MeshingSharedState {
         MeshingAlgorithm::from_u8(self.algorithm.load(Ordering::Acquire))
     }
 
+    fn ao_safe(&self) -> bool {
+        self.ao_safe.load(Ordering::Acquire)
+    }
+
     fn timing_generation(&self) -> u64 {
         self.timing_generation.load(Ordering::Acquire)
+    }
+
+    fn reset_timing(&self) {
+        self.timing_generation.fetch_add(1, Ordering::AcqRel);
+        self.total_nanos.store(0, Ordering::Release);
+        self.sample_count.store(0, Ordering::Release);
     }
 
     fn select_algorithm(&self, algorithm: MeshingAlgorithm) -> bool {
@@ -131,10 +147,13 @@ impl MeshingSharedState {
             return false;
         }
 
-        self.timing_generation.fetch_add(1, Ordering::AcqRel);
-        self.total_nanos.store(0, Ordering::Release);
-        self.sample_count.store(0, Ordering::Release);
+        self.reset_timing();
         true
+    }
+
+    fn set_ao_safe(&self, ao_safe: bool) -> bool {
+        let previous = self.ao_safe.swap(ao_safe, Ordering::AcqRel);
+        previous != ao_safe
     }
 
     fn record_sample(&self, generation: u64, elapsed: Duration) {
@@ -149,6 +168,7 @@ impl MeshingSharedState {
 
     fn snapshot(&self) -> MeshingTimingSnapshot {
         let algorithm = self.algorithm();
+        let ao_safe = self.ao_safe();
         let sample_count = self.sample_count.load(Ordering::Acquire);
         let total_nanos = self.total_nanos.load(Ordering::Acquire);
         let average = if sample_count == 0 {
@@ -159,6 +179,7 @@ impl MeshingSharedState {
 
         MeshingTimingSnapshot {
             algorithm,
+            ao_safe,
             sample_count,
             average,
         }
@@ -167,6 +188,7 @@ impl MeshingSharedState {
 
 struct MeshingTimingSnapshot {
     algorithm: MeshingAlgorithm,
+    ao_safe: bool,
     sample_count: u64,
     average: Option<Duration>,
 }
@@ -214,11 +236,11 @@ impl VoxelWorldConfig for MainWorld {
                           _mesh_shape_in: UVec3,
                           texture_index_mapper: TextureIndexMapperFn<Self::MaterialIndex>| {
                         let algorithm = meshing.algorithm();
+                        let ao_safe = meshing.ao_safe();
                         let generation = meshing.timing_generation();
                         let start = Instant::now();
 
-                        let render_mesh =
-                            mesh_chunk(algorithm, &voxels, &texture_index_mapper);
+                        let render_mesh = mesh_chunk(algorithm, ao_safe, &voxels, &texture_index_mapper);
 
                         meshing.record_sample(generation, start.elapsed());
                         (render_mesh, None)
@@ -235,6 +257,7 @@ struct RenderMeshBuffers {
     normals: Vec<[f32; 3]>,
     tex_coords: Vec<[f32; 2]>,
     material_types: Vec<[u32; 3]>,
+    colors: Vec<[f32; 4]>,
 }
 
 impl RenderMeshBuffers {
@@ -247,6 +270,7 @@ impl RenderMeshBuffers {
             normals: Vec::with_capacity(num_vertices),
             tex_coords: Vec::with_capacity(num_vertices),
             material_types: Vec::with_capacity(num_vertices),
+            colors: Vec::with_capacity(num_vertices),
         }
     }
 
@@ -256,6 +280,7 @@ impl RenderMeshBuffers {
         quad: &UnorientedQuad,
         voxels: &[WorldVoxel<u8>],
         texture_index_mapper: &TextureIndexMapperFn<u8>,
+        ao: Option<[u32; 4]>,
     ) {
         self.indices
             .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
@@ -275,10 +300,13 @@ impl RenderMeshBuffers {
         };
         self.material_types
             .extend(std::iter::repeat_n(material_type, 4));
+        match ao {
+            Some(values) => self.colors.extend(values.map(ao_vertex_color)),
+            None => self.colors.extend(std::iter::repeat_n([1.0; 4], 4)),
+        }
     }
 
     fn build(self) -> Mesh {
-        let num_vertices = self.positions.len();
         let mut render_mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::RENDER_WORLD,
@@ -299,7 +327,10 @@ impl RenderMeshBuffers {
             ATTRIBUTE_TEX_INDEX,
             VertexAttributeValues::Uint32x3(self.material_types),
         );
-        render_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0; 4]; num_vertices]);
+        render_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_COLOR,
+            VertexAttributeValues::Float32x4(self.colors),
+        );
         render_mesh.insert_indices(Indices::U32(self.indices));
         render_mesh
     }
@@ -307,6 +338,7 @@ impl RenderMeshBuffers {
 
 fn mesh_chunk(
     algorithm: MeshingAlgorithm,
+    ao_safe: bool,
     voxels: &[WorldVoxel<u8>],
     texture_index_mapper: &TextureIndexMapperFn<u8>,
 ) -> Mesh {
@@ -324,7 +356,7 @@ fn mesh_chunk(
                 &faces,
                 &mut buffer,
             );
-            build_mesh_from_unit_quad_buffer(&buffer, &faces, voxels, texture_index_mapper)
+            build_mesh_from_unit_quad_buffer(&buffer, &faces, voxels, texture_index_mapper, ao_safe)
         }),
         MeshingAlgorithm::GreedyQuads => GREEDY_BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
@@ -336,19 +368,36 @@ fn mesh_chunk(
                 &faces,
                 &mut buffer,
             );
-            build_mesh_from_quad_buffer(&buffer.quads, &faces, voxels, texture_index_mapper)
+            build_mesh_from_quad_buffer(&buffer.quads, &faces, voxels, texture_index_mapper, false)
         }),
         MeshingAlgorithm::BinaryGreedyQuads => BINARY_BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
-            binary_greedy_quads(
-                voxels,
-                &PaddedChunkShape {},
-                [0; 3],
-                [CHUNK_SIZE_U + 1; 3],
+            if ao_safe {
+                binary_greedy_quads_ao_safe(
+                    voxels,
+                    &PaddedChunkShape {},
+                    [0; 3],
+                    [CHUNK_SIZE_U + 1; 3],
+                    &faces,
+                    &mut buffer,
+                );
+            } else {
+                binary_greedy_quads(
+                    voxels,
+                    &PaddedChunkShape {},
+                    [0; 3],
+                    [CHUNK_SIZE_U + 1; 3],
+                    &faces,
+                    &mut buffer,
+                );
+            }
+            build_mesh_from_quad_buffer(
+                &buffer.quads,
                 &faces,
-                &mut buffer,
-            );
-            build_mesh_from_quad_buffer(&buffer.quads, &faces, voxels, texture_index_mapper)
+                voxels,
+                texture_index_mapper,
+                ao_safe,
+            )
         }),
     }
 }
@@ -358,13 +407,15 @@ fn build_mesh_from_unit_quad_buffer(
     faces: &[OrientedBlockFace; 6],
     voxels: &[WorldVoxel<u8>],
     texture_index_mapper: &TextureIndexMapperFn<u8>,
+    ao_safe: bool,
 ) -> Mesh {
     let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
 
     for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
         for quad in group {
             let quad: UnorientedQuad = (*quad).into();
-            mesh.append_quad(face, &quad, voxels, texture_index_mapper);
+            let ao = ao_safe.then(|| face_aos(face, quad.minimum, voxels));
+            mesh.append_quad(face, &quad, voxels, texture_index_mapper, ao);
         }
     }
 
@@ -376,12 +427,14 @@ fn build_mesh_from_quad_buffer(
     faces: &[OrientedBlockFace; 6],
     voxels: &[WorldVoxel<u8>],
     texture_index_mapper: &TextureIndexMapperFn<u8>,
+    ao_safe: bool,
 ) -> Mesh {
     let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
 
     for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
         for quad in group {
-            mesh.append_quad(face, quad, voxels, texture_index_mapper);
+            let ao = ao_safe.then(|| face_aos(face, quad.minimum, voxels));
+            mesh.append_quad(face, quad, voxels, texture_index_mapper, ao);
         }
     }
 
@@ -409,7 +462,7 @@ fn main() {
         .add_systems(
             Update,
             (
-                (switch_meshing_algorithm, update_overlay).chain(),
+                (switch_meshing_settings, update_overlay).chain(),
                 move_camera,
             ),
         )
@@ -419,6 +472,9 @@ fn main() {
 fn setup(mut commands: Commands) {
     info!("bevy_voxel_world custom meshing example");
     info!("Press 1 for visible faces, 2 for greedy quads, 3 for binary greedy quads.");
+    info!(
+        "Press A to toggle ambient occlusion for visible faces and AO-safe binary greedy meshing."
+    );
     info!("Switching the mesher resets average timing and respawns the loaded chunks.");
     info!(
         "Initial meshing algorithm: {}",
@@ -481,26 +537,61 @@ fn update_overlay(mut overlay: Query<&mut Text, With<OverlayText>>, world: Res<M
              1: visible faces\n\
              2: greedy quads\n\
              3: binary greedy quads\n\
+             A: visible-face AO / binary greedy AO-safe [{}]\n\
              Current: {}\n\
              Average meshing time: {}\n\
              Switching clears the average and respawns loaded chunks.",
+            toggle_label(snapshot.ao_safe),
             snapshot.algorithm.label(),
             average_text,
         ));
     }
 }
 
-fn switch_meshing_algorithm(
+fn switch_meshing_settings(
     keyboard: Res<ButtonInput<KeyCode>>,
     world: Res<MainWorld>,
     mut commands: Commands,
     chunks: Query<Entity, (With<Chunk<MainWorld>>, Without<NeedsDespawn>)>,
 ) {
-    let Some(next_algorithm) = MeshingAlgorithm::from_input(&keyboard) else {
-        return;
-    };
+    let current_algorithm = world.meshing.algorithm();
+    let next_algorithm = MeshingAlgorithm::from_input(&keyboard);
+    let ao_toggled = keyboard.just_pressed(KeyCode::KeyA);
 
-    if !world.meshing.select_algorithm(next_algorithm) {
+    if next_algorithm.is_none() && !ao_toggled {
+        return;
+    }
+
+    let mut changed = false;
+    let mut remesh_needed = false;
+
+    if let Some(next_algorithm) = next_algorithm {
+        if world.meshing.select_algorithm(next_algorithm) {
+            changed = true;
+            remesh_needed = true;
+        }
+    }
+
+    if ao_toggled {
+        let next_ao_safe = !world.meshing.ao_safe();
+        if world.meshing.set_ao_safe(next_ao_safe) {
+            changed = true;
+            if current_algorithm.supports_ao() {
+                world.meshing.reset_timing();
+                remesh_needed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return;
+    }
+
+    if !remesh_needed {
+        info!(
+            "Ambient occlusion: {} (stored for the next visible-face or binary greedy remesh)",
+            toggle_label(world.meshing.ao_safe()),
+        );
         return;
     }
 
@@ -511,9 +602,116 @@ fn switch_meshing_algorithm(
     }
 
     info!(
-        "Meshing algorithm: {} (respawning {chunk_count} loaded chunks)",
-        next_algorithm.label(),
+        "Meshing algorithm: {} | ambient occlusion: {} (respawning {chunk_count} loaded chunks)",
+        world.meshing.algorithm().label(),
+        toggle_label(world.meshing.ao_safe()),
     );
+}
+
+fn toggle_label(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn ao_vertex_color(ao_value: u32) -> [f32; 4] {
+    match ao_value {
+        0 => [0.10, 0.10, 0.10, 1.0],
+        1 => [0.30, 0.30, 0.30, 1.0],
+        2 => [0.50, 0.50, 0.50, 1.0],
+        _ => [1.0, 1.0, 1.0, 1.0],
+    }
+}
+
+fn ao_value(side1: bool, corner: bool, side2: bool) -> u32 {
+    match (side1, corner, side2) {
+        (true, _, true) => 0,
+        (true, true, false) | (false, true, true) => 1,
+        (false, false, false) => 3,
+        _ => 2,
+    }
+}
+
+fn side_aos(neighbours: [WorldVoxel<u8>; 8]) -> [u32; 4] {
+    let opaque = neighbours.map(|voxel| voxel.get_visibility() == VoxelVisibility::Opaque);
+
+    [
+        ao_value(opaque[0], opaque[1], opaque[2]),
+        ao_value(opaque[2], opaque[3], opaque[4]),
+        ao_value(opaque[6], opaque[7], opaque[0]),
+        ao_value(opaque[4], opaque[5], opaque[6]),
+    ]
+}
+
+fn face_aos(face: OrientedBlockFace, minimum: [u32; 3], voxels: &[WorldVoxel<u8>]) -> [u32; 4] {
+    let normal = face.signed_normal();
+    let [x, y, z] = minimum;
+
+    match [normal.x, normal.y, normal.z] {
+        [-1, 0, 0] => side_aos([
+            voxels[PaddedChunkShape::linearize([x - 1, y, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
+        ]),
+        [1, 0, 0] => side_aos([
+            voxels[PaddedChunkShape::linearize([x + 1, y, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
+        ]),
+        [0, -1, 0] => side_aos([
+            voxels[PaddedChunkShape::linearize([x, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
+        ]),
+        [0, 1, 0] => side_aos([
+            voxels[PaddedChunkShape::linearize([x, y + 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
+        ]),
+        [0, 0, -1] => side_aos([
+            voxels[PaddedChunkShape::linearize([x - 1, y, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y + 1, z - 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
+        ]),
+        [0, 0, 1] => side_aos([
+            voxels[PaddedChunkShape::linearize([x - 1, y, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x, y + 1, z + 1]) as usize],
+            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
+        ]),
+        _ => unreachable!(),
+    }
 }
 
 fn get_voxel_fn() -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
