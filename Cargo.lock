@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "block-mesh-bgm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "block-mesh",
  "criterion",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "block-mesh-bgm-examples"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "bevy",
  "bevy_voxel_world",
