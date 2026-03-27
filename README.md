@@ -7,9 +7,10 @@
 
 It provides a `block_mesh::greedy_quads`-style API backed by a binary-mask greedy meshing implementation designed for high performance and low overhead.
 
-The default entry point preserves maximum-merge behavior.
+## API At A Glance
 
-`binary_greedy_quads_ao_safe` is an alternate path that preserves quad boundaries required for correct per-vertex ambient occlusion — **without computing or storing AO signatures during meshing**.
+- `binary_greedy_quads` for the maximum-merge fast path
+- `binary_greedy_quads_ao_safe` when quad boundaries must stay compatible with per-vertex ambient occlusion
 
 ---
 
@@ -40,11 +41,11 @@ The 62-voxel interior limit exists because each padded axis must fit inside a si
 
 ---
 
-## AO-Safe Meshing (No AO Signatures)
+## AO-Safe Meshing
 
 `binary_greedy_quads` is the zero-extra-work fast path.
 
-`binary_greedy_quads_ao_safe` enforces merge boundaries compatible with ambient occlusion shading — **without computing AO values or storing per-cell AO signatures during meshing**.
+`binary_greedy_quads_ao_safe` enforces merge boundaries compatible with ambient occlusion shading. It does not compute AO values for you; it only preserves the boundaries that AO shading depends on.
 
 ### Key Idea
 
@@ -95,7 +96,7 @@ In practice, this keeps AO-safe meshing much closer to the baseline fast path, a
 
 ---
 
-## Reading The Source
+## Reading the Source
 
 The crate is split by stage:
 
@@ -208,7 +209,8 @@ That makes it easier to reason about where time is going:
 
 ## Benchmark Snapshot
 
-Recent local `cargo bench --bench bench` Criterion medians on my machine:
+Recent local `cargo bench --bench bench` Criterion medians on my machine.
+Treat these as relative comparisons between meshers, not as universal absolute timings.
 
 ### Core Cases
 
