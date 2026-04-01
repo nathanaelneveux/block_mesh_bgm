@@ -184,6 +184,66 @@ pub(crate) fn build_visible_row_pair(
     (neg_unit_only, pos_unit_only)
 }
 
+/// Builds visibility rows for both signs of one normal axis without any
+/// slice-level unit-only bookkeeping.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn build_visible_row_pair_plain(
+    query_shape: [usize; 3],
+    bit_axis: usize,
+    bit_len: usize,
+    outer_len: usize,
+    n_len: usize,
+    n_axis: usize,
+    outer_axis: usize,
+    opaque_cols: &[u64],
+    trans_cols: &[u64],
+    has_translucent: bool,
+    neg_rows: &mut [u64],
+    pos_rows: &mut [u64],
+) -> (bool, bool) {
+    let interior_bit_mask = bit_mask(0, bit_len);
+    let (base_offset, n_stride, outer_stride) =
+        column_row_layout(query_shape, bit_axis, n_axis, outer_axis);
+
+    for n_local in 0..n_len {
+        let src_n = n_local + 1;
+        let neg_n = src_n - 1;
+        let pos_n = src_n + 1;
+        let row_start = n_local * outer_len;
+        let mut src = base_offset + src_n * n_stride;
+        let mut neg = base_offset + neg_n * n_stride;
+        let mut pos = base_offset + pos_n * n_stride;
+
+        for outer_local in 0..outer_len {
+            let src_opaque = opaque_cols[src];
+            let neg_opaque = opaque_cols[neg];
+            let pos_opaque = opaque_cols[pos];
+            let (neg_raw_visible, pos_raw_visible) = if has_translucent {
+                let src_trans = trans_cols[src];
+                let neg_trans = trans_cols[neg];
+                let pos_trans = trans_cols[pos];
+                (
+                    (src_opaque & !neg_opaque) | (src_trans & !(neg_opaque | neg_trans)),
+                    (src_opaque & !pos_opaque) | (src_trans & !(pos_opaque | pos_trans)),
+                )
+            } else {
+                (src_opaque & !neg_opaque, src_opaque & !pos_opaque)
+            };
+
+            let neg_visible = (neg_raw_visible >> 1) & interior_bit_mask;
+            let pos_visible = (pos_raw_visible >> 1) & interior_bit_mask;
+            neg_rows[row_start + outer_local] = neg_visible;
+            pos_rows[row_start + outer_local] = pos_visible;
+            src += outer_stride;
+            neg += outer_stride;
+            pos += outer_stride;
+        }
+    }
+
+    (false, false)
+}
+
 /// Returns the index layout for scanning rows out of one occupancy-column table.
 ///
 /// The result is `(base_offset, n_stride, outer_stride)`.
@@ -206,6 +266,9 @@ pub(crate) fn column_row_layout(
 }
 
 /// Resizes the reusable visible-row buffer for the current axis family.
+///
+/// Stage 2 overwrites every entry on each call, so preserving old contents is
+/// harmless and avoids an otherwise redundant clear.
 #[inline]
 pub(crate) fn reset_visible_rows(visible_rows: &mut Vec<u64>, total_rows: usize) {
     visible_rows.resize(total_rows, 0);

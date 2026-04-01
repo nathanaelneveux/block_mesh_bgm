@@ -27,7 +27,6 @@ pub(crate) fn mesh_face_rows<T>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
     axes: FaceAxes,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
@@ -40,7 +39,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -49,7 +47,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -58,7 +55,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -67,7 +63,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -76,7 +71,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -85,7 +79,6 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
             carry_runs,
             quads,
         ),
@@ -99,27 +92,11 @@ fn mesh_face_rows_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    if unit_only {
-        for n_local in 0..slice.n_len {
-            let row_start = n_local * slice.outer_len;
-            emit_unit_slice::<N_AXIS>(
-                context.interior_min,
-                slice.outer_axis,
-                slice.bit_axis,
-                context.interior_min[N_AXIS] + n_local as u32,
-                &visible_rows[row_start..row_start + slice.outer_len],
-                quads,
-            );
-        }
-        return;
-    }
-
     mesh_face_carry::<T, N_AXIS, BIT_IS_U>(voxels, context, slice, visible_rows, carry_runs, quads);
 }
 
@@ -148,17 +125,34 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         let n_coord = n_base + n_local as u32;
         let slice_start = n_local * slice.outer_len;
         let slice_rows = &rows[slice_start..slice_start + slice.outer_len];
+        let mut previous_row_bits = 0;
         for outer_local in 0..slice.outer_len {
-            let row_bits = slice_rows[outer_local];
-            if row_bits == 0 {
-                continue;
-            }
+            let current_row_bits = slice_rows[outer_local];
 
             let next_row_bits = if outer_local + 1 < slice.outer_len {
                 slice_rows[outer_local + 1]
             } else {
                 0
             };
+
+            let unit_bits =
+                isolate_unit_bits(previous_row_bits, current_row_bits, next_row_bits);
+            if unit_bits != 0 {
+                emit_single_row_unit_quads::<N_AXIS>(
+                    unit_bits,
+                    n_coord,
+                    outer_base + outer_local as u32,
+                    bit_base,
+                    quads,
+                );
+            }
+
+            let row_bits = current_row_bits & !unit_bits;
+            previous_row_bits = current_row_bits;
+            if row_bits == 0 {
+                continue;
+            }
+
             let row_base_index = n_index_base + outer_local * outer_stride;
             let overlapping_bits = row_bits & next_row_bits;
 
@@ -244,6 +238,42 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
             has_incoming_carry = continue_mask != 0;
         }
     }
+}
+
+#[inline(always)]
+fn emit_single_row_unit_quads<const N_AXIS: usize>(
+    mut row_bits: u64,
+    n_coord: u32,
+    outer_coord: u32,
+    bit_base: u32,
+    quads: &mut Vec<UnorientedQuad>,
+) {
+    let quad_count = row_bits.count_ones() as usize;
+    let base_len = quads.len();
+    quads.reserve(quad_count);
+    let spare = quads.spare_capacity_mut();
+    let mut written = 0usize;
+
+    while row_bits != 0 {
+        let bit_local = row_bits.trailing_zeros() as usize;
+        row_bits &= row_bits - 1;
+        write_unit_quad::<N_AXIS>(
+            &mut spare[written],
+            n_coord,
+            outer_coord,
+            bit_base + bit_local as u32,
+        );
+        written += 1;
+    }
+
+    unsafe {
+        quads.set_len(base_len + written);
+    }
+}
+
+#[inline(always)]
+fn isolate_unit_bits(previous: u64, current: u64, next: u64) -> u64 {
+    current & !(current >> 1) & !(current << 1) & !previous & !next
 }
 
 /// Builds the mask of bits whose runs continue into the next row.

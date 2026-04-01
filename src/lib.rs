@@ -173,7 +173,10 @@ use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
 use merge::mesh_face_rows;
 use ndshape::Shape;
-use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
+use prep::{
+    build_axis_columns, build_visible_row_pair, build_visible_row_pair_plain, reset_columns,
+    reset_visible_rows,
+};
 
 /// Reusable output and scratch storage for [`binary_greedy_quads`] and
 /// [`binary_greedy_quads_ao_safe`].
@@ -310,20 +313,38 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         // Stage 2: derive visible-face rows for both signs of the current normal axis.
         reset_visible_rows(visible_rows, slice.total_rows());
         reset_visible_rows(visible_rows_alt, slice.total_rows());
-        let (neg_unit_only, pos_unit_only) = build_visible_row_pair(
-            context.query_shape,
-            slice.bit_axis,
-            slice.bit_len,
-            slice.outer_len,
-            slice.n_len,
-            n_axis,
-            slice.outer_axis,
-            &opaque_cols[slice.bit_axis],
-            &trans_cols[slice.bit_axis],
-            has_translucent,
-            visible_rows,
-            visible_rows_alt,
-        );
+        let (neg_unit_only, pos_unit_only) = if AO_SAFE {
+            let (neg_unit_only, pos_unit_only) = build_visible_row_pair(
+                context.query_shape,
+                slice.bit_axis,
+                slice.bit_len,
+                slice.outer_len,
+                slice.n_len,
+                n_axis,
+                slice.outer_axis,
+                &opaque_cols[slice.bit_axis],
+                &trans_cols[slice.bit_axis],
+                has_translucent,
+                visible_rows,
+                visible_rows_alt,
+            );
+            (neg_unit_only, pos_unit_only)
+        } else {
+            build_visible_row_pair_plain(
+                context.query_shape,
+                slice.bit_axis,
+                slice.bit_len,
+                slice.outer_len,
+                slice.n_len,
+                n_axis,
+                slice.outer_axis,
+                &opaque_cols[slice.bit_axis],
+                &trans_cols[slice.bit_axis],
+                has_translucent,
+                visible_rows,
+                visible_rows_alt,
+            )
+        };
 
         // Stage 3 and 4: emit unit quads for fragmented slices, otherwise
         // merge rows with either the vanilla maximum-merge path or one of the
@@ -357,7 +378,6 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows,
-                neg_unit_only,
                 neg_axes,
                 carry_runs,
                 &mut quads.groups[neg_face_index],
@@ -367,7 +387,6 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows_alt,
-                pos_unit_only,
                 pos_axes,
                 carry_runs,
                 &mut quads.groups[pos_face_index],

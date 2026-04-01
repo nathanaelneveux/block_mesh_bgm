@@ -295,12 +295,12 @@ fn build_slice_ao_masks(
 
         let current_row =
             opaque_cols[outside_base + outer_local * column_outer_stride] & padded_bit_mask;
-        let prev_row =
-            opaque_cols[outside_base + outer_local * column_outer_stride - column_outer_stride]
-                & padded_bit_mask;
-        let next_row =
-            opaque_cols[outside_base + outer_local * column_outer_stride + column_outer_stride]
-                & padded_bit_mask;
+        let prev_row = opaque_cols
+            [outside_base + outer_local * column_outer_stride - column_outer_stride]
+            & padded_bit_mask;
+        let next_row = opaque_cols
+            [outside_base + outer_local * column_outer_stride + column_outer_stride]
+            & padded_bit_mask;
 
         // Classify the visible opaque bits by the merge directions that remain
         // legal once AO boundaries are respected.
