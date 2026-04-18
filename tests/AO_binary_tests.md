@@ -22,8 +22,8 @@ L = -1<< ^ -1>>     0 0 0 1 1 1 0 0 0 0 0 1 1 0 0 0 0 1 0 (unit)
 K = +1<< ^ +1>>     0 0 0 1 0 0 0 0 1 1 0 0 0 0 0 1 1 0 0 (unit)
 P = -1 & !J         1 0 1 0 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 (possible unit)
 Q = +1 & !I         1 0 1 0 0 1 0 0 0 0 0 1 0 0 0 0 0 0 1 (possible unit)
-R = K | L
-S = P | Q
+R = K | L           0 0 0 1 1 1 0 0 1 1 0 1 1 0 0 1 1 1 0
+S = P | Q           1 0 1 0 0 1 0 0 0 1 0 1 0 0 0 1 0 0 1
 
 M = (D|R|S)& !H& A  0 0 0 0 1 1 0 0 1 1 0 1 1 0 0 1 1 1 0 (final unit quads list)
 N = (I|J)& !H & !M  0 0 0 0 0 0 1 1 0 0 1 0 0 1 1 0 0 0 0
@@ -55,8 +55,8 @@ Third test
 
 A =     0 1 1 1 0 1
 H =     0 0 0 0 0 0
-M =     0 1 0 0 0 0
-0 =     0 0 1 1 1 0
+M =     0 1 0 0 0 1
+O =     0 0 1 1 0 0
 
 Fourth test
 
@@ -72,12 +72,15 @@ I =     0 0 0 0 0 0
 J =     0 0 0 0 0 0
 K =     0 0 0 1 0 1
 L =     1 0 1 0 0 0
-M =     1 0 1 1 0 1
+P =     0 1 0 0 0 0
+Q =     0 0 0 0 1 0
+R =     1 0 1 1 0 1
+S =     0 1 0 0 1 0
+M =     1 1 1 1 1 1
 N =     0 0 0 0 0 0
 O =     0 0 0 0 0 0
 
-Calc    U B U U B U
-Out?    U U U U U U
+Out     U U U U U U
 
 Counterexample candidate: fully exposed cap
 
@@ -97,14 +100,18 @@ D = B | C           0 0 0 0 0 0 0
 E = -1 & 0 & +1     0 0 0 0 0 0 0
 F = A & E>>         0 0 0 0 0 0 0
 G = A & E<<         0 0 0 0 0 0 0
-H = F & G           0 0 0 0 0 0 0 (final v mergable quads list)
+H = (F|G)& !-1& !+1 0 0 0 0 0 0 0 (final v mergable quads list)
 
-I = +1<< & +1>>     0 0 0 0 0 0 0
 J = -1<< & -1>>     0 0 0 0 0 0 0
-K = +1<< ^ +1>>     0 0 0 0 0 0 0
+I = +1<< & +1>>     0 0 0 0 0 0 0
 L = -1<< ^ -1>>     0 0 0 0 0 0 0
+K = +1<< ^ +1>>     0 0 0 0 0 0 0
+P = -1 & !J         0 0 0 0 0 0 0
+Q = +1 & !I         0 0 0 0 0 0 0
+R = K | L           0 0 0 0 0 0 0
+S = P | Q           0 0 0 0 0 0 0
 
-M = (D|K|L)& !H& A  0 0 0 0 0 0 0 (final unit quads list)
+M = (D|R|S)& !H& A  0 0 0 0 0 0 0 (final unit quads list)
 N = (I|J)& !H & !M  0 0 0 0 0 0 0
 O = N & A           0 0 0 0 0 0 0 (final u mergable quads list)
 

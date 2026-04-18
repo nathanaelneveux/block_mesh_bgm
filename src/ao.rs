@@ -295,12 +295,12 @@ fn build_slice_ao_masks(
 
         let current_row =
             opaque_cols[outside_base + outer_local * column_outer_stride] & padded_bit_mask;
-        let prev_row =
-            opaque_cols[outside_base + outer_local * column_outer_stride - column_outer_stride]
-                & padded_bit_mask;
-        let next_row =
-            opaque_cols[outside_base + outer_local * column_outer_stride + column_outer_stride]
-                & padded_bit_mask;
+        let prev_row = opaque_cols
+            [outside_base + outer_local * column_outer_stride - column_outer_stride]
+            & padded_bit_mask;
+        let next_row = opaque_cols
+            [outside_base + outer_local * column_outer_stride + column_outer_stride]
+            & padded_bit_mask;
 
         // Classify the visible opaque bits by the merge directions that remain
         // legal once AO boundaries are respected.
@@ -342,13 +342,19 @@ fn classify_ao_opaque_row(
         (((next_row << 1) & interior_bit_mask) ^ (next_row >> 1)) & interior_bit_mask;
     let edge_from_prev =
         (((prev_row << 1) & interior_bit_mask) ^ (prev_row >> 1)) & interior_bit_mask;
-    let unit = opaque_visible
-        & !vertical
-        & (neighbor_curr | edge_from_next | edge_from_prev)
-        & interior_bit_mask;
-
     let horiz_from_next = ((next_row << 1) & interior_bit_mask) & (next_row >> 1);
     let horiz_from_prev = ((prev_row << 1) & interior_bit_mask) & (prev_row >> 1);
+    let possible_unit_from_prev = prev_row & !horiz_from_prev;
+    let possible_unit_from_next = next_row & !horiz_from_next;
+    let unit = opaque_visible
+        & !vertical
+        & (neighbor_curr
+            | edge_from_next
+            | edge_from_prev
+            | possible_unit_from_prev
+            | possible_unit_from_next)
+        & interior_bit_mask;
+
     let horizontal = opaque_visible
         & !vertical
         & !unit
@@ -703,6 +709,105 @@ fn reset_mask_rows(rows: &mut Vec<u64>, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::classify_ao_opaque_row;
+
+    fn bits(pattern: &str) -> u64 {
+        pattern
+            .chars()
+            .enumerate()
+            .fold(0u64, |acc, (i, ch)| match ch {
+                '0' => acc,
+                '1' => acc | (1u64 << i),
+                _ => panic!("unexpected bit {ch:?}"),
+            })
+    }
+
+    fn padded(pattern: &str) -> u64 {
+        let mut padded = String::with_capacity(pattern.len() + 2);
+        padded.push('0');
+        padded.push_str(pattern);
+        padded.push('0');
+        bits(&padded)
+    }
+
+    #[test]
+    fn classify_matches_primary_worked_example() {
+        let opaque_visible = padded("0100111111111111110");
+        let prev_row = padded("1010000001111111000");
+        let current_row = padded("1011000000000000001");
+        let next_row = padded("1010011111110000001");
+        let mask = padded("1111111111111111111");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, padded("0000110011011001110"));
+        assert_eq!(horizontal, padded("0000001100100110000"));
+        assert_eq!(vertical, padded("0100000000000000000"));
+    }
+
+    #[test]
+    fn classify_matches_second_worked_example() {
+        let opaque_visible = padded("0110110");
+        let prev_row = padded("1000000");
+        let current_row = padded("1001001");
+        let next_row = padded("1000001");
+        let mask = padded("1111111");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, padded("0010110"));
+        assert_eq!(horizontal, 0);
+        assert_eq!(vertical, padded("0100000"));
+    }
+
+    #[test]
+    fn classify_matches_third_worked_example() {
+        let opaque_visible = padded("011101");
+        let prev_row = padded("111111");
+        let current_row = padded("100000");
+        let next_row = padded("100000");
+        let mask = padded("111111");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, padded("010001"));
+        assert_eq!(horizontal, padded("001100"));
+        assert_eq!(vertical, 0);
+    }
+
+    #[test]
+    fn classify_marks_fully_exposed_cap_as_bidir() {
+        let opaque_visible = bits("011111110");
+        let prev_row = 0;
+        let current_row = 0;
+        let next_row = 0;
+        let mask = bits("011111110");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, 0);
+        assert_eq!(horizontal, 0);
+        assert_eq!(vertical, 0);
+    }
+
+    #[test]
+    fn classify_matches_fourth_worked_example_regression() {
+        let opaque_visible = padded("111111");
+        let prev_row = padded("010000");
+        let current_row = 0;
+        let next_row = padded("000010");
+        let mask = padded("111111");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, padded("111111"));
+        assert_eq!(horizontal, 0);
+        assert_eq!(vertical, 0);
+    }
 
     #[test]
     fn vertical_rule_matches_updated_binary_proof() {
