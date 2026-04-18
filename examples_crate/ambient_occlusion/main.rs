@@ -37,7 +37,7 @@ impl SampleMode {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Sphere => "opaque sphere",
+            Self::Sphere => "opaque sphere + front voxel",
             Self::Torus => "opaque torus",
         }
     }
@@ -236,9 +236,20 @@ fn build_mesh(
 
 fn build_samples(sample_mode: SampleMode) -> [DemoVoxel; SampleShape::SIZE as usize] {
     match sample_mode {
-        SampleMode::Sphere => build_demo_samples(solid_sphere),
+        SampleMode::Sphere => build_sphere_with_probe_voxel(),
         SampleMode::Torus => build_demo_samples(solid_torus),
     }
+}
+
+fn build_sphere_with_probe_voxel() -> [DemoVoxel; SampleShape::SIZE as usize] {
+    let mut samples = build_demo_samples(solid_sphere);
+
+    // Add one protruding voxel to the center of the front +Z sphere face so
+    // the AO-safe regression is easy to inspect from the default camera.
+    let probe_coord = [16, 16, 31];
+    samples[SampleShape::linearize(probe_coord) as usize] = DemoVoxel::solid(2);
+
+    samples
 }
 
 fn solid_sphere(_: [u32; 3], p: Vec3A) -> DemoVoxel {
