@@ -97,6 +97,25 @@ On real geometry it can actually be a better mesher. In the `layered-caves-2x2x2
 
 When you do go compute AO signatures later, you are doing it over the final quads, not per voxel. That means fewer things to scan and a faster mesh to begin with. The `custom_meshing` example in this workspace shows exactly that flow: it meshes first, computes AO from the resulting quads during mesh construction, and shows the average chunk meshing time in the on-screen overlay.
 
+The examples share a small [`FaceAoSampler`](examples_crate/src/ao.rs) that is
+intended to be copied or adapted by users who want the same fast rendering
+path. Construct it once per face group, then sample only the final quads:
+
+```rust,ignore
+let sampler = FaceAoSampler::new(face, [1, EDGE, EDGE * EDGE]);
+
+for quad in face_quads {
+    let vertex_ao = sampler.sample(voxels, quad.minimum, |voxel| voxel.is_opaque());
+    // Map the four 0..=3 values to vertex colors or another lighting channel.
+}
+```
+
+Precomputing the face-normal and in-plane offsets removes per-quad orientation
+matching and eight repeated coordinate linearizations. The sampler packs the
+eight occupancy tests into one byte and uses a compact lookup for the four
+standard voxel-AO values. Run the matching focused benchmark with
+`cargo bench -p block-mesh-bgm-examples --bench ao`.
+
 ## Performance
 
 `block_mesh::greedy_quads` is dramatically slower than this crate in every benchmark here, and usually by enough that it stops looking like a serious option unless you specifically need its exact behavior. In several cases, this crate is even competitive with or faster than `visible_block_faces`, which is the obvious speed baseline.

@@ -12,6 +12,13 @@ block-mesh-bgm = { path = ".." }
 ndshape = "0.3"
 noise = "0.9"
 
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "ao"
+harness = false
+
 [[example]]
 name = "render"
 path = "render/main.rs"
