@@ -23,6 +23,26 @@ pub(crate) struct FaceSliceMasks {
     pub(crate) unit_only: u64,
 }
 
+/// Visibility classes encountered while packing the padded query.
+#[derive(Clone, Copy)]
+pub(crate) struct OccupancySummary {
+    pub(crate) has_empty: bool,
+    pub(crate) has_opaque: bool,
+    pub(crate) has_translucent: bool,
+}
+
+impl OccupancySummary {
+    /// Returns whether any pair of visibility classes can expose a source face.
+    #[inline]
+    pub(crate) fn can_have_visible_faces(self) -> bool {
+        if self.has_empty {
+            self.has_opaque || self.has_translucent
+        } else {
+            self.has_opaque && self.has_translucent
+        }
+    }
+}
+
 /// Resizes the reusable occupancy-column buffers for one query shape.
 ///
 /// The builder overwrites every opaque entry. Translucent entries are
@@ -42,11 +62,11 @@ pub(crate) fn reset_columns(
 
 /// Builds the X- and Y-packed occupancy columns used by the fixed scan plans.
 ///
-/// The function returns `true` if any translucent voxel was seen. That lets the
-/// next stage skip translucent visibility logic entirely for opaque-only inputs.
-/// Translucent columns are also left untouched until the first translucent
-/// voxel is found, avoiding writes to scratch that the opaque-only path never
-/// reads.
+/// The returned summary lets the next stage skip translucent visibility logic
+/// for opaque-only inputs and terminate immediately when a uniform padded query
+/// cannot contain a visible face. Translucent columns are also left untouched
+/// until the first translucent voxel is found, avoiding writes to scratch that
+/// the opaque-only path never reads.
 #[inline]
 pub(crate) fn build_axis_columns<T>(
     voxels: &[T],
@@ -55,7 +75,7 @@ pub(crate) fn build_axis_columns<T>(
     strides: [usize; 3],
     opaque_cols: &mut [Vec<u64>; 2],
     trans_cols: &mut [Vec<u64>; 2],
-) -> bool
+) -> OccupancySummary
 where
     T: Voxel,
 {
@@ -68,6 +88,9 @@ where
     let x_stride = strides[0];
     let y_stride = strides[1];
     let z_stride = strides[2];
+    let query_x_mask = if qx == 64 { u64::MAX } else { (1u64 << qx) - 1 };
+    let mut empty_union = 0u64;
+    let mut opaque_union = 0u64;
     let mut has_translucent = false;
 
     for z in 0..qz {
@@ -116,6 +139,8 @@ where
                 x_bit <<= 1;
             }
 
+            opaque_union |= opaque_x_mask;
+            empty_union |= !(opaque_x_mask | trans_x_mask) & query_x_mask;
             opaque_x_cols[x_col_index] = opaque_x_mask;
             if has_translucent {
                 trans_x_cols[x_col_index] = trans_x_mask;
@@ -123,7 +148,11 @@ where
         }
     }
 
-    has_translucent
+    OccupancySummary {
+        has_empty: empty_union != 0,
+        has_opaque: opaque_union != 0,
+        has_translucent,
+    }
 }
 
 /// Builds visibility rows for both signs of one normal axis.

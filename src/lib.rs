@@ -296,7 +296,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
     // fixed face scan plans. No plan packs Z, so building that third
     // representation would only add work.
     reset_columns(opaque_cols, trans_cols, context.query_shape);
-    let has_translucent = build_axis_columns(
+    let occupancy = build_axis_columns(
         voxels,
         min,
         context.query_shape,
@@ -304,6 +304,9 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         opaque_cols,
         trans_cols,
     );
+    if !occupancy.can_have_visible_faces() {
+        return;
+    }
 
     for n_axis in 0..3 {
         let slice = context.slice_plan(n_axis);
@@ -324,7 +327,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
             slice.outer_axis,
             &opaque_cols[slice.bit_axis],
             &trans_cols[slice.bit_axis],
-            has_translucent,
+            occupancy.has_translucent,
             visible_rows,
             visible_rows_alt,
         );

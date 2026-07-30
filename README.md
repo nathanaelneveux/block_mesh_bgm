@@ -93,7 +93,7 @@ Full AO packing means doing neighborhood checks during meshing and dragging AO d
 
 `binary_greedy_quads_ao_safe` goes the other direction. It looks at opaque occupancy in the exterior plane next to a face, derives AO constraints a whole row at a time with shifts and masks, peels off the obvious unit-only / one-direction-only cases in bulk, and only sends the remaining cells through the full bidirectional merge logic. The AO rule stays binary the whole time.
 
-On real geometry it can actually be a better mesher. In the `layered-caves-2x2x2` benchmark, `binary_greedy_quads_ao_safe` comes in at `394.26 µs`, faster than vanilla `binary_greedy_quads` at `528.16 µs`, because a lot of the AO-constrained work becomes simpler to merge once those cases are classified up front.
+On real geometry it can actually be a better mesher. In the `layered-caves-2x2x2` benchmark, `binary_greedy_quads_ao_safe` comes in at `413.04 µs`, faster than vanilla `binary_greedy_quads` at `534.15 µs`, because a lot of the AO-constrained work becomes simpler to merge once those cases are classified up front.
 
 When you do go compute AO signatures later, you are doing it over the final quads, not per voxel. That means fewer things to scan and a faster mesh to begin with. The `custom_meshing` example in this workspace shows exactly that flow: it meshes first, computes AO from the resulting quads during mesh construction, and shows the average chunk meshing time in the on-screen overlay.
 
@@ -107,24 +107,26 @@ Recent local `cargo bench --bench bench` Criterion medians on my machine:
 
 | Case | `visible_block_faces` | `greedy_quads` | `binary_greedy_quads` |
 | --- | ---: | ---: | ---: |
-| `dense-sphere` | `40.262 µs` | `252.25 µs` | `31.428 µs` |
-| `translucent-sphere` | `40.621 µs` | `260.87 µs` | `33.477 µs` |
-| `translucent-shell-sphere` | `38.191 µs` | `259.11 µs` | `33.219 µs` |
-| `layered-caves` | `69.536 µs` | `742.53 µs` | `73.429 µs` |
-| `checkerboard` | `74.162 µs` | `656.34 µs` | `67.445 µs` |
-| `partial-extent` | `36.081 µs` | `231.45 µs` | `42.019 µs` |
-| `translucent-mix` | `81.532 µs` | `830.92 µs` | `119.86 µs` |
-| `layered-caves-2x2x2` | `612.30 µs` | `4.1293 ms` | `528.16 µs` |
+| `empty` | `17.726 µs` | `143.92 µs` | `11.623 µs` |
+| `uniform-opaque` | `46.055 µs` | `207.69 µs` | `21.567 µs` |
+| `dense-sphere` | `40.262 µs` | `252.25 µs` | `30.848 µs` |
+| `translucent-sphere` | `40.621 µs` | `260.87 µs` | `30.918 µs` |
+| `translucent-shell-sphere` | `38.191 µs` | `259.11 µs` | `32.071 µs` |
+| `layered-caves` | `69.536 µs` | `742.53 µs` | `73.358 µs` |
+| `checkerboard` | `74.162 µs` | `656.34 µs` | `67.293 µs` |
+| `partial-extent` | `36.081 µs` | `231.45 µs` | `40.743 µs` |
+| `translucent-mix` | `81.532 µs` | `830.92 µs` | `117.88 µs` |
+| `layered-caves-2x2x2` | `612.30 µs` | `4.1293 ms` | `534.15 µs` |
 
 ### AO-Safe Cases
 
 | Case | `visible_block_faces` | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
 | --- | ---: | ---: | ---: |
-| `dense-sphere-ao` | `40.569 µs` | `31.505 µs` | `36.669 µs` |
-| `translucent-shell-sphere-ao` | `38.530 µs` | `33.295 µs` | `38.583 µs` |
-| `layered-caves-2x2x2` | `612.30 µs` | `528.16 µs` | `394.26 µs` |
-| `ao-boundary-stress` | `18.419 µs` | `16.194 µs` | `16.818 µs` |
-| `ao-unit-patterns` | `18.234 µs` | `16.269 µs` | `17.180 µs` |
+| `dense-sphere-ao` | `40.569 µs` | `30.848 µs` | `35.615 µs` |
+| `translucent-shell-sphere-ao` | `38.530 µs` | `32.071 µs` | `37.361 µs` |
+| `layered-caves-2x2x2` | `612.30 µs` | `534.15 µs` | `413.04 µs` |
+| `ao-boundary-stress` | `18.419 µs` | `16.071 µs` | `16.505 µs` |
+| `ao-unit-patterns` | `18.234 µs` | `16.339 µs` | `16.758 µs` |
 
 It is slower than vanilla `binary_greedy_quads` on the small AO-sensitive microbenches, but in cases closer to real-world geometry like `layered-caves-2x2x2` it can actually be faster.
 

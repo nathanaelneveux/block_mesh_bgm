@@ -41,6 +41,11 @@ pub(crate) struct AoScratch {
     carry_runs: Vec<u8>,
 }
 
+const AO_UNIT_ROWS: u8 = 1 << 0;
+const AO_HORIZONTAL_ROWS: u8 = 1 << 1;
+const AO_VERTICAL_ROWS: u8 = 1 << 2;
+const AO_BIDIR_ROWS: u8 = 1 << 3;
+
 /// Merges one face slice with AO-safe merge restrictions.
 #[inline(always)]
 pub(crate) fn mesh_face_rows_ao_safe<T>(
@@ -202,7 +207,7 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 
         let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
 
-        build_slice_ao_masks(
+        let populated_masks = build_slice_ao_masks(
             context.query_shape,
             N_AXIS,
             slice,
@@ -219,51 +224,59 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         // first three avoid the full carry kernel entirely; only the residual
         // bidirectionally mergeable rows need the same greedy row merger shape
         // as vanilla meshing.
-        emit_unit_rows::<N_AXIS>(
-            &scratch.unit_rows[..slice.outer_len],
-            n_coord,
-            outer_base,
-            bit_base,
-            quads,
-        );
-        emit_horizontal_rows::<T, N_AXIS, BIT_IS_U>(
-            voxels,
-            &scratch.horizontal_rows[..slice.outer_len],
-            n_index_base,
-            outer_stride,
-            bit_stride,
-            slice.bit_len,
-            n_coord,
-            outer_base,
-            bit_base,
-            quads,
-        );
-        emit_vertical_rows::<T, N_AXIS, BIT_IS_U>(
-            voxels,
-            &scratch.vertical_rows[..slice.outer_len],
-            n_index_base,
-            outer_stride,
-            bit_stride,
-            slice.bit_len,
-            n_coord,
-            outer_base,
-            bit_base,
-            &mut scratch.carry_runs,
-            quads,
-        );
-        mesh_bidir_rows::<T, N_AXIS, BIT_IS_U>(
-            voxels,
-            &scratch.bidir_rows[..slice.outer_len],
-            n_index_base,
-            outer_stride,
-            bit_stride,
-            slice.bit_len,
-            n_coord,
-            outer_base,
-            bit_base,
-            &mut scratch.carry_runs,
-            quads,
-        );
+        if populated_masks & AO_UNIT_ROWS != 0 {
+            emit_unit_rows::<N_AXIS>(
+                &scratch.unit_rows[..slice.outer_len],
+                n_coord,
+                outer_base,
+                bit_base,
+                quads,
+            );
+        }
+        if populated_masks & AO_HORIZONTAL_ROWS != 0 {
+            emit_horizontal_rows::<T, N_AXIS, BIT_IS_U>(
+                voxels,
+                &scratch.horizontal_rows[..slice.outer_len],
+                n_index_base,
+                outer_stride,
+                bit_stride,
+                slice.bit_len,
+                n_coord,
+                outer_base,
+                bit_base,
+                quads,
+            );
+        }
+        if populated_masks & AO_VERTICAL_ROWS != 0 {
+            emit_vertical_rows::<T, N_AXIS, BIT_IS_U>(
+                voxels,
+                &scratch.vertical_rows[..slice.outer_len],
+                n_index_base,
+                outer_stride,
+                bit_stride,
+                slice.bit_len,
+                n_coord,
+                outer_base,
+                bit_base,
+                &mut scratch.carry_runs,
+                quads,
+            );
+        }
+        if populated_masks & AO_BIDIR_ROWS != 0 {
+            mesh_bidir_rows::<T, N_AXIS, BIT_IS_U>(
+                voxels,
+                &scratch.bidir_rows[..slice.outer_len],
+                n_index_base,
+                outer_stride,
+                bit_stride,
+                slice.bit_len,
+                n_coord,
+                outer_base,
+                bit_base,
+                &mut scratch.carry_runs,
+                quads,
+            );
+        }
     }
 }
 
@@ -280,7 +293,7 @@ fn build_slice_ao_masks(
     horizontal_rows: &mut Vec<u64>,
     vertical_rows: &mut Vec<u64>,
     bidir_rows: &mut Vec<u64>,
-) {
+) -> u8 {
     // AO-safe meshing only cares about opaque occupancy in the plane just
     // outside the visible face. From that outside plane we can derive, a row at
     // a time, whether a visible cell:
@@ -309,6 +322,10 @@ fn build_slice_ao_masks(
     };
     let source_base = base_offset + source_n * n_stride;
     let outside_base = base_offset + outside_n * n_stride;
+    let mut unit_union = 0;
+    let mut horizontal_union = 0;
+    let mut vertical_union = 0;
+    let mut bidir_union = 0;
 
     for (outer_local, &row_bits) in slice_rows.iter().enumerate() {
         if row_bits == 0 {
@@ -324,6 +341,7 @@ fn build_slice_ao_masks(
             // Translucent and empty-visible faces do not participate in the AO
             // rule set. They keep the vanilla merge behavior.
             bidir_rows[outer_local] = row_bits;
+            bidir_union |= row_bits;
             continue;
         }
 
@@ -355,7 +373,16 @@ fn build_slice_ao_masks(
         horizontal_rows[outer_local] = horizontal;
         vertical_rows[outer_local] = vertical;
         bidir_rows[outer_local] = bidir;
+        unit_union |= unit;
+        horizontal_union |= horizontal;
+        vertical_union |= vertical;
+        bidir_union |= bidir;
     }
+
+    (u8::from(unit_union != 0) * AO_UNIT_ROWS)
+        | (u8::from(horizontal_union != 0) * AO_HORIZONTAL_ROWS)
+        | (u8::from(vertical_union != 0) * AO_VERTICAL_ROWS)
+        | (u8::from(bidir_union != 0) * AO_BIDIR_ROWS)
 }
 
 #[inline(always)]
