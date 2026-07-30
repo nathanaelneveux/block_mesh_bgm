@@ -365,6 +365,49 @@ fn randomized_property_cases_match_block_mesh_geometry() {
 }
 
 #[test]
+fn reusable_buffer_handles_opaque_and_translucent_transitions() {
+    let dims = [9, 8, 7];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let cases = [
+        make_voxels(dims, |x, y, z| {
+            if (x + 2 * y + 3 * z) % 5 == 0 {
+                TestVoxel::translucent(((x + z) % 3 + 1) as u8, 0)
+            } else {
+                TestVoxel::empty(0)
+            }
+        }),
+        make_voxels(dims, |x, y, z| {
+            if (x * 3 + y + z * 5) % 4 <= 1 {
+                TestVoxel::opaque(((x + y) % 4 + 1) as u8, 0)
+            } else {
+                TestVoxel::empty(0)
+            }
+        }),
+        make_voxels(dims, |x, y, z| {
+            if x == dims[0] - 2 && y == dims[1] - 2 && z == dims[2] - 2 {
+                TestVoxel::translucent(3, 0)
+            } else if (x + y + z) % 3 == 0 {
+                TestVoxel::opaque(2, 0)
+            } else {
+                TestVoxel::empty(0)
+            }
+        }),
+    ];
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+    let mut buffer = BinaryGreedyQuadsBuffer::new();
+
+    for voxels in &cases {
+        let expected = mesh_with_block_mesh(voxels, &shape, [0; 3], [8, 7, 6], &faces);
+
+        binary_greedy_quads(voxels, &shape, [0; 3], [8, 7, 6], &faces, &mut buffer);
+        assert_same_geometry_buffers(voxels, &shape, &faces, &expected, &buffer.quads);
+
+        binary_greedy_quads_ao_safe(voxels, &shape, [0; 3], [8, 7, 6], &faces, &mut buffer);
+        assert_same_geometry_buffers(voxels, &shape, &faces, &expected, &buffer.quads);
+    }
+}
+
+#[test]
 #[ignore = "informational benchmark-case report"]
 fn reports_quad_count_similarity_for_benchmark_cases() {
     for case in benchmark_like_cases() {

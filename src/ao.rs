@@ -24,7 +24,7 @@ use crate::merge::{
     build_continue_mask, emit_mixed_row_runs, emit_single_row_runs, emit_terminal_row_runs,
     emit_unit_slice, reset_carry_runs,
 };
-use crate::prep::column_row_layout;
+use crate::prep::{column_row_layout, FaceSliceMasks};
 
 /// Reusable scratch that only AO-safe meshing needs.
 #[derive(Default)]
@@ -48,7 +48,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
+    slice_masks: FaceSliceMasks,
     axes: FaceAxes,
     opaque_cols: &[u64],
     scratch: &mut AoScratch,
@@ -62,7 +62,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -73,7 +73,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -84,7 +84,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -95,7 +95,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -106,7 +106,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -117,7 +117,7 @@ pub(crate) fn mesh_face_rows_ao_safe<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             axes,
             opaque_cols,
             scratch,
@@ -133,7 +133,7 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
+    slice_masks: FaceSliceMasks,
     axes: FaceAxes,
     opaque_cols: &[u64],
     scratch: &mut AoScratch,
@@ -141,17 +141,34 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
 ) where
     T: MergeVoxel,
 {
-    if unit_only {
-        for n_local in 0..slice.n_len {
-            let row_start = n_local * slice.outer_len;
-            emit_unit_slice::<N_AXIS>(
-                context.interior_min,
-                slice.outer_axis,
-                slice.bit_axis,
-                context.interior_min[N_AXIS] + n_local as u32,
-                &visible_rows[row_start..row_start + slice.outer_len],
-                quads,
-            );
+    if slice_masks.active == slice_masks.unit_only {
+        if slice_masks.active == bit_mask(0, slice.n_len) {
+            for n_local in 0..slice.n_len {
+                let row_start = n_local * slice.outer_len;
+                emit_unit_slice::<N_AXIS>(
+                    context.interior_min,
+                    slice.outer_axis,
+                    slice.bit_axis,
+                    context.interior_min[N_AXIS] + n_local as u32,
+                    &visible_rows[row_start..row_start + slice.outer_len],
+                    quads,
+                );
+            }
+        } else {
+            let mut active_slices = slice_masks.active;
+            while active_slices != 0 {
+                let n_local = active_slices.trailing_zeros() as usize;
+                active_slices &= active_slices - 1;
+                let row_start = n_local * slice.outer_len;
+                emit_unit_slice::<N_AXIS>(
+                    context.interior_min,
+                    slice.outer_axis,
+                    slice.bit_axis,
+                    context.interior_min[N_AXIS] + n_local as u32,
+                    &visible_rows[row_start..row_start + slice.outer_len],
+                    quads,
+                );
+            }
         }
         return;
     }
@@ -163,9 +180,26 @@ fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     let bit_stride = context.strides[slice.bit_axis];
 
     for n_local in 0..slice.n_len {
+        let slice_bit = 1u64 << n_local;
+        if slice_masks.active & slice_bit == 0 {
+            continue;
+        }
+
         let row_start = n_local * slice.outer_len;
         let slice_rows = &visible_rows[row_start..row_start + slice.outer_len];
         let n_coord = n_base + n_local as u32;
+        if slice_masks.unit_only & slice_bit != 0 {
+            emit_unit_slice::<N_AXIS>(
+                context.interior_min,
+                slice.outer_axis,
+                slice.bit_axis,
+                n_coord,
+                slice_rows,
+                quads,
+            );
+            continue;
+        }
+
         let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
 
         build_slice_ao_masks(

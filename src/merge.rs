@@ -19,6 +19,7 @@ use block_mesh::{MergeVoxel, UnorientedQuad};
 use crate::bit_mask;
 use crate::context::{MeshingContext, SlicePlan};
 use crate::face::{write_quad, write_unit_quad, FaceAxes};
+use crate::prep::FaceSliceMasks;
 
 /// Chooses the compile-time-specialized merge kernel for one face orientation.
 #[inline(always)]
@@ -27,7 +28,7 @@ pub(crate) fn mesh_face_rows<T>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
+    slice_masks: FaceSliceMasks,
     axes: FaceAxes,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
@@ -40,7 +41,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -49,7 +50,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -58,7 +59,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -67,7 +68,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -76,7 +77,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -85,7 +86,7 @@ pub(crate) fn mesh_face_rows<T>(
             context,
             slice,
             visible_rows,
-            unit_only,
+            slice_masks,
             carry_runs,
             quads,
         ),
@@ -99,28 +100,53 @@ fn mesh_face_rows_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     context: &MeshingContext,
     slice: SlicePlan,
     visible_rows: &[u64],
-    unit_only: bool,
+    slice_masks: FaceSliceMasks,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    if unit_only {
-        for n_local in 0..slice.n_len {
-            let row_start = n_local * slice.outer_len;
-            emit_unit_slice::<N_AXIS>(
-                context.interior_min,
-                slice.outer_axis,
-                slice.bit_axis,
-                context.interior_min[N_AXIS] + n_local as u32,
-                &visible_rows[row_start..row_start + slice.outer_len],
-                quads,
-            );
+    if slice_masks.active == slice_masks.unit_only {
+        if slice_masks.active == bit_mask(0, slice.n_len) {
+            for n_local in 0..slice.n_len {
+                let row_start = n_local * slice.outer_len;
+                emit_unit_slice::<N_AXIS>(
+                    context.interior_min,
+                    slice.outer_axis,
+                    slice.bit_axis,
+                    context.interior_min[N_AXIS] + n_local as u32,
+                    &visible_rows[row_start..row_start + slice.outer_len],
+                    quads,
+                );
+            }
+        } else {
+            let mut active_slices = slice_masks.active;
+            while active_slices != 0 {
+                let n_local = active_slices.trailing_zeros() as usize;
+                active_slices &= active_slices - 1;
+                let row_start = n_local * slice.outer_len;
+                emit_unit_slice::<N_AXIS>(
+                    context.interior_min,
+                    slice.outer_axis,
+                    slice.bit_axis,
+                    context.interior_min[N_AXIS] + n_local as u32,
+                    &visible_rows[row_start..row_start + slice.outer_len],
+                    quads,
+                );
+            }
         }
         return;
     }
 
-    mesh_face_carry::<T, N_AXIS, BIT_IS_U>(voxels, context, slice, visible_rows, carry_runs, quads);
+    mesh_face_carry::<T, N_AXIS, BIT_IS_U>(
+        voxels,
+        context,
+        slice,
+        visible_rows,
+        slice_masks,
+        carry_runs,
+        quads,
+    );
 }
 
 #[inline(always)]
@@ -129,6 +155,7 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     context: &MeshingContext,
     slice: SlicePlan,
     rows: &[u64],
+    slice_masks: FaceSliceMasks,
     carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
@@ -140,14 +167,34 @@ fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     let outer_base = context.interior_min[slice.outer_axis];
     let outer_stride = context.strides[slice.outer_axis];
     let bit_stride = context.strides[slice.bit_axis];
+    let select_slices =
+        slice_masks.active != bit_mask(0, slice.n_len) || slice_masks.unit_only != 0;
 
     for n_local in 0..slice.n_len {
+        let slice_start = n_local * slice.outer_len;
+        let slice_rows = &rows[slice_start..slice_start + slice.outer_len];
+        let n_coord = n_base + n_local as u32;
+        if select_slices {
+            let slice_bit = 1u64 << n_local;
+            if slice_masks.active & slice_bit == 0 {
+                continue;
+            }
+            if slice_masks.unit_only & slice_bit != 0 {
+                emit_unit_slice::<N_AXIS>(
+                    context.interior_min,
+                    slice.outer_axis,
+                    slice.bit_axis,
+                    n_coord,
+                    slice_rows,
+                    quads,
+                );
+                continue;
+            }
+        }
+
         carry_runs.fill(0);
         let mut has_incoming_carry = false;
         let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
-        let n_coord = n_base + n_local as u32;
-        let slice_start = n_local * slice.outer_len;
-        let slice_rows = &rows[slice_start..slice_start + slice.outer_len];
         for outer_local in 0..slice.outer_len {
             let row_bits = slice_rows[outer_local];
             if row_bits == 0 {
