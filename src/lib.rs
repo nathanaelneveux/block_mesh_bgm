@@ -5,7 +5,8 @@
 //! through a different internal pipeline:
 //!
 //! 1. Validate the padded query extent and precompute a few indexing facts.
-//! 2. Build packed occupancy columns, one `u64` per orthogonal column.
+//! 2. Build the packed occupancy columns used by the fixed face scan plans,
+//!    one `u64` per orthogonal column.
 //! 3. Turn those columns into visible-face rows with cheap bitwise tests.
 //! 4. Merge each face slice into quads, either as unit quads or with a
 //!    carry-based greedy row merger.
@@ -184,10 +185,11 @@ use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visi
 pub struct BinaryGreedyQuadsBuffer {
     /// Output quads grouped by face, matching `block-mesh`'s `QuadBuffer`.
     pub quads: QuadBuffer,
-    // Stage 1 scratch: packed opaque occupancy columns for each candidate bit axis.
-    opaque_cols: [Vec<u64>; 3],
+    // Stage 1 scratch: packed opaque occupancy columns for the two bit axes
+    // used by the fixed scan plans.
+    opaque_cols: [Vec<u64>; 2],
     // Stage 1 scratch: packed translucent occupancy columns with the same layout.
-    trans_cols: [Vec<u64>; 3],
+    trans_cols: [Vec<u64>; 2],
     // Stage 2 scratch: visibility rows for the negative face of one normal axis.
     visible_rows: Vec<u64>,
     // Stage 2 scratch: visibility rows for the positive face of the same axis.
@@ -290,9 +292,11 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         ao_scratch,
     } = output;
 
-    // Stage 1: build reusable occupancy columns for all three candidate bit axes.
+    // Stage 1: build the X- and Y-packed occupancy columns used by the three
+    // fixed face scan plans. No plan packs Z, so building that third
+    // representation would only add work.
     reset_columns(opaque_cols, trans_cols, context.query_shape);
-    let has_translucent = build_axis_columns(
+    let occupancy = build_axis_columns(
         voxels,
         min,
         context.query_shape,
@@ -300,6 +304,9 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         opaque_cols,
         trans_cols,
     );
+    if !occupancy.can_have_visible_faces() {
+        return;
+    }
 
     for n_axis in 0..3 {
         let slice = context.slice_plan(n_axis);
@@ -310,7 +317,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         // Stage 2: derive visible-face rows for both signs of the current normal axis.
         reset_visible_rows(visible_rows, slice.total_rows());
         reset_visible_rows(visible_rows_alt, slice.total_rows());
-        let (neg_unit_only, pos_unit_only) = build_visible_row_pair(
+        let (neg_slice_masks, pos_slice_masks) = build_visible_row_pair(
             context.query_shape,
             slice.bit_axis,
             slice.bit_len,
@@ -320,7 +327,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
             slice.outer_axis,
             &opaque_cols[slice.bit_axis],
             &trans_cols[slice.bit_axis],
-            has_translucent,
+            occupancy.has_translucent,
             visible_rows,
             visible_rows_alt,
         );
@@ -334,7 +341,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows,
-                neg_unit_only,
+                neg_slice_masks,
                 neg_axes,
                 &opaque_cols[slice.bit_axis],
                 ao_scratch,
@@ -345,7 +352,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows_alt,
-                pos_unit_only,
+                pos_slice_masks,
                 pos_axes,
                 &opaque_cols[slice.bit_axis],
                 ao_scratch,
@@ -357,7 +364,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows,
-                neg_unit_only,
+                neg_slice_masks,
                 neg_axes,
                 carry_runs,
                 &mut quads.groups[neg_face_index],
@@ -367,7 +374,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
                 &context,
                 slice,
                 visible_rows_alt,
-                pos_unit_only,
+                pos_slice_masks,
                 pos_axes,
                 carry_runs,
                 &mut quads.groups[pos_face_index],

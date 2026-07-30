@@ -1,3 +1,5 @@
+pub mod ao;
+
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, Mesh, VertexAttributeValues},
@@ -10,10 +12,13 @@ use block_mesh::{
     VoxelVisibility,
 };
 
+use ao::FaceAoSampler;
+
 pub type SampleShape = ConstShape3u32<34, 34, 34>;
 
 pub const SAMPLE_MIN: [u32; 3] = [0; 3];
 pub const SAMPLE_MAX: [u32; 3] = [33; 3];
+pub const SAMPLE_STRIDES: [usize; 3] = [1, 34, 34 * 34];
 pub const EMPTY: DemoVoxel = DemoVoxel {
     visibility: VoxelVisibility::Empty,
     material: 0,
@@ -134,9 +139,10 @@ fn mesh_from_unit_quads_impl(
     apply_ao: bool,
 ) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
-    let mut mesh = MeshBuffers::default();
+    let mut mesh = MeshBuffers::with_quad_capacity(num_quads);
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
+        let ao_sampler = apply_ao.then(|| FaceAoSampler::new(face, SAMPLE_STRIDES));
         for quad in group {
             let quad: UnorientedQuad = quad.into();
             append_quad(
@@ -144,7 +150,7 @@ fn mesh_from_unit_quads_impl(
                 quad,
                 quad_voxel(samples, quad.minimum),
                 samples,
-                apply_ao,
+                ao_sampler.as_ref(),
                 &mut mesh,
             );
         }
@@ -176,16 +182,17 @@ fn mesh_from_quads_impl(
     apply_ao: bool,
 ) -> (Mesh, MeshStats) {
     let num_quads = buffer.num_quads();
-    let mut mesh = MeshBuffers::default();
+    let mut mesh = MeshBuffers::with_quad_capacity(num_quads);
 
     for (group, face) in buffer.groups.into_iter().zip(faces.iter().copied()) {
+        let ao_sampler = apply_ao.then(|| FaceAoSampler::new(face, SAMPLE_STRIDES));
         for quad in group {
             append_quad(
                 face,
                 quad,
                 quad_voxel(samples, quad.minimum),
                 samples,
-                apply_ao,
+                ao_sampler.as_ref(),
                 &mut mesh,
             );
         }
@@ -194,7 +201,6 @@ fn mesh_from_quads_impl(
     build_demo_render_mesh(num_quads, mesh)
 }
 
-#[derive(Default)]
 struct MeshBuffers {
     indices: Vec<u32>,
     positions: Vec<[f32; 3]>,
@@ -203,6 +209,16 @@ struct MeshBuffers {
 }
 
 impl MeshBuffers {
+    fn with_quad_capacity(num_quads: usize) -> Self {
+        let num_vertices = num_quads * 4;
+        Self {
+            indices: Vec::with_capacity(num_quads * 6),
+            positions: Vec::with_capacity(num_vertices),
+            normals: Vec::with_capacity(num_vertices),
+            colors: Vec::with_capacity(num_vertices),
+        }
+    }
+
     fn push_quad(&mut self, face: OrientedBlockFace, quad: UnorientedQuad, color: [f32; 4]) {
         self.indices
             .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
@@ -236,19 +252,21 @@ fn append_quad(
     quad: UnorientedQuad,
     voxel: DemoVoxel,
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
-    apply_ao: bool,
+    ao_sampler: Option<&FaceAoSampler>,
     mesh: &mut MeshBuffers,
 ) {
-    if voxel.visibility != VoxelVisibility::Empty {
-        if apply_ao && voxel.visibility == VoxelVisibility::Opaque {
-            mesh.push_quad_colors(
-                face,
-                quad,
-                quad_vertex_colors_with_ao(face, quad, voxel, samples),
-            );
-        } else {
-            mesh.push_quad(face, quad, voxel_color(voxel));
-        }
+    if voxel.visibility == VoxelVisibility::Empty {
+        return;
+    }
+
+    if let Some(ao_sampler) = ao_sampler.filter(|_| voxel.visibility == VoxelVisibility::Opaque) {
+        mesh.push_quad_colors(
+            face,
+            quad,
+            quad_vertex_colors_with_ao(ao_sampler, quad, voxel, samples),
+        );
+    } else {
+        mesh.push_quad(face, quad, voxel_color(voxel));
     }
 }
 
@@ -318,142 +336,23 @@ fn material_color(material: u8) -> [f32; 4] {
 }
 
 fn quad_vertex_colors_with_ao(
-    face: OrientedBlockFace,
+    ao_sampler: &FaceAoSampler,
     quad: UnorientedQuad,
     voxel: DemoVoxel,
     samples: &[DemoVoxel; SampleShape::SIZE as usize],
 ) -> [[f32; 4]; 4] {
-    let ao = face_aos(face, quad.minimum, samples);
+    let ao = ao_sampler.sample(samples, quad.minimum, |voxel| {
+        voxel.visibility == VoxelVisibility::Opaque
+    });
     let base = voxel_color(voxel);
     ao.map(|ao_value| shade_color_with_ao(base, ao_value))
 }
 
-fn shade_color_with_ao(mut color: [f32; 4], ao_value: u32) -> [f32; 4] {
-    let shade = match ao_value {
-        0 => 0.10,
-        1 => 0.30,
-        2 => 0.50,
-        _ => 1.00,
-    };
+fn shade_color_with_ao(mut color: [f32; 4], ao_value: u8) -> [f32; 4] {
+    const AO_SHADE: [f32; 4] = [0.10, 0.30, 0.50, 1.00];
+    let shade = AO_SHADE[ao_value as usize];
     color[0] *= shade;
     color[1] *= shade;
     color[2] *= shade;
     color
-}
-
-fn face_aos(
-    face: OrientedBlockFace,
-    minimum: [u32; 3],
-    samples: &[DemoVoxel; SampleShape::SIZE as usize],
-) -> [u32; 4] {
-    let normal = face.signed_normal();
-    let [x, y, z] = minimum;
-
-    match [normal.x, normal.y, normal.z] {
-        [-1, 0, 0] => side_aos(
-            samples,
-            [
-                [x - 1, y, z - 1],
-                [x - 1, y - 1, z - 1],
-                [x - 1, y - 1, z],
-                [x - 1, y - 1, z + 1],
-                [x - 1, y, z + 1],
-                [x - 1, y + 1, z + 1],
-                [x - 1, y + 1, z],
-                [x - 1, y + 1, z - 1],
-            ],
-        ),
-        [1, 0, 0] => side_aos(
-            samples,
-            [
-                [x + 1, y, z - 1],
-                [x + 1, y - 1, z - 1],
-                [x + 1, y - 1, z],
-                [x + 1, y - 1, z + 1],
-                [x + 1, y, z + 1],
-                [x + 1, y + 1, z + 1],
-                [x + 1, y + 1, z],
-                [x + 1, y + 1, z - 1],
-            ],
-        ),
-        [0, -1, 0] => side_aos(
-            samples,
-            [
-                [x, y - 1, z - 1],
-                [x - 1, y - 1, z - 1],
-                [x - 1, y - 1, z],
-                [x - 1, y - 1, z + 1],
-                [x, y - 1, z + 1],
-                [x + 1, y - 1, z + 1],
-                [x + 1, y - 1, z],
-                [x + 1, y - 1, z - 1],
-            ],
-        ),
-        [0, 1, 0] => side_aos(
-            samples,
-            [
-                [x, y + 1, z - 1],
-                [x - 1, y + 1, z - 1],
-                [x - 1, y + 1, z],
-                [x - 1, y + 1, z + 1],
-                [x, y + 1, z + 1],
-                [x + 1, y + 1, z + 1],
-                [x + 1, y + 1, z],
-                [x + 1, y + 1, z - 1],
-            ],
-        ),
-        [0, 0, -1] => side_aos(
-            samples,
-            [
-                [x - 1, y, z - 1],
-                [x - 1, y - 1, z - 1],
-                [x, y - 1, z - 1],
-                [x + 1, y - 1, z - 1],
-                [x + 1, y, z - 1],
-                [x + 1, y + 1, z - 1],
-                [x, y + 1, z - 1],
-                [x - 1, y + 1, z - 1],
-            ],
-        ),
-        [0, 0, 1] => side_aos(
-            samples,
-            [
-                [x - 1, y, z + 1],
-                [x - 1, y - 1, z + 1],
-                [x, y - 1, z + 1],
-                [x + 1, y - 1, z + 1],
-                [x + 1, y, z + 1],
-                [x + 1, y + 1, z + 1],
-                [x, y + 1, z + 1],
-                [x - 1, y + 1, z + 1],
-            ],
-        ),
-        _ => unreachable!(),
-    }
-}
-
-fn side_aos(
-    samples: &[DemoVoxel; SampleShape::SIZE as usize],
-    neighbors: [[u32; 3]; 8],
-) -> [u32; 4] {
-    let opaque = neighbors.map(|coord| voxel_is_opaque(samples, coord));
-    [
-        ao_value(opaque[0], opaque[1], opaque[2]),
-        ao_value(opaque[2], opaque[3], opaque[4]),
-        ao_value(opaque[6], opaque[7], opaque[0]),
-        ao_value(opaque[4], opaque[5], opaque[6]),
-    ]
-}
-
-fn voxel_is_opaque(samples: &[DemoVoxel; SampleShape::SIZE as usize], coord: [u32; 3]) -> bool {
-    samples[SampleShape::linearize(coord) as usize].visibility == VoxelVisibility::Opaque
-}
-
-fn ao_value(side1: bool, corner: bool, side2: bool) -> u32 {
-    match (side1, corner, side2) {
-        (true, _, true) => 0,
-        (true, true, false) | (false, true, true) => 1,
-        (false, false, false) => 3,
-        _ => 2,
-    }
 }

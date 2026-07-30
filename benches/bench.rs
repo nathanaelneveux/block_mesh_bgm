@@ -317,6 +317,27 @@ fn bench_meshers(c: &mut Criterion) {
 fn benchmark_cases() -> Vec<Case> {
     vec![
         build_case(
+            "empty",
+            [34, 34, 34],
+            [0; 3],
+            [33; 3],
+            |_x, _y, _z, _dims| BenchVoxel::default(),
+        ),
+        {
+            let mut case = build_case(
+                "uniform-opaque",
+                [34, 34, 34],
+                [0; 3],
+                [33; 3],
+                |_x, _y, _z, _dims| BenchVoxel::default(),
+            );
+            case.voxels.fill(BenchVoxel {
+                visibility: VoxelVisibility::Opaque,
+                material: 1,
+            });
+            case
+        },
+        build_case(
             "dense-sphere",
             [34, 34, 34],
             [0; 3],

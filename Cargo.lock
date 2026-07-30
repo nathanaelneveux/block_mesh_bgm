@@ -1794,6 +1794,7 @@ dependencies = [
  "bevy_voxel_world",
  "block-mesh",
  "block-mesh-bgm",
+ "criterion",
  "ndshape",
  "noise",
 ]

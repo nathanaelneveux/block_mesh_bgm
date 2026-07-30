@@ -31,11 +31,14 @@ use block_mesh::{
     UnitQuadBuffer, UnorientedQuad, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
 use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm_examples::ao::FaceAoSampler;
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
 
 const PADDED_CHUNK_EDGE: usize = CHUNK_SIZE_U as usize + 2;
 const PADDED_CHUNK_LEN: usize = PADDED_CHUNK_EDGE * PADDED_CHUNK_EDGE * PADDED_CHUNK_EDGE;
+const PADDED_CHUNK_STRIDES: [usize; 3] =
+    [1, PADDED_CHUNK_EDGE, PADDED_CHUNK_EDGE * PADDED_CHUNK_EDGE];
 
 thread_local! {
     static SIMPLE_BUFFER: RefCell<UnitQuadBuffer> = RefCell::new(UnitQuadBuffer::new());
@@ -171,11 +174,9 @@ impl MeshingSharedState {
         let ao_safe = self.ao_safe();
         let sample_count = self.sample_count.load(Ordering::Acquire);
         let total_nanos = self.total_nanos.load(Ordering::Acquire);
-        let average = if sample_count == 0 {
-            None
-        } else {
-            Some(Duration::from_nanos(total_nanos / sample_count))
-        };
+        let average = total_nanos
+            .checked_div(sample_count)
+            .map(Duration::from_nanos);
 
         MeshingTimingSnapshot {
             algorithm,
@@ -280,7 +281,7 @@ impl RenderMeshBuffers {
         quad: &UnorientedQuad,
         voxels: &[WorldVoxel<u8>],
         texture_index_mapper: &TextureIndexMapperFn<u8>,
-        ao: Option<[u32; 4]>,
+        ao: Option<[u8; 4]>,
     ) {
         self.indices
             .extend_from_slice(&face.quad_mesh_indices(self.positions.len() as u32));
@@ -412,9 +413,14 @@ fn build_mesh_from_unit_quad_buffer(
     let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
 
     for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
+        let ao_sampler = ao_safe.then(|| FaceAoSampler::new(face, PADDED_CHUNK_STRIDES));
         for quad in group {
             let quad: UnorientedQuad = (*quad).into();
-            let ao = ao_safe.then(|| face_aos(face, quad.minimum, voxels));
+            let ao = ao_sampler.as_ref().map(|sampler| {
+                sampler.sample(voxels, quad.minimum, |voxel| {
+                    voxel.get_visibility() == VoxelVisibility::Opaque
+                })
+            });
             mesh.append_quad(face, &quad, voxels, texture_index_mapper, ao);
         }
     }
@@ -432,8 +438,13 @@ fn build_mesh_from_quad_buffer(
     let mut mesh = RenderMeshBuffers::with_quad_capacity(buffer.num_quads());
 
     for (group, face) in buffer.groups.iter().zip(faces.iter().copied()) {
+        let ao_sampler = ao_safe.then(|| FaceAoSampler::new(face, PADDED_CHUNK_STRIDES));
         for quad in group {
-            let ao = ao_safe.then(|| face_aos(face, quad.minimum, voxels));
+            let ao = ao_sampler.as_ref().map(|sampler| {
+                sampler.sample(voxels, quad.minimum, |voxel| {
+                    voxel.get_visibility() == VoxelVisibility::Opaque
+                })
+            });
             mesh.append_quad(face, quad, voxels, texture_index_mapper, ao);
         }
     }
@@ -616,102 +627,14 @@ fn toggle_label(enabled: bool) -> &'static str {
     }
 }
 
-fn ao_vertex_color(ao_value: u32) -> [f32; 4] {
-    match ao_value {
-        0 => [0.10, 0.10, 0.10, 1.0],
-        1 => [0.30, 0.30, 0.30, 1.0],
-        2 => [0.50, 0.50, 0.50, 1.0],
-        _ => [1.0, 1.0, 1.0, 1.0],
-    }
-}
-
-fn ao_value(side1: bool, corner: bool, side2: bool) -> u32 {
-    match (side1, corner, side2) {
-        (true, _, true) => 0,
-        (true, true, false) | (false, true, true) => 1,
-        (false, false, false) => 3,
-        _ => 2,
-    }
-}
-
-fn side_aos(neighbours: [WorldVoxel<u8>; 8]) -> [u32; 4] {
-    let opaque = neighbours.map(|voxel| voxel.get_visibility() == VoxelVisibility::Opaque);
-
-    [
-        ao_value(opaque[0], opaque[1], opaque[2]),
-        ao_value(opaque[2], opaque[3], opaque[4]),
-        ao_value(opaque[6], opaque[7], opaque[0]),
-        ao_value(opaque[4], opaque[5], opaque[6]),
-    ]
-}
-
-fn face_aos(face: OrientedBlockFace, minimum: [u32; 3], voxels: &[WorldVoxel<u8>]) -> [u32; 4] {
-    let normal = face.signed_normal();
-    let [x, y, z] = minimum;
-
-    match [normal.x, normal.y, normal.z] {
-        [-1, 0, 0] => side_aos([
-            voxels[PaddedChunkShape::linearize([x - 1, y, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
-        ]),
-        [1, 0, 0] => side_aos([
-            voxels[PaddedChunkShape::linearize([x + 1, y, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
-        ]),
-        [0, -1, 0] => side_aos([
-            voxels[PaddedChunkShape::linearize([x, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
-        ]),
-        [0, 1, 0] => side_aos([
-            voxels[PaddedChunkShape::linearize([x, y + 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
-        ]),
-        [0, 0, -1] => side_aos([
-            voxels[PaddedChunkShape::linearize([x - 1, y, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y + 1, z - 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z - 1]) as usize],
-        ]),
-        [0, 0, 1] => side_aos([
-            voxels[PaddedChunkShape::linearize([x - 1, y, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y - 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x + 1, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x, y + 1, z + 1]) as usize],
-            voxels[PaddedChunkShape::linearize([x - 1, y + 1, z + 1]) as usize],
-        ]),
-        _ => unreachable!(),
-    }
+fn ao_vertex_color(ao_value: u8) -> [f32; 4] {
+    const AO_COLORS: [[f32; 4]; 4] = [
+        [0.10, 0.10, 0.10, 1.0],
+        [0.30, 0.30, 0.30, 1.0],
+        [0.50, 0.50, 0.50, 1.0],
+        [1.00, 1.00, 1.00, 1.0],
+    ];
+    AO_COLORS[ao_value as usize]
 }
 
 fn get_voxel_fn() -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
