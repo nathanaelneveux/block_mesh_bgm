@@ -394,10 +394,20 @@ fn classify_ao_opaque_row(
     interior_bit_mask: u64,
 ) -> (u64, u64, u64) {
     let neighbor_curr = ((current_row << 1) | (current_row >> 1)) & interior_bit_mask;
-    let shared_depth = prev_row & current_row & next_row;
-    let vertical_seed =
-        (((shared_depth << 1) & interior_bit_mask) | (shared_depth >> 1)) & interior_bit_mask;
-    let vertical = opaque_visible & vertical_seed & (!prev_row) & (!next_row) & interior_bit_mask;
+    let shared_opaque_depth = prev_row & current_row & next_row;
+    // A continuous wall on only one side is not enough to prove a vertical
+    // merge: an occupancy transition on the other side still changes the AO
+    // signature. Both side columns must be stable across all three rows.
+    let stable_depth = shared_opaque_depth | !(prev_row | current_row | next_row);
+    let stable_on_both_sides = (stable_depth << 1) & (stable_depth >> 1);
+    let opaque_on_either_side =
+        ((shared_opaque_depth << 1) & interior_bit_mask) | (shared_opaque_depth >> 1);
+    let vertical = opaque_visible
+        & stable_on_both_sides
+        & opaque_on_either_side
+        & (!prev_row)
+        & (!next_row)
+        & interior_bit_mask;
 
     let edge_from_next =
         (((next_row << 1) & interior_bit_mask) ^ (next_row >> 1)) & interior_bit_mask;
@@ -884,6 +894,22 @@ mod tests {
         assert_eq!(vertical, 0b010_0000);
         assert_eq!(horizontal, 0);
         assert_eq!(unit & vertical, 0);
+    }
+
+    #[test]
+    fn vertical_rule_rejects_a_transition_on_the_other_side() {
+        let opaque_visible = padded("010");
+        let prev_row = padded("101");
+        let current_row = padded("100");
+        let next_row = padded("100");
+        let mask = padded("111");
+
+        let (unit, horizontal, vertical) =
+            classify_ao_opaque_row(opaque_visible, prev_row, current_row, next_row, mask);
+
+        assert_eq!(unit, padded("010"));
+        assert_eq!(horizontal, 0);
+        assert_eq!(vertical, 0);
     }
 
     #[test]
