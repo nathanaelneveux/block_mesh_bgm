@@ -271,6 +271,76 @@ fn ao_safe_mode_keeps_fully_exposed_caps_merged() {
 }
 
 #[test]
+fn ao_safe_mode_splits_fifth_worked_example_in_every_direction() {
+    let dims = [10; 3];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let face_configs = [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()];
+
+    for (config_index, faces) in face_configs.iter().enumerate() {
+        for normal_axis in 0..3 {
+            let in_plane_axes: Vec<_> = (0..3).filter(|&axis| axis != normal_axis).collect();
+
+            for normal_sign in [-1, 1] {
+                for &run_axis in &in_plane_axes {
+                    let side_axis = in_plane_axes
+                        .iter()
+                        .copied()
+                        .find(|&axis| axis != run_axis)
+                        .expect("face should have a second in-plane axis");
+                    let source_n = 4;
+                    let outside_n = (source_n as i32 + normal_sign) as u32;
+                    let voxels = make_voxels(dims, |x, y, z| {
+                        let coord = [x, y, z];
+                        let visible_row = coord[normal_axis] == source_n
+                            && coord[side_axis] == 4
+                            && (2..=7).contains(&coord[run_axis]);
+                        let full_ao_row = coord[normal_axis] == outside_n
+                            && coord[side_axis] == 3
+                            && (2..=7).contains(&coord[run_axis]);
+                        let partial_ao_row = coord[normal_axis] == outside_n
+                            && coord[side_axis] == 5
+                            && (2..=5).contains(&coord[run_axis]);
+
+                        if visible_row || full_ao_row || partial_ao_row {
+                            TestVoxel::opaque(1, 0)
+                        } else {
+                            TestVoxel::empty(0)
+                        }
+                    });
+                    let ao_safe =
+                        mesh_with_binary_bgm_ao_safe(&voxels, &shape, [0; 3], [9; 3], faces);
+                    let face_index = faces
+                        .iter()
+                        .position(|face| {
+                            let axes = face_axes(face);
+                            axes.n_axis == normal_axis && axes.n_sign == normal_sign
+                        })
+                        .expect("oriented face should exist");
+                    let source_quads: Vec<_> = ao_safe.groups[face_index]
+                        .iter()
+                        .filter(|quad| quad.minimum[normal_axis] == source_n)
+                        .collect();
+
+                    assert_eq!(
+                        source_quads.len(),
+                        5,
+                        "unexpected fifth-case split for face config {config_index}, normal axis {normal_axis}, sign {normal_sign}, run axis {run_axis}: {source_quads:?}"
+                    );
+                    assert_eq!(
+                        source_quads
+                            .iter()
+                            .map(|quad| quad.width * quad.height)
+                            .sum::<u32>(),
+                        6,
+                    );
+                    assert_uniform_ao_per_quad(&voxels, &shape, faces, &ao_safe);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn ao_safe_mode_uses_padding_columns_on_chunk_boundaries() {
     let shape = RuntimeShape::<u32, 3>::new([8, 6, 8]);
     let voxels = make_voxels([8, 6, 8], |x, y, z| {
@@ -361,6 +431,8 @@ fn randomized_property_cases_match_block_mesh_geometry() {
         };
 
         assert_same_geometry(&voxels, &shape, min, max, &faces);
+        let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, min, max, &faces);
+        assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
     }
 }
 

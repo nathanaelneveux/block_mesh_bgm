@@ -11,10 +11,12 @@ B = A & 0>>         0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (unit and v mergable)
 C = A & 0<<         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 (unit and v mergable)
 D = B | C           0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 1 0 (unit and v mergable combine)
 
-E = -1 & 0 & +1     1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-F = A & E>>         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-G = A & E<<         0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
-H=(F| G)& !-1& !+1  0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (final v mergable quads list)
+E = -1 & 0 & +1     1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (shared opaque depth)
+E*= !-1 & !0 & !+1  0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 1 0 (shared empty depth)
+F = E | E*          1 1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 1 1 0 (stable depth)
+G =
+(F<<&F>>)&(E<<|E>>) 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (stable sides with opaque neighbor)
+H = A& G& !-1& !+1  0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 (final v mergable quads list)
 
 J = -1<< & -1>>     0 1 0 0 0 0 0 0 0 0 1 1 1 1 1 0 0 0 0 (u merge)
 I = +1<< & +1>>     0 1 0 0 0 0 1 1 1 1 1 0 0 0 0 0 0 0 0 (u merge)
@@ -82,6 +84,23 @@ O =     0 0 0 0 0 0
 
 Out     U U U U U U
 
+Fifth test (longer V set)
+
+        1 0 1
+        1 0 1
+        1 0 1
+        1 0 1
+        1 0 0
+        1 0 0
+
+A =     1 1 1 1 1 1 (along V)
+H =     0 1 1 0 0 0 (along V)
+M =     1 0 0 1 1 1 (along V)
+O =     0 0 0 0 0 0 (along V)
+
+Out     U N N U U U (along V)
+
+
 Counterexample candidate: fully exposed cap
 
 Current Row         1 1 1 1 1 1 1
@@ -97,10 +116,12 @@ B = A & 0>>         0 0 0 0 0 0 0
 C = A & 0<<         0 0 0 0 0 0 0
 D = B | C           0 0 0 0 0 0 0
 
-E = -1 & 0 & +1     0 0 0 0 0 0 0
-F = A & E>>         0 0 0 0 0 0 0
-G = A & E<<         0 0 0 0 0 0 0
-H = (F|G)& !-1& !+1 0 0 0 0 0 0 0 (final v mergable quads list)
+E = -1 & 0 & +1     0 0 0 0 0 0 0 (shared opaque depth)
+E*= !-1 & !0 & !+1  1 1 1 1 1 1 1 (shared empty depth)
+F = E | E*          1 1 1 1 1 1 1 (stable depth)
+G =
+(F<<&F>>)&(E<<|E>>) 0 0 0 0 0 0 0 (stable sides with opaque neighbor)
+H = A& G& !-1& !+1  0 0 0 0 0 0 0 (final v mergable quads list)
 
 J = -1<< & -1>>     0 0 0 0 0 0 0
 I = +1<< & +1>>     0 0 0 0 0 0 0
@@ -177,6 +198,6 @@ then this is still a problem for `M / O / H` by itself:
 It is a non-flat AO case that is locally mergeable in **either** direction, but
 the final partition has to pick one direction consistently.
 
-For now, the stronger evidence is still the geometry-backed third test above,
-which exposed the missing internal-corner unit quad and was fixed by tightening
-`H`.
+The geometry-backed third and fifth tests now cover both known `H` regressions:
+the missing internal-corner unit quad and the asymmetric side transition during
+a row-to-row merge.
