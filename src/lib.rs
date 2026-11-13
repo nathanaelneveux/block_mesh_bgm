@@ -1,66 +1,94 @@
-//! `block-mesh`-compatible binary greedy meshing.
+//! Binary greedy meshing for [`block-mesh`](block_mesh).
 //!
-//! This crate is a drop-in replacement for the meshers in
-//! [`block-mesh`](block_mesh). It takes the same voxel slices, shapes, extents,
-//! and face configurations, and writes the same public quad types:
+//! Same voxels, same shapes, same quads: this crate is a drop-in replacement
+//! for the `block-mesh` meshers, built on bitmasks instead of per-voxel
+//! loops. It is about ten times faster than [`greedy_quads`], and usually
+//! faster than even [`visible_block_faces`] while emitting far fewer quads.
 //!
-//! | `block-mesh` | this crate | output |
+//! | `block-mesh` | this crate | buffer |
 //! | --- | --- | --- |
-//! | [`greedy_quads`](block_mesh::greedy_quads) | [`binary_greedy_quads`] | [`BinaryGreedyQuadsBuffer`] |
+//! | [`greedy_quads`] | [`binary_greedy_quads`] | [`BinaryGreedyQuadsBuffer`] |
 //! | | [`binary_greedy_quads_ao_safe`] | [`BinaryGreedyQuadsBuffer`] |
-//! | [`visible_block_faces`](block_mesh::visible_block_faces) | [`binary_visible_block_faces`] | [`BinaryUnitQuadBuffer`] |
+//! | [`visible_block_faces`] | [`binary_visible_block_faces`] | [`BinaryUnitQuadBuffer`] |
 //!
-//! [`binary_greedy_quads_ao_safe`] is greedy meshing that never merges across
-//! an ambient-occlusion boundary, and [`FaceAoSampler`] computes the vertex AO
-//! for its quads afterwards.
+//! [`greedy_quads`]: block_mesh::greedy_quads
+//! [`visible_block_faces`]: block_mesh::visible_block_faces
 //!
-//! # Pipeline
+//! # Getting started
 //!
-//! Every entry point runs the same four stages, on tiles of at most 62
-//! interior voxels per axis:
+//! Mesh a padded chunk, then turn each quad into vertices exactly as you would
+//! with `block-mesh`:
 //!
-//! 1. **Validate** the padded query and precompute indexing facts
-//!    (`context`).
-//! 2. **Pack occupancy** into `u64` columns, one bit per voxel: X rows are
-//!    packed eight voxels at a time with a SWAR multiply, and Y columns are a
-//!    bit-matrix transpose of them (`prep`).
-//! 3. **Find visible faces** a whole row at a time:
-//!    `source & !neighbour` per column pair (`prep`).
-//! 4. **Merge** each face slice into quads with the chosen policy: unit quads,
-//!    the carry-based greedy row merger (`merge`), or the AO-safe classes
-//!    (`ao`).
+//! ```
+//! use block_mesh::ndshape::{ConstShape, ConstShape3u32};
+//! use block_mesh::{MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG};
+//! use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 //!
-//! # Terminology
+//! #[derive(Clone, Copy, PartialEq, Eq)]
+//! struct Block(bool);
 //!
-//! The source uses three axis names repeatedly:
+//! impl Voxel for Block {
+//!     fn get_visibility(&self) -> VoxelVisibility {
+//!         if self.0 { VoxelVisibility::Opaque } else { VoxelVisibility::Empty }
+//!     }
+//! }
 //!
-//! - `n_axis`: the face normal axis
-//! - `outer_axis`: the axis that advances from one row to the next within a
-//!   face slice
-//! - `bit_axis`: the axis packed into the row's `u64` bitset
+//! impl MergeVoxel for Block {
+//!     type MergeValue = bool;
+//!     fn merge_value(&self) -> bool { self.0 }
+//! }
 //!
-//! Every meshed query is also split into two nested boxes:
+//! // A 32³ chunk plus one voxel of padding on every side.
+//! type Chunk = ConstShape3u32<34, 34, 34>;
 //!
-//! - the **query extent** `[min, max]`, which includes one voxel of padding on
-//!   every side
-//! - the **interior extent** `[min + 1, max - 1]`, whose faces may actually
-//!   produce quads
+//! let mut voxels = [Block(false); Chunk::SIZE as usize];
+//! for i in 0..Chunk::SIZE {
+//!     let [x, y, z] = Chunk::delinearize(i);
+//!     voxels[i as usize] = Block(x * x + y * y + z * z < 30 * 30);
+//! }
 //!
-//! The padding is never emitted. It only exists so the mesher can decide
-//! whether an interior face is visible.
+//! let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+//! let mut buffer = BinaryGreedyQuadsBuffer::new();
+//! binary_greedy_quads(&voxels, &Chunk {}, [0; 3], [33; 3], &faces, &mut buffer);
 //!
-//! # Tiles and the 62-voxel row
+//! for (group, face) in buffer.quads.groups.iter().zip(&faces) {
+//!     for quad in group {
+//!         let positions = face.quad_mesh_positions(quad, 1.0);
+//!         let normals = face.quad_mesh_normals();
+//!         // ...push into your mesh
+//!     }
+//! }
+//! # assert!(buffer.quads.num_quads() > 0);
+//! ```
 //!
-//! Each axis of a tile is packed into one `u64`, which holds 62 interior
-//! voxels plus the two padding voxels. A 64³ padded chunk is therefore meshed
-//! in a single pass. Larger queries are split into evenly sized tiles that
-//! use their neighbours' voxels as padding, so visibility and AO are exact
-//! across seams; quads simply never merge across one.
+//! The query `[min, max]` includes one voxel of padding on every side. Only
+//! faces of the interior `[min + 1, max - 1]` are emitted; the padding just
+//! tells the mesher what each interior face is up against.
 //!
-//! # How AO-safe merging works
+//! Reuse one buffer per thread. It keeps its allocations between calls.
 //!
-//! Standard voxel AO gives each corner of a face a value from `0` to `3`,
-//! based on the eight voxels around the face in the plane just outside it:
+//! # Choosing a mesher
+//!
+//! - [`binary_greedy_quads`] merges faces with equal
+//!   [`merge_value`](block_mesh::MergeVoxel::merge_value)s into as few quads
+//!   as it can. Use it unless you need one of the others.
+//! - [`binary_greedy_quads_ao_safe`] merges the same way, except across
+//!   ambient-occlusion boundaries. Use it with per-vertex AO.
+//! - [`binary_visible_block_faces`] emits one quad per face. Use it when
+//!   something per-voxel, like a texture atlas without tiling, rules out
+//!   merging.
+//!
+//! # Ambient occlusion
+//!
+//! Greedy meshing and vertex AO usually fight: a big merged quad smears corner
+//! darkening across faces that should differ. [`binary_greedy_quads_ao_safe`]
+//! only merges faces whose four corner AO values match, so you can compute AO
+//! once per final quad with [`FaceAoSampler`] instead of once per voxel face.
+//!
+//! ## How AO-safe merging works
+//!
+//! Voxel AO gives each corner of a face a value from `0` to `3`, from the
+//! eight voxels around the face in the plane just outside it:
 //!
 //! ```text
 //!     prev row     a  b  c        each corner looks at its two side
@@ -68,131 +96,62 @@
 //!     next row     f  g  h        them, e.g. the top-left corner: d, a, b
 //! ```
 //!
-//! Two neighbouring faces can share a quad only if their corners would get
-//! the same AO. Rather than computing a per-face AO signature and comparing
-//! signatures in the merge loop, the AO-safe policy reads the three rows of
-//! that exterior plane as bitsets (`prev`, `current`, `next`, which the
-//! mesher already has as occupancy columns) and classifies a whole row of
-//! visible opaque faces at once with shifts and masks:
+//! Comparing per-face AO signatures in the merge loop would be slow. Instead,
+//! the mesher reads those three rows as bitsets (it already has them as
+//! occupancy columns) and sorts a whole row of opaque faces at once, with
+//! shifts and masks, into four classes:
 //!
-//! - **Flat**: no occluders around the face. Every corner is `3`, so it
-//!   merges like vanilla meshing.
-//! - **Vertical**: a wall beside the face runs through all three rows
-//!   (`a d f` or `c e h` all solid), each side column is either all solid or
-//!   all empty, and `b` and `g` are empty. AO then repeats from row to row,
-//!   so the face may merge across rows at width 1.
-//! - **Horizontal**: the `prev` or `next` row is solid at both diagonals
-//!   (`a c` or `f h`), each of those rows matches itself on both sides, and
-//!   nothing sits beside the face (`d` and `e` empty). AO then repeats along
-//!   the row, so the face may merge within the row.
-//! - **Unit**: anything else with an occluder nearby. Some occupancy change
-//!   falls inside the face's neighbourhood, so it stays `1x1`.
+//! - **Flat**: no occluders nearby. Every corner is `3`, so the face merges
+//!   freely.
+//! - **Vertical**: a wall runs beside the face through all three rows (`a d f`
+//!   or `c e h`), each side column is all solid or all empty, and `b` and `g`
+//!   are empty. AO repeats from row to row, so the face may merge across rows
+//!   at width 1.
+//! - **Horizontal**: `a c` or `f h` are solid, each of those rows matches
+//!   itself on both sides, and `d` and `e` are empty. AO repeats along the
+//!   row, so the face may merge within it.
+//! - **Unit**: anything else with an occluder nearby. It stays `1x1`.
 //!
-//! Each class then goes through the same row merger as vanilla meshing with
-//! only its legal directions enabled, and faces only merge within their own
-//! class. Translucent faces keep vanilla behaviour. The test suite checks the
-//! result against a brute-force AO evaluation of every unit face, including
-//! on randomized volumes.
+//! Each class runs through the ordinary row merger with only its legal
+//! directions switched on. Classes with fewer directions are cheaper to
+//! merge, which is why AO-safe meshing is often *faster* than plain greedy
+//! meshing on terrain. The tests check every quad against a brute-force AO
+//! evaluation.
 //!
-//! Classifying constraints up front also makes AO-safe meshing *faster* than
-//! vanilla on realistic terrain: most cells end up in a class that never
-//! needs the full two-direction merge.
+//! # How it works
 //!
-//! # Example
+//! Every mesher runs the same pipeline on tiles of at most 62 interior voxels
+//! per axis, so that each padded row fits one `u64`. A `64³` padded chunk is
+//! one tile; larger queries are split for you.
 //!
-//! ```
-//! use block_mesh::ndshape::{ConstShape, ConstShape3u32};
-//! use block_mesh::{
-//!     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
-//! };
-//! use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
+//! 1. **Pack occupancy.** Each X row becomes an opaque and a translucent
+//!    bitset, eight voxels per step with a multiply trick. Y columns are a
+//!    bit-matrix transpose of the X rows.
+//! 2. **Find visible faces.** A face is visible where `voxel & !neighbour`,
+//!    computed for a whole row at once.
+//! 3. **Merge.** Runs grow down columns, then join sideways when their merge
+//!    values and heights match. `MergeVoxel` is only consulted where the
+//!    bitmasks say a merge is possible.
 //!
-//! #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-//! struct BoolVoxel(bool);
+//! Tiles read their neighbours' voxels as padding, so visibility and AO are
+//! exact across tile seams. Quads never merge across one.
 //!
-//! const EMPTY: BoolVoxel = BoolVoxel(false);
-//! const FULL: BoolVoxel = BoolVoxel(true);
+//! # FAQ
 //!
-//! impl Voxel for BoolVoxel {
-//!     fn get_visibility(&self) -> VoxelVisibility {
-//!         if *self == EMPTY {
-//!             VoxelVisibility::Empty
-//!         } else {
-//!             VoxelVisibility::Opaque
-//!         }
-//!     }
-//! }
+//! **Why don't I get the same quads as `greedy_quads`?** You get exactly the
+//! same visible faces, and usually a very similar number of quads, but the
+//! rectangles may be split differently.
 //!
-//! impl MergeVoxel for BoolVoxel {
-//!     type MergeValue = Self;
+//! **Why are the faces on my chunk's border missing?** The outermost layer of
+//! the query is padding and never produces faces. Fill it with your
+//! neighbouring chunks' voxels.
 //!
-//!     fn merge_value(&self) -> Self::MergeValue {
-//!         *self
-//!     }
-//! }
+//! **Do I have to clear the buffer?** No. Every function here clears its
+//! output first (unlike upstream `visible_block_faces`, which appends).
 //!
-//! type ChunkShape = ConstShape3u32<18, 18, 18>;
-//!
-//! let mut voxels = [EMPTY; ChunkShape::SIZE as usize];
-//! for i in 0..ChunkShape::SIZE {
-//!     let [x, y, z] = ChunkShape::delinearize(i);
-//!     voxels[i as usize] = if ((x * x + y * y + z * z) as f32).sqrt() < 15.0 {
-//!         FULL
-//!     } else {
-//!         EMPTY
-//!     };
-//! }
-//!
-//! let mut buffer = BinaryGreedyQuadsBuffer::new();
-//! binary_greedy_quads(
-//!     &voxels,
-//!     &ChunkShape {},
-//!     [0; 3],
-//!     [17; 3],
-//!     &RIGHT_HANDED_Y_UP_CONFIG.faces,
-//!     &mut buffer,
-//! );
-//!
-//! assert!(buffer.quads.num_quads() > 0);
-//! ```
-//!
-//! The AO-safe entry point uses the same buffer type:
-//!
-//! ```
-//! # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
-//! # use block_mesh::{
-//! #     MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
-//! # };
-//! # use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
-//! # #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-//! # struct BoolVoxel(bool);
-//! # impl Voxel for BoolVoxel {
-//! #     fn get_visibility(&self) -> VoxelVisibility {
-//! #         if self.0 {
-//! #             VoxelVisibility::Opaque
-//! #         } else {
-//! #             VoxelVisibility::Empty
-//! #         }
-//! #     }
-//! # }
-//! # impl MergeVoxel for BoolVoxel {
-//! #     type MergeValue = Self;
-//! #     fn merge_value(&self) -> Self::MergeValue {
-//! #         *self
-//! #     }
-//! # }
-//! # type ChunkShape = ConstShape3u32<4, 4, 4>;
-//! # let voxels = [BoolVoxel(false); ChunkShape::SIZE as usize];
-//! let mut buffer = BinaryGreedyQuadsBuffer::new();
-//! binary_greedy_quads_ao_safe(
-//!     &voxels,
-//!     &ChunkShape {},
-//!     [0; 3],
-//!     [3; 3],
-//!     &RIGHT_HANDED_Y_UP_CONFIG.faces,
-//!     &mut buffer,
-//! );
-//! ```
+//! **Where can I see it running?** The repository's
+//! [`examples_crate`](https://github.com/nathanaelneveux/block_mesh_bgm/tree/main/examples_crate)
+//! has Bevy demos comparing every mesher, AO layouts included.
 #![warn(missing_docs)]
 
 mod ao;
@@ -210,20 +169,20 @@ use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
 pub use sampler::FaceAoSampler;
 
-/// Reusable output and scratch storage for [`binary_greedy_quads`] and
+/// Output and reusable scratch for [`binary_greedy_quads`] and
 /// [`binary_greedy_quads_ao_safe`].
 ///
-/// Reusing one buffer per worker thread keeps the hot meshing path focused on
-/// bitwise work instead of repeated heap growth.
+/// Keep one per thread: it holds on to its allocations, so after the first
+/// call meshing never touches the heap except to grow the output.
 #[derive(Default)]
 pub struct BinaryGreedyQuadsBuffer {
-    /// Output quads grouped by face, matching `block-mesh`'s `QuadBuffer`.
+    /// The quads, one group per face in the order of the `faces` you passed.
     pub quads: QuadBuffer,
     scratch: Scratch,
 }
 
 impl BinaryGreedyQuadsBuffer {
-    /// Creates an empty reusable output/scratch buffer.
+    /// Creates an empty buffer.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -231,16 +190,18 @@ impl BinaryGreedyQuadsBuffer {
     }
 }
 
-/// Reusable output and scratch storage for [`binary_visible_block_faces`].
+/// Output and reusable scratch for [`binary_visible_block_faces`].
+///
+/// Keep one per thread, like [`BinaryGreedyQuadsBuffer`].
 #[derive(Default)]
 pub struct BinaryUnitQuadBuffer {
-    /// Output quads grouped by face, matching `block-mesh`'s `UnitQuadBuffer`.
+    /// The quads, one group per face in the order of the `faces` you passed.
     pub quads: UnitQuadBuffer,
     scratch: Scratch,
 }
 
 impl BinaryUnitQuadBuffer {
-    /// Creates an empty reusable output/scratch buffer.
+    /// Creates an empty buffer.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -262,26 +223,21 @@ struct Scratch {
     pos_rows: Vec<u64>,
 }
 
-/// Generates greedy quads using a binary-mask-backed implementation.
+/// Meshes the visible faces in `[min, max]` into as few quads as it can.
 ///
-/// The public API mirrors [`block_mesh::greedy_quads`]. The output lands in
-/// [`BinaryGreedyQuadsBuffer::quads`], which uses the same public
-/// `block-mesh` types as the upstream mesher. The buffer is cleared first.
+/// A drop-in for [`block_mesh::greedy_quads`]: faces merge when their voxels'
+/// [`merge_value`](MergeVoxel::merge_value)s are equal. You get exactly the
+/// visible faces `greedy_quads` would emit, usually in a similar number of
+/// quads, though not necessarily the same rectangles. The output is cleared
+/// first. See the [crate docs](crate#getting-started) for an example.
 ///
-/// # Output contract
+/// Any query size works. Interiors wider than 62 voxels are meshed in tiles,
+/// and quads don't merge across tile seams.
 ///
-/// This implementation preserves the set of visible unit faces that
-/// `block_mesh::greedy_quads` would emit, and it usually stays very close to
-/// the upstream quad count. It does not promise the exact same quad
-/// partition.
+/// # Panics
 ///
-/// # Extents
-///
-/// Any query extent is supported. Interiors up to `62` voxels per axis (`64`
-/// including the one-voxel border, the usual binary-meshing chunk size) are
-/// meshed in one pass. Wider queries are meshed in tiles of at most `62`
-/// interior voxels per axis; visibility is exact across tile seams, but quads
-/// do not merge across them.
+/// Panics if `voxels` is shorter than `voxels_shape`, or if `[min, max]` is
+/// empty or reaches outside the shape.
 pub fn binary_greedy_quads<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -305,18 +261,17 @@ pub fn binary_greedy_quads<T, S>(
     );
 }
 
-/// Generates greedy quads with AO-safe merge restrictions for opaque faces.
+/// Like [`binary_greedy_quads`], but never merges across an ambient-occlusion
+/// boundary.
 ///
-/// This uses the same visibility pipeline as [`binary_greedy_quads`], but it
-/// refuses merges that would cross AO boundaries on opaque faces: every unit
-/// face inside an emitted opaque quad has the same four vertex AO values.
-/// Translucent faces keep the same merge rule they use in the vanilla path.
-///
-/// This only changes the merge policy. It does not emit AO values or lighting
-/// data for you; [`FaceAoSampler`] computes them per quad afterwards.
-///
-/// Extents work as in [`binary_greedy_quads`], and AO stays exact across tile
+/// Every unit face inside an opaque quad has the same four vertex AO values,
+/// so [`FaceAoSampler`] can compute AO once per quad; its docs show the two
+/// together. Translucent faces merge as usual. AO stays exact across tile
 /// seams.
+///
+/// # Panics
+///
+/// Same as [`binary_greedy_quads`].
 pub fn binary_greedy_quads_ao_safe<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -340,12 +295,40 @@ pub fn binary_greedy_quads_ao_safe<T, S>(
     );
 }
 
-/// Emits one unit quad per visible face, like
-/// [`block_mesh::visible_block_faces`].
+/// Emits one quad per visible face in `[min, max]`.
 ///
-/// Uses the same binary visibility pipeline as [`binary_greedy_quads`] and
-/// emits exactly the faces `visible_block_faces` would, for any query extent.
-/// Unlike upstream, the output buffer is cleared first.
+/// A drop-in for [`block_mesh::visible_block_faces`] that emits exactly the
+/// same faces, for any query size. Unlike upstream, it clears the output
+/// first instead of appending.
+///
+/// ```
+/// # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
+/// # use block_mesh::{Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG};
+/// # #[derive(Clone, Copy)]
+/// # struct Block(bool);
+/// # impl Voxel for Block {
+/// #     fn get_visibility(&self) -> VoxelVisibility {
+/// #         if self.0 { VoxelVisibility::Opaque } else { VoxelVisibility::Empty }
+/// #     }
+/// # }
+/// use block_mesh_bgm::{binary_visible_block_faces, BinaryUnitQuadBuffer};
+///
+/// type Chunk = ConstShape3u32<18, 18, 18>;
+///
+/// // A single block in the middle of the chunk.
+/// let mut voxels = [Block(false); Chunk::SIZE as usize];
+/// voxels[Chunk::linearize([8, 8, 8]) as usize] = Block(true);
+///
+/// let mut buffer = BinaryUnitQuadBuffer::new();
+/// let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+/// binary_visible_block_faces(&voxels, &Chunk {}, [0; 3], [17; 3], &faces, &mut buffer);
+///
+/// assert_eq!(buffer.quads.num_quads(), 6);
+/// ```
+///
+/// # Panics
+///
+/// Same as [`binary_greedy_quads`].
 pub fn binary_visible_block_faces<T, S>(
     voxels: &[T],
     voxels_shape: &S,

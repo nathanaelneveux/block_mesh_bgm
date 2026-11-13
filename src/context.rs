@@ -5,6 +5,19 @@
 //! caller's `OrientedBlockFace` array. [`Query`] validates the caller's request
 //! once; [`MeshingContext`] holds the facts for one tile of it.
 //!
+//! # Terminology
+//!
+//! The source names the three axes of a face scan:
+//!
+//! - `n_axis`: the face normal axis
+//! - `outer_axis`: the axis that advances from one row to the next within a
+//!   face slice
+//! - `bit_axis`: the axis packed into a row's `u64` bitset
+//!
+//! A query `[min, max]` is the **query extent**, including one voxel of
+//! padding; `[min + 1, max - 1]` is the **interior extent**, whose faces are
+//! emitted.
+//!
 //! # Tiling
 //!
 //! Each axis of a tile is packed into one `u64`, so a tile's interior is at

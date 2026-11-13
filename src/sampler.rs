@@ -8,13 +8,12 @@
 use block_mesh::{OrientedBlockFace, UnorientedQuad};
 use ndshape::Shape;
 
-/// Samples the standard four-corner voxel AO for quads of one face
+/// Computes per-vertex ambient occlusion for the quads of one face
 /// orientation.
 ///
-/// Construct one sampler per face group, outside the quad loop; it
-/// precomputes the linear offsets of the eight voxels around a face in the
-/// plane just outside it. Each [`sample`](Self::sample) then costs eight
-/// loads and one table lookup.
+/// Build one sampler per face group, outside the quad loop. It precomputes
+/// where the eight voxels around a face sit in memory, so each
+/// [`sample`](Self::sample) is eight loads and a table lookup.
 ///
 /// ```
 /// # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
@@ -32,20 +31,29 @@ use ndshape::Shape;
 /// # }
 /// use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer, FaceAoSampler};
 ///
-/// type ChunkShape = ConstShape3u32<34, 34, 34>;
-/// let voxels = [Block(false); ChunkShape::SIZE as usize];
+/// type Chunk = ConstShape3u32<18, 18, 18>;
+///
+/// // A floor with one pillar standing on it.
+/// let mut voxels = [Block(false); Chunk::SIZE as usize];
+/// for i in 0..Chunk::SIZE {
+///     let [x, y, z] = Chunk::delinearize(i);
+///     voxels[i as usize] = Block(y < 4 || (x == 8 && z == 8 && y < 8));
+/// }
+///
 /// let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
-///
 /// let mut buffer = BinaryGreedyQuadsBuffer::new();
-/// binary_greedy_quads_ao_safe(&voxels, &ChunkShape {}, [0; 3], [33; 3], &faces, &mut buffer);
+/// binary_greedy_quads_ao_safe(&voxels, &Chunk {}, [0; 3], [17; 3], &faces, &mut buffer);
 ///
+/// let mut darkened = 0;
 /// for (group, face) in buffer.quads.groups.iter().zip(faces) {
-///     let sampler = FaceAoSampler::for_shape(face, &ChunkShape {});
+///     let sampler = FaceAoSampler::for_shape(face, &Chunk {});
 ///     for quad in group {
-///         // 0 = fully occluded ..= 3 = open, in `quad_corners` vertex order.
-///         let vertex_ao: [u8; 4] = sampler.sample(&voxels, quad.minimum, |block| block.0);
+///         // 0 (dark) ..= 3 (open) per corner, in `quad_corners` order.
+///         let vertex_ao = sampler.sample(&voxels, quad.minimum, |block| block.0);
+///         darkened += vertex_ao.iter().filter(|&&ao| ao < 3).count();
 ///     }
 /// }
+/// assert!(darkened > 0, "the floor darkens around the pillar's base");
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct FaceAoSampler {
@@ -56,8 +64,7 @@ pub struct FaceAoSampler {
 }
 
 impl FaceAoSampler {
-    /// Builds the sampler for one oriented block face of voxels laid out by
-    /// `shape`.
+    /// Builds a sampler for `face`, with voxels laid out by `shape`.
     pub fn for_shape<S>(face: OrientedBlockFace, shape: &S) -> Self
     where
         S: Shape<3, Coord = u32>,
@@ -65,9 +72,9 @@ impl FaceAoSampler {
         Self::new(face, crate::context::shape_strides(shape))
     }
 
-    /// Builds the sampler for one oriented block face of a dense linear voxel
-    /// array with the given per-axis `strides`. For a `34³` padded chunk in
-    /// X/Y/Z order that is `[1, 34, 34 * 34]`.
+    /// Builds a sampler for `face`, with voxels in a dense array with the
+    /// given per-axis `strides` (`[1, 34, 34 * 34]` for a `34³` chunk in
+    /// X/Y/Z order).
     pub fn new(face: OrientedBlockFace, strides: [usize; 3]) -> Self {
         let unit_quad = UnorientedQuad {
             minimum: [0; 3],
@@ -121,16 +128,15 @@ impl FaceAoSampler {
         }
     }
 
-    /// Samples the four vertex AO values for a quad whose source voxel is
-    /// `minimum`, in the vertex order of [`OrientedBlockFace::quad_corners`].
+    /// Returns the four corner AO values of the quad whose source voxel is
+    /// `minimum`, in [`OrientedBlockFace::quad_corners`] order.
     ///
-    /// Each value is `0` (fully occluded) to `3` (unoccluded), following the
+    /// Each value runs from `0` (fully occluded) to `3` (open), by the
     /// standard voxel AO rule: two occluding sides make a corner fully dark
-    /// regardless of the diagonal. `is_opaque` decides which voxels occlude.
+    /// whatever the diagonal. `is_opaque` decides which voxels occlude.
     ///
-    /// For a merged quad this is exact only if the quad came from
-    /// [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe),
-    /// which keeps AO uniform across each opaque quad.
+    /// For a merged quad, this is exact only if the quad came from
+    /// [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe).
     ///
     /// # Panics
     ///
