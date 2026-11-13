@@ -7,7 +7,7 @@
 
 - **Drop-in.** Swap one function and one buffer type. Everything else in `block-mesh` stays.
 - **Any size.** From `64³` chunks in one pass to whole `.vox` models, tiled for you.
-- **AO-safe merging.** Optional greedy meshing that never merges across an ambient-occlusion boundary, plus a sampler that gives you the AO values.
+- **AO-safe greedy meshing.** Greedy quads with exact per-vertex ambient occlusion, worked out from bitmasks instead of per-face AO signatures. On cave-heavy terrain it even beats plain greedy meshing.
 
 ## Getting Started
 
@@ -76,9 +76,22 @@ The arguments are identical, and `buffer.quads` is the same `QuadBuffer` (or `Un
 - **Buffer clearing.** These functions clear their output first. Upstream `visible_block_faces` appends.
 - **Tile seams.** Interiors wider than `62` voxels are meshed in tiles. Visibility and AO stay exact across seams, but quads don't merge across them.
 
-## Ambient Occlusion
+## AO-Safe Greedy Meshing
 
-Greedy meshing and vertex AO usually fight: a big merged quad smears the corner darkening across faces that should differ. `binary_greedy_quads_ao_safe` only merges faces whose four corner AO values match, so you can compute AO once per final quad instead of once per voxel face:
+Greedy meshing and per-vertex ambient occlusion are a famously awkward pair. Merge two faces whose corners should darken differently and the quad smears one shading across both. The usual fix is to compute an AO signature for every visible face and merge only matching signatures, which puts an eight-voxel lookup per face on the hot path.
+
+`binary_greedy_quads_ao_safe` never computes a signature. It reads the plane just outside each face as bitsets the mesher already has, and sorts a whole row of faces at once into four classes: free to merge, row-only, column-only, or single. Single and one-direction faces are peeled off in bulk on cheap paths, and only the rest goes through the full two-direction merge.
+
+Every quad comes out with uniform AO, and faces still merge wherever AO allows. The speed depends on the scene: on noisy, cave-heavy terrain most faces land in the cheap classes, so it beats plain greedy meshing; on smooth surfaces it costs 15–30% more.
+
+| Case | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
+| --- | ---: | ---: |
+| `layered-caves-2x2x2` | `307.46 µs` | `218.70 µs` |
+| `translucent-mix` | `111.68 µs` | `97.227 µs` |
+| `layered-caves` | `61.785 µs` | `54.398 µs` |
+| `dense-sphere` | `21.005 µs` | `25.067 µs` |
+
+Because AO is uniform per quad, you compute it once per final quad with `FaceAoSampler`, not once per voxel face:
 
 ```rust,ignore
 use block_mesh_bgm::{binary_greedy_quads_ao_safe, FaceAoSampler};
@@ -94,7 +107,7 @@ for (group, face) in buffer.quads.groups.iter().zip(faces) {
 }
 ```
 
-The AO-safe mesher classifies faces with bitmasks instead of comparing per-face AO signatures, which makes it *faster* than plain greedy meshing on terrain. The [API docs](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/#how-ao-safe-merging-works) show how.
+The [API docs](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/#how-ao-safe-merging-works) walk through the four classes, bit by bit.
 
 ## Performance
 
@@ -113,16 +126,6 @@ Criterion medians on an Apple M4 (`cargo bench --bench bench`). Cases are `34³`
 | `translucent-mix` | `842.69 µs` | `111.68 µs` | `97.227 µs` |
 | `layered-caves-2x2x2` | `4.1295 ms` | `307.46 µs` | `218.70 µs` |
 | `large-model-130x66x98` | `9.7650 ms` | `1.0241 ms` | `1.0309 ms` |
-
-AO-safe meshing costs a little on small AO-heavy chunks and wins on terrain:
-
-| Case | `visible_block_faces` | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
-| --- | ---: | ---: | ---: |
-| `dense-sphere-ao` | `40.787 µs` | `20.899 µs` | `24.903 µs` |
-| `translucent-shell-sphere-ao` | `38.311 µs` | `24.862 µs` | `29.563 µs` |
-| `layered-caves-2x2x2` | `659.23 µs` | `307.46 µs` | `218.70 µs` |
-| `ao-boundary-stress` | `18.564 µs` | `11.133 µs` | `11.635 µs` |
-| `ao-unit-patterns` | `18.297 µs` | `10.773 µs` | `11.450 µs` |
 
 <details>
 <summary>Unit faces: <code>visible_block_faces</code> vs <code>binary_visible_block_faces</code></summary>
@@ -152,12 +155,6 @@ cargo run -p block-mesh-bgm-examples --example render           # all meshers si
 cargo run -p block-mesh-bgm-examples --example ambient_occlusion  # AO-safe quad layouts on a sphere and torus
 cargo run -p block-mesh-bgm-examples --example custom_meshing     # head-to-head in a bevy_voxel_world scene
 ```
-
-## Compatibility
-
-| `block-mesh` | `block-mesh-bgm` |
-| --- | --- |
-| 0.2 | 0.2 |
 
 ## License
 

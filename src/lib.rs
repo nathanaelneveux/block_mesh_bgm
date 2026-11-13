@@ -5,6 +5,10 @@
 //! loops. It is about ten times faster than [`greedy_quads`], and usually
 //! faster than even [`visible_block_faces`] while emitting far fewer quads.
 //!
+//! It also does something greedy meshers usually shy away from: greedy
+//! merging that keeps per-vertex [ambient occlusion](#ambient-occlusion)
+//! exact, without ever computing a per-face AO signature.
+//!
 //! | `block-mesh` | this crate | buffer |
 //! | --- | --- | --- |
 //! | [`greedy_quads`] | [`binary_greedy_quads`] | [`BinaryGreedyQuadsBuffer`] |
@@ -80,10 +84,15 @@
 //!
 //! # Ambient occlusion
 //!
-//! Greedy meshing and vertex AO usually fight: a big merged quad smears corner
-//! darkening across faces that should differ. [`binary_greedy_quads_ao_safe`]
-//! only merges faces whose four corner AO values match, so you can compute AO
-//! once per final quad with [`FaceAoSampler`] instead of once per voxel face.
+//! Greedy meshing and per-vertex AO are a famously awkward pair. Merge two
+//! faces whose corners should darken differently and the quad smears one
+//! shading across both. The usual fix is to compute an AO signature for every
+//! visible face and merge only matching signatures, which puts an eight-voxel
+//! lookup per face on the hot path.
+//!
+//! [`binary_greedy_quads_ao_safe`] gets the same guarantee, uniform AO across
+//! every quad, from bitmasks the mesher already has. Compute the AO itself
+//! once per final quad with [`FaceAoSampler`], not once per voxel face.
 //!
 //! ## How AO-safe merging works
 //!
@@ -112,11 +121,12 @@
 //!   row, so the face may merge within it.
 //! - **Unit**: anything else with an occluder nearby. It stays `1x1`.
 //!
-//! Each class runs through the ordinary row merger with only its legal
-//! directions switched on. Classes with fewer directions are cheaper to
-//! merge, which is why AO-safe meshing is often *faster* than plain greedy
-//! meshing on terrain. The tests check every quad against a brute-force AO
-//! evaluation.
+//! Unit faces are emitted directly, one-direction classes take cheap merge
+//! paths, and only flat (and translucent) faces go through the full
+//! two-direction merge. On noisy, cave-heavy terrain most faces land in the
+//! cheap classes, which makes AO-safe meshing *faster* than plain greedy
+//! meshing there; smooth surfaces cost 15–30% more. The tests check every
+//! quad against a brute-force AO evaluation.
 //!
 //! # How it works
 //!
