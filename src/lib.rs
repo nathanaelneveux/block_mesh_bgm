@@ -1,46 +1,34 @@
 //! `block-mesh`-compatible binary greedy meshing.
 //!
-//! [`binary_greedy_quads`] mirrors the call shape of
-//! [`block_mesh::greedy_quads`], but it reaches the same kind of `QuadBuffer`
-//! through a different internal pipeline:
+//! This crate is a drop-in replacement for the meshers in
+//! [`block-mesh`](block_mesh). It takes the same voxel slices, shapes, extents,
+//! and face configurations, and writes the same public quad types:
 //!
-//! 1. Validate the padded query extent and precompute a few indexing facts.
-//! 2. Build the packed occupancy columns used by the fixed face scan plans,
-//!    one `u64` per orthogonal column.
-//! 3. Turn those columns into visible-face rows with cheap bitwise tests.
-//! 4. Merge each face slice into quads, either as unit quads or with a
-//!    carry-based greedy row merger.
+//! | `block-mesh` | this crate | output |
+//! | --- | --- | --- |
+//! | [`greedy_quads`](block_mesh::greedy_quads) | [`binary_greedy_quads`] | [`BinaryGreedyQuadsBuffer`] |
+//! | | [`binary_greedy_quads_ao_safe`] | [`BinaryGreedyQuadsBuffer`] |
+//! | [`visible_block_faces`](block_mesh::visible_block_faces) | [`binary_visible_block_faces`] | [`BinaryUnitQuadBuffer`] |
 //!
-//! The implementation is split into the same stages in source:
+//! [`binary_greedy_quads_ao_safe`] is greedy meshing that never merges across
+//! an ambient-occlusion boundary, and [`FaceAoSampler`] computes the vertex AO
+//! for its quads afterwards.
 //!
-//! - `context`: query validation and precomputed layout facts
-//! - `prep`: occupancy columns and visible-face rows
-//! - `merge`: unit emission and carry-based greedy merging
-//! - `ao`: AO-safe alternate merge policy built on binary occupancy masks
-//! - `face`: face-orientation helpers shared by the other stages
+//! # Pipeline
 //!
-//! The crate exposes two public entry points:
+//! Every entry point runs the same four stages, on tiles of at most 62
+//! interior voxels per axis:
 //!
-//! - [`binary_greedy_quads`]: the current maximum-merge implementation with no
-//!   extra policy checks
-//! - [`binary_greedy_quads_ao_safe`]: the same visibility pipeline, but with
-//!   AO-safe merge restrictions for opaque faces
-//!
-//! # AO-safe mode
-//!
-//! AO-safe mode keeps the same prep pipeline as vanilla meshing. The difference
-//! is only in how face rows are merged:
-//!
-//! - vanilla merging only checks `MergeVoxel::merge_value()`
-//! - AO-safe merging also looks at opaque occupancy in the plane just outside
-//!   the visible face
-//! - from that exterior plane it derives whole-row binary masks that prove
-//!   which cells must stay unit, which may only merge in one direction, and
-//!   which are still free to use the normal carry merge
-//!
-//! That keeps the AO rule in terms of the same binary data the mesher already
-//! uses elsewhere, instead of carrying per-cell lighting data through the hot
-//! merge loop.
+//! 1. **Validate** the padded query and precompute indexing facts
+//!    (`context`).
+//! 2. **Pack occupancy** into `u64` columns, one bit per voxel: X rows are
+//!    packed eight voxels at a time with a SWAR multiply, and Y columns are a
+//!    bit-matrix transpose of them (`prep`).
+//! 3. **Find visible faces** a whole row at a time:
+//!    `source & !neighbour` per column pair (`prep`).
+//! 4. **Merge** each face slice into quads with the chosen policy: unit quads,
+//!    the carry-based greedy row merger (`merge`), or the AO-safe classes
+//!    (`ao`).
 //!
 //! # Terminology
 //!
@@ -61,10 +49,54 @@
 //! The padding is never emitted. It only exists so the mesher can decide
 //! whether an interior face is visible.
 //!
-//! # Why the `62`-voxel limit exists
+//! # Tiles and the 62-voxel row
 //!
-//! Each axis of the padded query is packed into one `u64`. That leaves room for
-//! at most `62` interior voxels plus the two required padding voxels.
+//! Each axis of a tile is packed into one `u64`, which holds 62 interior
+//! voxels plus the two padding voxels. A 64³ padded chunk is therefore meshed
+//! in a single pass. Larger queries are split into evenly sized tiles that
+//! use their neighbours' voxels as padding, so visibility and AO are exact
+//! across seams; quads simply never merge across one.
+//!
+//! # How AO-safe merging works
+//!
+//! Standard voxel AO gives each corner of a face a value from `0` to `3`,
+//! based on the eight voxels around the face in the plane just outside it:
+//!
+//! ```text
+//!     prev row     a  b  c        each corner looks at its two side
+//!     current row  d  ·  e        neighbours and the diagonal between
+//!     next row     f  g  h        them, e.g. the top-left corner: d, a, b
+//! ```
+//!
+//! Two neighbouring faces can share a quad only if their corners would get
+//! the same AO. Rather than computing a per-face AO signature and comparing
+//! signatures in the merge loop, the AO-safe policy reads the three rows of
+//! that exterior plane as bitsets (`prev`, `current`, `next`, which the
+//! mesher already has as occupancy columns) and classifies a whole row of
+//! visible opaque faces at once with shifts and masks:
+//!
+//! - **Flat**: no occluders around the face. Every corner is `3`, so it
+//!   merges like vanilla meshing.
+//! - **Vertical**: a wall beside the face runs through all three rows
+//!   (`a d f` or `c e h` all solid), each side column is either all solid or
+//!   all empty, and `b` and `g` are empty. AO then repeats from row to row,
+//!   so the face may merge across rows at width 1.
+//! - **Horizontal**: the `prev` or `next` row is solid at both diagonals
+//!   (`a c` or `f h`), each of those rows matches itself on both sides, and
+//!   nothing sits beside the face (`d` and `e` empty). AO then repeats along
+//!   the row, so the face may merge within the row.
+//! - **Unit**: anything else with an occluder nearby. Some occupancy change
+//!   falls inside the face's neighbourhood, so it stays `1x1`.
+//!
+//! Each class then goes through the same row merger as vanilla meshing with
+//! only its legal directions enabled, and faces only merge within their own
+//! class. Translucent faces keep vanilla behaviour. The test suite checks the
+//! result against a brute-force AO evaluation of every unit face, including
+//! on randomized volumes.
+//!
+//! Classifying constraints up front also makes AO-safe meshing *faster* than
+//! vanilla on realistic terrain: most cells end up in a class that never
+//! needs the full two-direction merge.
 //!
 //! # Example
 //!

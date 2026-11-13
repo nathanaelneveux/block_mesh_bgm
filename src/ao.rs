@@ -1,13 +1,9 @@
-//! AO-safe alternate merge policy.
+//! The AO-safe merge policy.
 //!
-//! The default [`crate::binary_greedy_quads`] path stays on the existing
-//! carry-based maximum-merge implementation in [`crate::merge`]. This module
-//! handles the AO-safe variant. Instead of
-//! materializing one AO signature byte per visible opaque cell, it derives
-//! merge constraints directly from binary opaque-occupancy rows in the face's
-//! exterior sample plane.
-//!
-//! The core idea is:
+//! Instead of materializing an AO signature per visible opaque face, this
+//! derives merge constraints directly from binary opaque-occupancy rows in
+//! the face's exterior plane. The crate docs ("How AO-safe merging works")
+//! explain the classes; the core idea is:
 //!
 //! - use `opaque_cols` to build whole-row AO constraint masks with shifts and
 //!   intersections
@@ -32,57 +28,47 @@ impl<T: MergeVoxel> FacePolicy<T> for AoSafe {
         job: &FaceJob<'_, T>,
         quads: &mut Vec<UnorientedQuad>,
     ) {
-        mesh_face_ao_safe::<T, N_AXIS, BIT_IS_U>(job, quads);
+        job.for_each_active_slice(|n_local, rows, unit_only| {
+            let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
+            if unit_only {
+                emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
+                return;
+            }
+
+            // Emit the AO classes in increasing order of generality. Each class
+            // reuses the shared row merger with only its legal directions enabled.
+            let classes = AoRowClasses::build::<N_AXIS, T>(job, n_local, rows);
+            let len = rows.len();
+            let voxels = job.voxels;
+            if classes.unit_union != 0 {
+                emit_unit_slice::<N_AXIS, _>(&geometry, &classes.unit[..len], quads);
+            }
+            if classes.horizontal_union != 0 {
+                merge_rows::<T, N_AXIS, BIT_IS_U, true, false>(
+                    voxels,
+                    &geometry,
+                    &classes.horizontal[..len],
+                    quads,
+                );
+            }
+            if classes.vertical_union != 0 {
+                merge_rows::<T, N_AXIS, BIT_IS_U, false, true>(
+                    voxels,
+                    &geometry,
+                    &classes.vertical[..len],
+                    quads,
+                );
+            }
+            if classes.bidir_union != 0 {
+                merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(
+                    voxels,
+                    &geometry,
+                    &classes.bidir[..len],
+                    quads,
+                );
+            }
+        });
     }
-}
-
-#[inline(always)]
-fn mesh_face_ao_safe<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    job: &FaceJob<'_, T>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    job.for_each_active_slice(|n_local, rows, unit_only| {
-        let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
-        if unit_only {
-            emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
-            return;
-        }
-
-        // Emit the AO classes in increasing order of generality. Each class
-        // reuses the shared row merger with only its legal directions enabled.
-        let classes = AoRowClasses::build::<N_AXIS, T>(job, n_local, rows);
-        let len = rows.len();
-        let voxels = job.voxels;
-        if classes.unit_union != 0 {
-            emit_unit_slice::<N_AXIS, _>(&geometry, &classes.unit[..len], quads);
-        }
-        if classes.horizontal_union != 0 {
-            merge_rows::<T, N_AXIS, BIT_IS_U, true, false>(
-                voxels,
-                &geometry,
-                &classes.horizontal[..len],
-                quads,
-            );
-        }
-        if classes.vertical_union != 0 {
-            merge_rows::<T, N_AXIS, BIT_IS_U, false, true>(
-                voxels,
-                &geometry,
-                &classes.vertical[..len],
-                quads,
-            );
-        }
-        if classes.bidir_union != 0 {
-            merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(
-                voxels,
-                &geometry,
-                &classes.bidir[..len],
-                quads,
-            );
-        }
-    });
 }
 
 /// The visible cells of one face slice, split by the merge directions that
@@ -203,6 +189,10 @@ impl AoRowClasses {
 /// exterior plane, one row before, at, and after the visible row. Returns
 /// `(unit, horizontal, vertical)`; any opaque visible cell in none of them is
 /// free to merge in both directions.
+///
+/// The crate docs ("How AO-safe merging works") describe the four classes;
+/// `tests/AO_binary_tests.md` in the repository walks through every mask
+/// below on worked examples, using the same letter names.
 #[inline(always)]
 fn classify_ao_opaque_row(
     opaque_visible: u64,
@@ -211,15 +201,21 @@ fn classify_ao_opaque_row(
     next_row: u64,
     interior_bit_mask: u64,
 ) -> (u64, u64, u64) {
+    // Letters in comments match the worked examples in the notes; the
+    // input `opaque_visible` is A.
+    // D: an occluder directly beside the face.
     let neighbor_curr = ((current_row << 1) | (current_row >> 1)) & interior_bit_mask;
+    // E: columns solid through all three rows.
     let shared_opaque_depth = prev_row & current_row & next_row;
     // A continuous wall on only one side is not enough to prove a vertical
     // merge: an occupancy transition on the other side still changes the AO
     // signature. Both side columns must be stable across all three rows.
+    // F: columns that are all solid (E) or all empty (E*).
     let stable_depth = shared_opaque_depth | !(prev_row | current_row | next_row);
     let stable_on_both_sides = (stable_depth << 1) & (stable_depth >> 1);
     let opaque_on_either_side =
         ((shared_opaque_depth << 1) & interior_bit_mask) | (shared_opaque_depth >> 1);
+    // H (with G = stable sides with an opaque neighbour).
     let vertical = opaque_visible
         & stable_on_both_sides
         & opaque_on_either_side
@@ -227,14 +223,18 @@ fn classify_ao_opaque_row(
         & (!next_row)
         & interior_bit_mask;
 
+    // K and L: the diagonals of the next / previous row disagree.
     let edge_from_next =
         (((next_row << 1) & interior_bit_mask) ^ (next_row >> 1)) & interior_bit_mask;
     let edge_from_prev =
         (((prev_row << 1) & interior_bit_mask) ^ (prev_row >> 1)) & interior_bit_mask;
+    // I and J: both diagonals of the next / previous row are solid.
     let horiz_from_next = ((next_row << 1) & interior_bit_mask) & (next_row >> 1);
     let horiz_from_prev = ((prev_row << 1) & interior_bit_mask) & (prev_row >> 1);
+    // P and Q: solid directly behind / ahead without both diagonals.
     let possible_unit_from_prev = prev_row & !horiz_from_prev;
     let possible_unit_from_next = next_row & !horiz_from_next;
+    // M.
     let unit = opaque_visible
         & !vertical
         & (neighbor_curr
@@ -244,6 +244,7 @@ fn classify_ao_opaque_row(
             | possible_unit_from_next)
         & interior_bit_mask;
 
+    // O (N restricted to A).
     let horizontal = opaque_visible
         & !vertical
         & !unit

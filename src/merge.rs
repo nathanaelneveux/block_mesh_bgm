@@ -101,7 +101,7 @@ impl SliceGeometry {
 ///
 /// # Safety
 ///
-/// `index` must be in bounds. `MeshingContext::new` asserts that the whole
+/// `index` must be in bounds. `Query::new` asserts that the whole
 /// query extent lies inside `voxels`, and the merge kernels only index interior
 /// cells of the current slice (or, for row continuation, the interior cell one
 /// row further on, which is only read when that row is visible too).

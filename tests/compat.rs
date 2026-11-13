@@ -122,7 +122,7 @@ fn matches_block_mesh_geometry_for_translucent_mix() {
 
         let pattern = (x * 17 + y * 7 + z * 13) % 9;
         match pattern {
-            0 | 1 | 2 => TestVoxel::opaque((pattern + 1) as u8, ((x + z) % 4) as u8),
+            0..=2 => TestVoxel::opaque((pattern + 1) as u8, ((x + z) % 4) as u8),
             3 | 4 => TestVoxel::translucent((pattern + 1) as u8, ((y + z) % 5) as u8),
             _ => TestVoxel::empty(((x + y + z) % 6) as u8),
         }
@@ -183,9 +183,9 @@ fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
             return TestVoxel::empty(0);
         }
 
-        if y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z) {
-            TestVoxel::opaque(1, 0)
-        } else if y == 3 && (2..=4).contains(&x) && z == 1 {
+        let plate = y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z);
+        let lip = y == 3 && (2..=4).contains(&x) && z == 1;
+        if plate || lip {
             TestVoxel::opaque(1, 0)
         } else {
             TestVoxel::empty(0)
@@ -905,6 +905,7 @@ fn offset_is_opaque(
     voxels[shape.linearize(offset_coord) as usize].visibility == VoxelVisibility::Opaque
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors offset_is_opaque with a second offset
 fn offset2_is_opaque(
     shape: &RuntimeShape<u32, 3>,
     voxels: &[TestVoxel],
@@ -974,7 +975,7 @@ fn make_terrain_voxels(dims: [u32; 3], seed: u32) -> Vec<TestVoxel> {
         if y < height {
             if hash3(x, y, z, seed ^ 0x55) % 100 < 6 {
                 TestVoxel::empty(0)
-            } else if hash3(x / 3, y / 3, z / 3, seed ^ 0xaa) % 9 == 0 {
+            } else if hash3(x / 3, y / 3, z / 3, seed ^ 0xaa).is_multiple_of(9) {
                 TestVoxel::opaque(2, 0)
             } else {
                 TestVoxel::opaque(1, 0)
@@ -1047,7 +1048,7 @@ fn benchmark_like_cases() -> Vec<CarryCase> {
             [34, 34, 34],
             [0; 3],
             [33; 3],
-            |x, y, z, dims| translucent_shell_sphere_voxel(x, y, z, dims),
+            translucent_shell_sphere_voxel,
         ),
         build_carry_case(
             "layered-caves",

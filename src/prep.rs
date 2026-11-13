@@ -167,7 +167,7 @@ fn pack_strided_row<T: Voxel>(
 ) -> (u64, u64) {
     let mut bytes = [0u8; 64];
     for byte in bytes.iter_mut().take(len) {
-        // SAFETY: `MeshingContext::new` asserted that the whole query extent
+        // SAFETY: `Query::new` asserted that the whole query extent
         // lies inside `voxels`, and this row is part of the query.
         *byte = visibility_byte(unsafe { voxels.get_unchecked(index) });
         index += stride;
