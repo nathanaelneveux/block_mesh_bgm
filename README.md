@@ -3,159 +3,130 @@
 [![Crates.io](https://img.shields.io/crates/v/block-mesh-bgm.svg)](https://crates.io/crates/block-mesh-bgm)
 [![Docs.rs](https://docs.rs/block-mesh-bgm/badge.svg)](https://docs.rs/block-mesh-bgm)
 
-**Binary greedy meshing for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).** Same voxels, same shapes, same quads — about ten times faster than `greedy_quads`, and usually faster than even `visible_block_faces` while emitting far fewer quads.
+**Binary greedy meshing for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).** Same voxels, same shapes, same quads — swap one function and mesh four chunks of smooth hills in **70 µs** instead of **887 µs**.
 
-- **Drop-in.** Swap one function and one buffer type. Everything else in `block-mesh` stays.
-- **Any size.** From `64³` chunks in one pass to whole `.vox` models, tiled for you.
-- **AO-safe greedy meshing.** Greedy quads with exact per-vertex ambient occlusion, worked out from bitmasks instead of per-face AO signatures. On cave-heavy terrain it even beats plain greedy meshing.
+It also does something greedy meshers usually avoid: it merges faces while keeping per-vertex ambient occlusion (AO) exact, without computing a single per-face AO signature.
 
-## Getting Started
+[Quick start](#mesh-your-first-chunk) · [Migration](#switch-from-block-mesh) · [Ambient occlusion](#keep-ambient-occlusion) · [Benchmarks](#benchmarks)
 
-```toml
-[dependencies]
-block-mesh = "0.2"
-block-mesh-bgm = "0.2"
-```
+## Mesh your first chunk
 
-Mesh a padded chunk, then turn each quad into vertices exactly as you would with `block-mesh`:
+In a Rust binary project, run `cargo add block-mesh@0.2 block-mesh-bgm@0.2`. Save this as `src/main.rs` and run `cargo run`. Expect `6 quads`.
 
 ```rust
 use block_mesh::ndshape::{ConstShape, ConstShape3u32};
 use block_mesh::{MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG};
 use block_mesh_bgm::{binary_greedy_quads, BinaryGreedyQuadsBuffer};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Block(bool);
+#[derive(Clone, Copy)]
+struct Block(u8);
 
 impl Voxel for Block {
     fn get_visibility(&self) -> VoxelVisibility {
-        if self.0 { VoxelVisibility::Opaque } else { VoxelVisibility::Empty }
+        if self.0 == 0 {
+            VoxelVisibility::Empty
+        } else {
+            VoxelVisibility::Opaque
+        }
     }
 }
 
 impl MergeVoxel for Block {
-    type MergeValue = bool;
-    fn merge_value(&self) -> bool { self.0 }
-}
+    type MergeValue = u8;
 
-// A 32³ chunk plus one voxel of padding on every side.
-type Chunk = ConstShape3u32<34, 34, 34>;
-
-let mut voxels = [Block(false); Chunk::SIZE as usize];
-for i in 0..Chunk::SIZE {
-    let [x, y, z] = Chunk::delinearize(i);
-    voxels[i as usize] = Block(x * x + y * y + z * z < 30 * 30);
-}
-
-let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
-let mut buffer = BinaryGreedyQuadsBuffer::new();
-binary_greedy_quads(&voxels, &Chunk {}, [0; 3], [33; 3], &faces, &mut buffer);
-
-for (group, face) in buffer.quads.groups.iter().zip(&faces) {
-    for quad in group {
-        let positions = face.quad_mesh_positions(quad, 1.0);
-        let normals = face.quad_mesh_normals();
-        // ...push into your mesh
+    fn merge_value(&self) -> u8 {
+        self.0
     }
+}
+
+fn main() {
+    // 0 is air. The two blocks share material 1.
+    type Chunk = ConstShape3u32<4, 4, 4>;
+    let mut voxels = [Block(0); Chunk::SIZE as usize];
+    voxels[Chunk::linearize([1, 1, 1]) as usize] = Block(1);
+    voxels[Chunk::linearize([2, 1, 1]) as usize] = Block(1);
+
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+    let mut buffer = BinaryGreedyQuadsBuffer::new();
+    binary_greedy_quads(&voxels, &Chunk {}, [0; 3], [3; 3], &faces, &mut buffer);
+
+    println!("{} quads", buffer.quads.num_quads());
 }
 ```
 
-Reuse one buffer per thread; it keeps its allocations between calls. The [API docs](https://docs.rs/block-mesh-bgm) cover choosing a mesher, how it works, and common questions.
+The touching faces disappear, and the four pairs along the sides merge. Change the second block to `Block(2)` to see the same shape take **10 quads** across two materials.
 
-## Switching From `block-mesh`
+The bounds are inclusive and contain one padding voxel at either end of each axis. Only coordinates `1..=2` can emit faces. Fill the padding with neighboring chunk data, using empty voxels where the world ends.
 
-| `block-mesh` | `block-mesh-bgm` | buffer |
+Pair each quad group with its entry in `faces` to build [positions, normals, and indices](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/#build-vertex-buffers).
+
+## Switch from `block-mesh`
+
+| What you need | Mesher | Output buffer |
 | --- | --- | --- |
-| `greedy_quads` | `binary_greedy_quads` | `BinaryGreedyQuadsBuffer` |
-| | `binary_greedy_quads_ao_safe` | `BinaryGreedyQuadsBuffer` |
-| `visible_block_faces` | `binary_visible_block_faces` | `BinaryUnitQuadBuffer` |
+| Replace `greedy_quads` | `binary_greedy_quads` | `BinaryGreedyQuadsBuffer` |
+| Merge faces and keep vertex AO on opaque surfaces | `binary_greedy_quads_ao_safe` | `BinaryGreedyQuadsBuffer` |
+| Replace `visible_block_faces` for one quad per face | `binary_visible_block_faces` | `BinaryUnitQuadBuffer` |
 
-The arguments are identical, and `buffer.quads` is the same `QuadBuffer` (or `UnitQuadBuffer`) you already consume. Three things differ:
+Keep your voxels, shape, bounds, and face config. Call the new buffer’s `new()` without arguments and read `buffer.quads`.
 
-- **Quad partition.** You get exactly the same visible faces as `greedy_quads`, and usually a similar quad count, but not necessarily the same rectangles.
-- **Buffer clearing.** These functions clear their output first. Upstream `visible_block_faces` appends.
-- **Tile seams.** Interiors wider than `62` voxels are meshed in tiles. Visibility and AO stay exact across seams, but quads don't merge across them.
+- **Face coverage stays the same.** Quad layout, count, and order can differ.
+- **Every call clears the output.** If you relied on upstream `visible_block_faces` appending, collect the quads after each call.
+- **Queries tile automatically beyond 62 interior voxels on any axis.** Tiles read their neighbors for visibility and AO. Quads stop at tile seams.
 
-## AO-Safe Greedy Meshing
+Reuse one buffer per worker to retain its allocations.
 
-Greedy meshing and per-vertex ambient occlusion are a famously awkward pair. Merge two faces whose corners should darken differently and the quad smears one shading across both. The usual fix is to compute an AO signature for every visible face and merge only matching signatures, which puts an eight-voxel lookup per face on the hot path.
+## Keep ambient occlusion
 
-`binary_greedy_quads_ao_safe` never computes a signature. It reads the plane just outside each face as bitsets the mesher already has, and sorts a whole row of faces at once into four classes: free to merge, row-only, column-only, or single. Single and one-direction faces are peeled off in bulk on cheap paths, and only the rest goes through the full two-direction merge.
+Greedy meshing and per-vertex AO are a famously awkward pair. A single raised voxel darkens the floor around it, but a big merged quad can only shade its four corners, so the darkening smears or vanishes. The usual fix computes an AO signature for every visible face and merges only matching signatures, which puts an eight-voxel lookup per face on the hot path.
 
-Every quad comes out with uniform AO, and faces still merge wherever AO allows. The speed depends on the scene: on noisy, cave-heavy terrain most faces land in the cheap classes, so it beats plain greedy meshing; on smooth surfaces it costs 15–30% more.
+`binary_greedy_quads_ao_safe` never computes a signature. It reads the plane just outside each face as bitsets the mesher already has, and sorts a whole row of faces at once into four classes: free to merge, row-only, column-only, or single. Single and one-direction faces are peeled off in bulk on cheap paths; only the rest takes the full two-direction merge.
 
-| Case | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
-| --- | ---: | ---: |
-| `layered-caves-2x2x2` | `307.46 µs` | `218.70 µs` |
-| `translucent-mix` | `111.68 µs` | `97.227 µs` |
-| `layered-caves` | `61.785 µs` | `54.398 µs` |
-| `dense-sphere` | `21.005 µs` | `25.067 µs` |
+![Top view of the same floor. Binary greedy uses four floor quads. AO-safe greedy uses twelve and shades the ring around the raised voxel.](docs/ao-quad-layout.png)
 
-Because AO is uniform per quad, you compute it once per final quad with `FaceAoSampler`, not once per voxel face:
+Every opaque quad comes out with uniform AO, so you sample it once per quad with [`FaceAoSampler`](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/struct.FaceAoSampler.html):
 
 ```rust,ignore
-use block_mesh_bgm::{binary_greedy_quads_ao_safe, FaceAoSampler};
-
-binary_greedy_quads_ao_safe(&voxels, &Chunk {}, [0; 3], [33; 3], &faces, &mut buffer);
-
 for (group, face) in buffer.quads.groups.iter().zip(faces) {
     let sampler = FaceAoSampler::for_shape(face, &Chunk {});
     for quad in group {
-        // 0 (dark) ..= 3 (open) per corner, in `quad_corners` order.
-        let vertex_ao = sampler.sample(&voxels, quad.minimum, |block| block.0);
+        // Four values in vertex order, from 0 (dark) to 3 (open).
+        let ao = sampler.sample(&voxels, quad.minimum, |v| v.get_visibility() == VoxelVisibility::Opaque);
     }
 }
 ```
 
-The [API docs](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/#how-ao-safe-merging-works) walk through the four classes, bit by bit.
+On cave-heavy terrain most faces land in the cheap classes, so AO-safe meshing beats plain greedy meshing; on smooth hills it costs more (see [Benchmarks](#benchmarks)). From a checkout, run the demo and press **A** to watch the shading and quad count change:
 
-## Performance
-
-Criterion medians on an Apple M4 (`cargo bench --bench bench`). Cases are `34³` padded chunks unless named otherwise; `layered-caves-2x2x2` is eight chunks, and the large model is a single query spanning several tiles.
-
-| Case | `greedy_quads` | `binary_greedy_quads` | `binary_greedy_quads_ao_safe` |
-| --- | ---: | ---: | ---: |
-| `empty` | `142.58 µs` | `6.7751 µs` | `6.5790 µs` |
-| `uniform-opaque` | `208.41 µs` | `8.7534 µs` | `8.7599 µs` |
-| `dense-sphere` | `263.40 µs` | `21.005 µs` | `25.067 µs` |
-| `translucent-sphere` | `272.40 µs` | `22.850 µs` | `25.788 µs` |
-| `translucent-shell-sphere` | `266.75 µs` | `25.660 µs` | `29.873 µs` |
-| `layered-caves` | `748.59 µs` | `61.785 µs` | `54.398 µs` |
-| `checkerboard` | `668.57 µs` | `59.612 µs` | `59.861 µs` |
-| `partial-extent` | `248.05 µs` | `37.646 µs` | `32.812 µs` |
-| `translucent-mix` | `842.69 µs` | `111.68 µs` | `97.227 µs` |
-| `layered-caves-2x2x2` | `4.1295 ms` | `307.46 µs` | `218.70 µs` |
-| `large-model-130x66x98` | `9.7650 ms` | `1.0241 ms` | `1.0309 ms` |
-
-<details>
-<summary>Unit faces: <code>visible_block_faces</code> vs <code>binary_visible_block_faces</code></summary>
-
-| Case | `visible_block_faces` | `binary_visible_block_faces` |
-| --- | ---: | ---: |
-| `empty` | `17.771 µs` | `6.5473 µs` |
-| `uniform-opaque` | `45.862 µs` | `8.7762 µs` |
-| `dense-sphere` | `40.774 µs` | `15.178 µs` |
-| `translucent-sphere` | `40.034 µs` | `17.084 µs` |
-| `translucent-shell-sphere` | `38.424 µs` | `19.168 µs` |
-| `layered-caves` | `77.080 µs` | `26.138 µs` |
-| `checkerboard` | `72.494 µs` | `49.611 µs` |
-| `partial-extent` | `35.326 µs` | `14.392 µs` |
-| `translucent-mix` | `79.057 µs` | `38.860 µs` |
-| `layered-caves-2x2x2` | `659.23 µs` | `124.67 µs` |
-| `large-model-130x66x98` | `2.1078 ms` | `528.96 µs` |
-
-</details>
-
-## Examples
-
-The workspace's `examples_crate` has three Bevy demos:
-
-```text
-cargo run -p block-mesh-bgm-examples --example render           # all meshers side by side, with quad counts
-cargo run -p block-mesh-bgm-examples --example ambient_occlusion  # AO-safe quad layouts on a sphere and torus
-cargo run -p block-mesh-bgm-examples --example custom_meshing     # head-to-head in a bevy_voxel_world scene
+```sh
+cargo run --release -p block-mesh-bgm-examples --example ambient_occlusion
 ```
+
+## Benchmarks
+
+Criterion medians on an Apple M4 with reused buffers. Timings cover meshing only.
+
+| Scene | `greedy_quads` | Binary greedy | AO-safe greedy |
+| --- | ---: | ---: | ---: |
+| Dense sphere · one `34³` padded chunk | 250 µs | 21 µs | 24 µs |
+| Smooth hills · four chunks | 887 µs | 70 µs | 92 µs |
+| Layered caves · eight chunks | 3.77 ms | 304 µs | 216 µs |
+| Large model · one `130×66×98` padded query | 9.39 ms | 1.03 ms | 1.03 ms |
+
+AO-safe merging adds work on the smooth hills, where slopes split many quads for AO; in the caves most faces take its cheaper merge paths. For unit faces on the hills, `binary_visible_block_faces` took 60 µs versus 139 µs for `visible_block_faces`.
+
+Run `cargo bench --bench bench` for the full suite. Add `-- smooth-hills` to focus on the hills. The table used 50 samples, a 1-second warm-up, and a 2-second measurement target per case.
+
+## More examples
+
+From a checkout, run `cargo run --release -p block-mesh-bgm-examples --example <name>`.
+
+| Demo | What to try |
+| --- | --- |
+| [`render`](examples_crate/render/main.rs) | Compare quad counts across meshers. Press **Space** to toggle wireframes and **T** to change scenes. |
+| [`ambient_occlusion`](examples_crate/ambient_occlusion/main.rs) | Press **U** to compare with unit faces and **S** to swap the sphere for a torus. |
+| [`custom_meshing`](examples_crate/custom_meshing/main.rs) | Watch chunk rebuild timings as the camera flies through a `bevy_voxel_world` scene. Press **1**, **2**, or **3** to switch meshers. |
 
 ## License
 
-MIT or Apache-2.0, at your option — the same as `block-mesh`.
+[MIT](LICENSE.MIT) or [Apache-2.0](LICENSE.Apache-2.0), at your option.

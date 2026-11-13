@@ -1,19 +1,23 @@
 //! Per-quad vertex ambient occlusion for meshes from
 //! [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe).
 //!
-//! AO-safe meshing guarantees that every unit face inside a merged quad has
-//! the same four vertex AO values. Rendering therefore only needs to sample
-//! the eight voxels around one face of each final quad, not every voxel.
+//! For a merged opaque quad, AO-safe meshing preserves the four corner
+//! values of its unit faces. Sample the eight neighbors of one unit face to
+//! get the values for the whole quad.
 
 use block_mesh::{OrientedBlockFace, UnorientedQuad};
 use ndshape::Shape;
 
-/// Computes per-vertex ambient occlusion for the quads of one face
-/// orientation.
+/// Samples the four ambient occlusion values for a face orientation.
 ///
-/// Build one sampler per face group, outside the quad loop. It precomputes
-/// where the eight voxels around a face sit in memory, so each
-/// [`sample`](Self::sample) is eight loads and a table lookup.
+/// Build one sampler per face group and voxel layout, outside the quad loop.
+/// Each [`sample`](Self::sample) reads eight neighbors using precomputed
+/// offsets, then looks up their four corner values.
+///
+/// # Example
+///
+/// A pillar darkens the floor around its base. The loop samples each output
+/// quad once and reads its four values in vertex order.
 ///
 /// ```
 /// # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
@@ -49,7 +53,9 @@ use ndshape::Shape;
 ///     let sampler = FaceAoSampler::for_shape(face, &Chunk {});
 ///     for quad in group {
 ///         // 0 (dark) ..= 3 (open) per corner, in `quad_corners` order.
-///         let vertex_ao = sampler.sample(&voxels, quad.minimum, |block| block.0);
+///         let vertex_ao = sampler.sample(&voxels, quad.minimum, |block| {
+///             block.get_visibility() == VoxelVisibility::Opaque
+///         });
 ///         darkened += vertex_ao.iter().filter(|&&ao| ao < 3).count();
 ///     }
 /// }
@@ -128,21 +134,22 @@ impl FaceAoSampler {
         }
     }
 
-    /// Returns the four corner AO values of the quad whose source voxel is
-    /// `minimum`, in [`OrientedBlockFace::quad_corners`] order.
+    /// Samples the unit face at `minimum` and returns its four AO values in
+    /// [`OrientedBlockFace::quad_corners`] order.
     ///
-    /// Each value runs from `0` (fully occluded) to `3` (open), by the
-    /// standard voxel AO rule: two occluding sides make a corner fully dark
-    /// whatever the diagonal. `is_opaque` decides which voxels occlude.
+    /// Each value ranges from `0` (fully occluded) to `3` (open). Two
+    /// occluding sides make a corner fully dark regardless of the diagonal.
     ///
-    /// For a merged quad, this is exact only if the quad came from
-    /// [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe).
+    /// To shade a merged opaque quad from
+    /// [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe), pass
+    /// its `quad.minimum` and use `is_opaque` to identify voxels with
+    /// [`block_mesh::VoxelVisibility::Opaque`], just as the mesher does.
     ///
     /// # Panics
     ///
-    /// Panics if any of the eight neighbours lies outside `voxels`. Meshing
-    /// requires a one-voxel border, so quads from a padded query always have
-    /// their whole neighbourhood in bounds.
+    /// Panics if a neighbor offset would index outside `voxels`. Use the same
+    /// padded voxel array and layout that produced the quad so all eight
+    /// neighbors are present.
     #[inline]
     pub fn sample<T>(
         &self,
