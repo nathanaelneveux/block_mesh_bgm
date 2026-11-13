@@ -90,10 +90,10 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins.set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(WgpuSettings {
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                     features: WgpuFeatures::POLYGON_MODE_LINE,
                     ..default()
-                }),
+                })),
                 ..default()
             }),
             WireframePlugin::default(),
@@ -101,6 +101,7 @@ fn main() {
         .insert_resource(WireframeConfig {
             global: false,
             default_color: BLACK.into(),
+            ..default()
         })
         .add_systems(Startup, setup)
         .add_systems(
@@ -134,7 +135,7 @@ fn setup(
     let camera = spawn_camera(&mut commands);
     apply_transparency_mode(
         &mut commands,
-        materials
+        &mut materials
             .get_mut(&surface_material)
             .expect("shared surface material should remain valid"),
         camera,
@@ -260,7 +261,7 @@ fn spawn_lights(commands: &mut Commands) {
     commands.spawn((
         DirectionalLight {
             color: WHITE.into(),
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             illuminance: 16_000.0,
             ..default()
         },
@@ -337,7 +338,7 @@ fn toggle_transparency_mode(
         scene.transparency = scene.transparency.next();
         apply_transparency_mode(
             &mut commands,
-            materials
+            &mut materials
                 .get_mut(&scene.material)
                 .expect("shared surface material should remain valid"),
             scene.camera,

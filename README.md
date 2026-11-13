@@ -141,13 +141,13 @@ Run `cargo bench --bench bench` for the full suite. Add `-- smooth-hills` to foc
 
 ## More examples
 
-From a checkout, run `cargo run --release -p block-mesh-bgm-examples --example <name>`.
+From a checkout, run `cargo run --release -p block-mesh-bgm-examples --example <name>`. The demos use Bevy 0.20, which needs Rust 1.97.1 or newer.
 
 | Demo | What to try |
 | --- | --- |
 | [`render`](examples_crate/render/main.rs) | Compare quad counts across meshers. Press **Space** to toggle wireframes and **T** to change scenes. |
 | [`ambient_occlusion`](examples_crate/ambient_occlusion/main.rs) | Press **U** to compare with unit faces and **S** to swap the sphere for a torus. |
-| [`custom_meshing`](examples_crate/custom_meshing/main.rs) | Watch chunk rebuild timings as the camera flies through a `bevy_voxel_world` scene. Press **1**, **2**, or **3** to switch meshers. |
+| [`custom_meshing`](examples_crate/custom_meshing/main.rs) | Watch chunk rebuild timings as the camera flies through a `bevy_voxel_world` scene. Press **1**–**4** to switch meshers, including `bevy_voxel_world`'s built-in one, and **A** to toggle AO. |
 
 ## License
 

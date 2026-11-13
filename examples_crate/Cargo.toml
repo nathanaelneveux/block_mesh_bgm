@@ -2,11 +2,13 @@
 name = "block-mesh-bgm-examples"
 version = "0.2.1"
 edition = "2021"
+# Bevy 0.20 requires Rust 1.97.1.
+rust-version = "1.97.1"
 publish = false
 
 [dependencies]
-bevy = "0.18"
-bevy_voxel_world = "0.15.1"
+bevy = "0.20"
+bevy_voxel_world = "0.19"
 block-mesh = "0.2"
 block-mesh-bgm = { path = ".." }
 ndshape = "0.3"

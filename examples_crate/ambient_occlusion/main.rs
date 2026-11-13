@@ -79,10 +79,10 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins.set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(WgpuSettings {
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                     features: WgpuFeatures::POLYGON_MODE_LINE,
                     ..default()
-                }),
+                })),
                 ..default()
             }),
             WireframePlugin::default(),
@@ -90,6 +90,7 @@ fn main() {
         .insert_resource(WireframeConfig {
             global: true,
             default_color: BLACK.into(),
+            ..default()
         })
         .add_systems(Startup, setup)
         .add_systems(Update, toggle_ambient_occlusion_viewer)
@@ -344,7 +345,7 @@ fn spawn_lights(commands: &mut Commands) {
     commands.spawn((
         DirectionalLight {
             color: WHITE.into(),
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             illuminance: 16_000.0,
             ..default()
         },
