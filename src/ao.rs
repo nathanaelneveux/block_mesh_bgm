@@ -18,373 +18,177 @@
 use block_mesh::{MergeVoxel, UnorientedQuad};
 
 use crate::bit_mask;
-use crate::context::{MeshingContext, SlicePlan};
-use crate::face::{write_quad, write_unit_quad, FaceAxes};
-use crate::merge::{
-    build_continue_mask, emit_mixed_row_runs, emit_single_row_runs, emit_terminal_row_runs,
-    emit_unit_slice, reset_carry_runs,
-};
-use crate::prep::{column_row_layout, FaceSliceMasks};
+use crate::merge::{emit_unit_slice, merge_rows, FaceJob, SliceGeometry};
+use crate::prep::column_row_layout;
 
-/// Reusable scratch that only AO-safe meshing needs.
-#[derive(Default)]
-pub(crate) struct AoScratch {
-    // Visible cells whose exterior occupancy forces a 1x1 quad.
-    unit_rows: Vec<u64>,
-    // Visible cells that may only merge along the packed row axis.
-    horizontal_rows: Vec<u64>,
-    // Visible cells that may only merge from row to row, always at width 1.
-    vertical_rows: Vec<u64>,
-    // Visible cells that are still free to use the normal bidirectional greedy
-    // merge after the stricter AO-only cases are peeled away.
-    bidir_rows: Vec<u64>,
-    carry_runs: Vec<u8>,
-}
-
-const AO_UNIT_ROWS: u8 = 1 << 0;
-const AO_HORIZONTAL_ROWS: u8 = 1 << 1;
-const AO_VERTICAL_ROWS: u8 = 1 << 2;
-const AO_BIDIR_ROWS: u8 = 1 << 3;
-
-/// Merges one face slice with AO-safe merge restrictions.
+/// Merges the faces of one orientation with AO-safe merge restrictions.
 #[inline(always)]
-pub(crate) fn mesh_face_rows_ao_safe<T>(
-    voxels: &[T],
-    context: &MeshingContext,
-    slice: SlicePlan,
-    visible_rows: &[u64],
-    slice_masks: FaceSliceMasks,
-    axes: FaceAxes,
-    opaque_cols: &[u64],
-    scratch: &mut AoScratch,
+pub(crate) fn mesh_face_ao_safe<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+    job: &FaceJob<'_, T>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    match (axes.n_axis, slice.bit_axis == axes.u_axis) {
-        (0, false) => mesh_face_rows_ao_safe_impl::<T, 0, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        (0, true) => mesh_face_rows_ao_safe_impl::<T, 0, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        (1, false) => mesh_face_rows_ao_safe_impl::<T, 1, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        (1, true) => mesh_face_rows_ao_safe_impl::<T, 1, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        (2, false) => mesh_face_rows_ao_safe_impl::<T, 2, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        (2, true) => mesh_face_rows_ao_safe_impl::<T, 2, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            axes,
-            opaque_cols,
-            scratch,
-            quads,
-        ),
-        _ => unreachable!(),
-    }
-}
-
-#[inline(always)]
-fn mesh_face_rows_ao_safe_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    context: &MeshingContext,
-    slice: SlicePlan,
-    visible_rows: &[u64],
-    slice_masks: FaceSliceMasks,
-    axes: FaceAxes,
-    opaque_cols: &[u64],
-    scratch: &mut AoScratch,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    if slice_masks.active == slice_masks.unit_only {
-        if slice_masks.active == bit_mask(0, slice.n_len) {
-            for n_local in 0..slice.n_len {
-                let row_start = n_local * slice.outer_len;
-                emit_unit_slice::<N_AXIS>(
-                    context.interior_min,
-                    slice.outer_axis,
-                    slice.bit_axis,
-                    context.interior_min[N_AXIS] + n_local as u32,
-                    &visible_rows[row_start..row_start + slice.outer_len],
-                    quads,
-                );
-            }
-        } else {
-            let mut active_slices = slice_masks.active;
-            while active_slices != 0 {
-                let n_local = active_slices.trailing_zeros() as usize;
-                active_slices &= active_slices - 1;
-                let row_start = n_local * slice.outer_len;
-                emit_unit_slice::<N_AXIS>(
-                    context.interior_min,
-                    slice.outer_axis,
-                    slice.bit_axis,
-                    context.interior_min[N_AXIS] + n_local as u32,
-                    &visible_rows[row_start..row_start + slice.outer_len],
-                    quads,
-                );
-            }
-        }
-        return;
-    }
-
-    let n_base = context.interior_min[N_AXIS];
-    let outer_base = context.interior_min[slice.outer_axis];
-    let bit_base = context.interior_min[slice.bit_axis];
-    let outer_stride = context.strides[slice.outer_axis];
-    let bit_stride = context.strides[slice.bit_axis];
-
-    for n_local in 0..slice.n_len {
-        let slice_bit = 1u64 << n_local;
-        if slice_masks.active & slice_bit == 0 {
-            continue;
+    job.for_each_active_slice(|n_local, rows, unit_only| {
+        let geometry = SliceGeometry::new::<T, N_AXIS>(job, n_local);
+        if unit_only {
+            emit_unit_slice::<N_AXIS>(&geometry, rows, quads);
+            return;
         }
 
-        let row_start = n_local * slice.outer_len;
-        let slice_rows = &visible_rows[row_start..row_start + slice.outer_len];
-        let n_coord = n_base + n_local as u32;
-        if slice_masks.unit_only & slice_bit != 0 {
-            emit_unit_slice::<N_AXIS>(
-                context.interior_min,
-                slice.outer_axis,
-                slice.bit_axis,
-                n_coord,
-                slice_rows,
+        // Emit the AO classes in increasing order of generality. Each class
+        // reuses the shared row merger with only its legal directions enabled.
+        let classes = AoRowClasses::build::<N_AXIS, T>(job, n_local, rows);
+        let len = rows.len();
+        let voxels = job.voxels;
+        if classes.unit_union != 0 {
+            emit_unit_slice::<N_AXIS>(&geometry, &classes.unit[..len], quads);
+        }
+        if classes.horizontal_union != 0 {
+            merge_rows::<T, N_AXIS, BIT_IS_U, true, false>(
+                voxels,
+                &geometry,
+                &classes.horizontal[..len],
                 quads,
             );
-            continue;
         }
+        if classes.vertical_union != 0 {
+            merge_rows::<T, N_AXIS, BIT_IS_U, false, true>(
+                voxels,
+                &geometry,
+                &classes.vertical[..len],
+                quads,
+            );
+        }
+        if classes.bidir_union != 0 {
+            merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(
+                voxels,
+                &geometry,
+                &classes.bidir[..len],
+                quads,
+            );
+        }
+    });
+}
 
-        let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
+/// The visible cells of one face slice, split by the merge directions that
+/// remain legal once AO boundaries are respected.
+struct AoRowClasses {
+    /// Cells whose exterior occupancy forces a `1x1` quad.
+    unit: [u64; 64],
+    /// Cells that may only merge along the packed row axis.
+    horizontal: [u64; 64],
+    /// Cells that may only merge from row to row, always at width 1.
+    vertical: [u64; 64],
+    /// Cells still free to use the normal bidirectional greedy merge. This
+    /// includes every translucent face, which keeps vanilla merge behaviour.
+    bidir: [u64; 64],
+    unit_union: u64,
+    horizontal_union: u64,
+    vertical_union: u64,
+    bidir_union: u64,
+}
 
-        let populated_masks = build_slice_ao_masks(
-            context.query_shape,
+impl AoRowClasses {
+    /// Classifies every visible cell of the slice at `n_local`.
+    ///
+    /// AO-safe meshing only cares about opaque occupancy in the plane just
+    /// outside the visible face. From that outside plane we can derive, a row
+    /// at a time, whether a visible cell must stay a unit quad, may only merge
+    /// within its row, may only merge across rows at width 1, or is
+    /// unconstrained. This avoids carrying a per-cell AO signature through the
+    /// merge loop.
+    #[inline(always)]
+    fn build<const N_AXIS: usize, T>(job: &FaceJob<'_, T>, n_local: usize, rows: &[u64]) -> Self {
+        let slice = job.slice;
+        let mut classes = Self {
+            unit: [0; 64],
+            horizontal: [0; 64],
+            vertical: [0; 64],
+            bidir: [0; 64],
+            unit_union: 0,
+            horizontal_union: 0,
+            vertical_union: 0,
+            bidir_union: 0,
+        };
+
+        let interior_bit_mask = bit_mask(0, slice.bit_len);
+        let padded_bit_mask = bit_mask(0, slice.bit_len + 2);
+        let interior_padded_mask = bit_mask(1, slice.bit_len);
+        let (base_offset, n_stride, outer_stride) = column_row_layout(
+            job.context.query_shape,
+            slice.bit_axis,
             N_AXIS,
-            slice,
-            n_local,
-            axes.n_sign,
-            opaque_cols,
-            slice_rows,
-            &mut scratch.unit_rows,
-            &mut scratch.horizontal_rows,
-            &mut scratch.vertical_rows,
-            &mut scratch.bidir_rows,
+            slice.outer_axis,
         );
-        // Emit the AO-constrained rows in increasing order of generality. The
-        // first three avoid the full carry kernel entirely; only the residual
-        // bidirectionally mergeable rows need the same greedy row merger shape
-        // as vanilla meshing.
-        if populated_masks & AO_UNIT_ROWS != 0 {
-            emit_unit_rows::<N_AXIS>(
-                &scratch.unit_rows[..slice.outer_len],
-                n_coord,
-                outer_base,
-                bit_base,
-                quads,
+        let source_n = n_local + 1;
+        let outside_n = if job.n_sign < 0 {
+            source_n - 1
+        } else {
+            source_n + 1
+        };
+        // `base_offset` already skips the padding row, so `base + outer_local
+        // * outer_stride` is the column under interior row `outer_local`, and
+        // its neighbours along the outer axis are one `outer_stride` away.
+        let source_base = base_offset + source_n * n_stride;
+        let outside_base = base_offset + outside_n * n_stride;
+        let column =
+            |base: usize, outer_local: usize| job.opaque_cols[base + outer_local * outer_stride];
+
+        for (outer_local, &row_bits) in rows.iter().enumerate() {
+            if row_bits == 0 {
+                continue;
+            }
+
+            let visible_padded = (row_bits << 1) & interior_padded_mask;
+            let source_opaque = column(source_base, outer_local) & interior_padded_mask;
+            let opaque_visible = visible_padded & source_opaque;
+
+            if opaque_visible == 0 {
+                // Translucent and empty-visible faces do not participate in the
+                // AO rule set. They keep the vanilla merge behaviour.
+                classes.bidir[outer_local] = row_bits;
+                classes.bidir_union |= row_bits;
+                continue;
+            }
+
+            let prev_row = column(outside_base - outer_stride, outer_local) & padded_bit_mask;
+            let current_row = column(outside_base, outer_local) & padded_bit_mask;
+            let next_row = column(outside_base + outer_stride, outer_local) & padded_bit_mask;
+            let (unit, horizontal, vertical) = classify_ao_opaque_row(
+                opaque_visible,
+                prev_row,
+                current_row,
+                next_row,
+                interior_padded_mask,
             );
+
+            let unit = (unit >> 1) & interior_bit_mask;
+            let horizontal = (horizontal >> 1) & interior_bit_mask;
+            let vertical = (vertical >> 1) & interior_bit_mask;
+            let bidir = row_bits & !(unit | horizontal | vertical);
+
+            classes.unit[outer_local] = unit;
+            classes.horizontal[outer_local] = horizontal;
+            classes.vertical[outer_local] = vertical;
+            classes.bidir[outer_local] = bidir;
+            classes.unit_union |= unit;
+            classes.horizontal_union |= horizontal;
+            classes.vertical_union |= vertical;
+            classes.bidir_union |= bidir;
         }
-        if populated_masks & AO_HORIZONTAL_ROWS != 0 {
-            emit_horizontal_rows::<T, N_AXIS, BIT_IS_U>(
-                voxels,
-                &scratch.horizontal_rows[..slice.outer_len],
-                n_index_base,
-                outer_stride,
-                bit_stride,
-                slice.bit_len,
-                n_coord,
-                outer_base,
-                bit_base,
-                quads,
-            );
-        }
-        if populated_masks & AO_VERTICAL_ROWS != 0 {
-            emit_vertical_rows::<T, N_AXIS, BIT_IS_U>(
-                voxels,
-                &scratch.vertical_rows[..slice.outer_len],
-                n_index_base,
-                outer_stride,
-                bit_stride,
-                slice.bit_len,
-                n_coord,
-                outer_base,
-                bit_base,
-                &mut scratch.carry_runs,
-                quads,
-            );
-        }
-        if populated_masks & AO_BIDIR_ROWS != 0 {
-            mesh_bidir_rows::<T, N_AXIS, BIT_IS_U>(
-                voxels,
-                &scratch.bidir_rows[..slice.outer_len],
-                n_index_base,
-                outer_stride,
-                bit_stride,
-                slice.bit_len,
-                n_coord,
-                outer_base,
-                bit_base,
-                &mut scratch.carry_runs,
-                quads,
-            );
-        }
+
+        classes
     }
 }
 
-#[inline(always)]
-fn build_slice_ao_masks(
-    query_shape: [usize; 3],
-    n_axis: usize,
-    slice: SlicePlan,
-    n_local: usize,
-    face_sign: i32,
-    opaque_cols: &[u64],
-    slice_rows: &[u64],
-    unit_rows: &mut Vec<u64>,
-    horizontal_rows: &mut Vec<u64>,
-    vertical_rows: &mut Vec<u64>,
-    bidir_rows: &mut Vec<u64>,
-) -> u8 {
-    // AO-safe meshing only cares about opaque occupancy in the plane just
-    // outside the visible face. From that outside plane we can derive, a row at
-    // a time, whether a visible cell:
-    //
-    // - must stay a unit quad
-    // - may only merge within its current row
-    // - may only merge across rows at width 1
-    // - or is unconstrained enough to fall back to the normal carry merge
-    //
-    // This avoids carrying a per-cell AO signature through the merge loop.
-    reset_mask_rows(unit_rows, slice.outer_len);
-    reset_mask_rows(horizontal_rows, slice.outer_len);
-    reset_mask_rows(vertical_rows, slice.outer_len);
-    reset_mask_rows(bidir_rows, slice.outer_len);
-
-    let interior_bit_mask = bit_mask(0, slice.bit_len);
-    let padded_bit_mask = bit_mask(0, slice.bit_len + 2);
-    let interior_padded_mask = bit_mask(1, slice.bit_len);
-    let (base_offset, n_stride, column_outer_stride) =
-        column_row_layout(query_shape, slice.bit_axis, n_axis, slice.outer_axis);
-    let source_n = n_local + 1;
-    let outside_n = if face_sign < 0 {
-        source_n - 1
-    } else {
-        source_n + 1
-    };
-    let source_base = base_offset + source_n * n_stride;
-    let outside_base = base_offset + outside_n * n_stride;
-    let mut unit_union = 0;
-    let mut horizontal_union = 0;
-    let mut vertical_union = 0;
-    let mut bidir_union = 0;
-
-    for (outer_local, &row_bits) in slice_rows.iter().enumerate() {
-        if row_bits == 0 {
-            continue;
-        }
-
-        let visible_padded = (row_bits << 1) & interior_padded_mask;
-        let source_opaque =
-            opaque_cols[source_base + outer_local * column_outer_stride] & interior_padded_mask;
-        let opaque_visible = visible_padded & source_opaque;
-
-        if opaque_visible == 0 {
-            // Translucent and empty-visible faces do not participate in the AO
-            // rule set. They keep the vanilla merge behavior.
-            bidir_rows[outer_local] = row_bits;
-            bidir_union |= row_bits;
-            continue;
-        }
-
-        let current_row =
-            opaque_cols[outside_base + outer_local * column_outer_stride] & padded_bit_mask;
-        let prev_row = opaque_cols
-            [outside_base + outer_local * column_outer_stride - column_outer_stride]
-            & padded_bit_mask;
-        let next_row = opaque_cols
-            [outside_base + outer_local * column_outer_stride + column_outer_stride]
-            & padded_bit_mask;
-
-        // Classify the visible opaque bits by the merge directions that remain
-        // legal once AO boundaries are respected.
-        let (unit, horizontal, vertical) = classify_ao_opaque_row(
-            opaque_visible,
-            prev_row,
-            current_row,
-            next_row,
-            interior_padded_mask,
-        );
-
-        let unit = (unit >> 1) & interior_bit_mask;
-        let horizontal = (horizontal >> 1) & interior_bit_mask;
-        let vertical = (vertical >> 1) & interior_bit_mask;
-        let bidir = row_bits & !(unit | horizontal | vertical);
-
-        unit_rows[outer_local] = unit;
-        horizontal_rows[outer_local] = horizontal;
-        vertical_rows[outer_local] = vertical;
-        bidir_rows[outer_local] = bidir;
-        unit_union |= unit;
-        horizontal_union |= horizontal;
-        vertical_union |= vertical;
-        bidir_union |= bidir;
-    }
-
-    (u8::from(unit_union != 0) * AO_UNIT_ROWS)
-        | (u8::from(horizontal_union != 0) * AO_HORIZONTAL_ROWS)
-        | (u8::from(vertical_union != 0) * AO_VERTICAL_ROWS)
-        | (u8::from(bidir_union != 0) * AO_BIDIR_ROWS)
-}
-
+/// Classifies the visible opaque cells of one row by the merge directions AO
+/// still allows. All inputs are in padded bit coordinates.
+///
+/// `prev_row`, `current_row`, and `next_row` are opaque occupancy in the
+/// exterior plane, one row before, at, and after the visible row. Returns
+/// `(unit, horizontal, vertical)`; any opaque visible cell in none of them is
+/// free to merge in both directions.
 #[inline(always)]
 fn classify_ao_opaque_row(
     opaque_visible: u64,
@@ -433,348 +237,6 @@ fn classify_ao_opaque_row(
         & interior_bit_mask;
 
     (unit, horizontal, vertical)
-}
-
-#[inline(always)]
-fn emit_unit_rows<const N_AXIS: usize>(
-    rows: &[u64],
-    n_coord: u32,
-    outer_base: u32,
-    bit_base: u32,
-    quads: &mut Vec<UnorientedQuad>,
-) {
-    for (outer_local, &row_bits) in rows.iter().enumerate() {
-        if row_bits == 0 {
-            continue;
-        }
-
-        emit_single_row_unit_quads::<N_AXIS>(
-            row_bits,
-            n_coord,
-            outer_base + outer_local as u32,
-            bit_base,
-            quads,
-        );
-    }
-}
-
-#[inline(always)]
-fn emit_horizontal_rows<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    rows: &[u64],
-    n_index_base: usize,
-    outer_stride: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_base: u32,
-    bit_base: u32,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    for (outer_local, &row_bits) in rows.iter().enumerate() {
-        if row_bits == 0 {
-            continue;
-        }
-
-        emit_single_row_runs::<T, N_AXIS, BIT_IS_U>(
-            voxels,
-            row_bits,
-            n_index_base + outer_local * outer_stride,
-            bit_stride,
-            bit_len,
-            n_coord,
-            outer_base + outer_local as u32,
-            bit_base,
-            quads,
-        );
-    }
-}
-
-#[inline(always)]
-fn emit_vertical_rows<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    rows: &[u64],
-    n_index_base: usize,
-    outer_stride: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_base: u32,
-    bit_base: u32,
-    carry_runs: &mut Vec<u8>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    // These rows are only allowed to continue from one row to the next. Since
-    // width can never grow, the carry state only tracks height and this path is
-    // much cheaper than the general greedy kernel.
-    reset_carry_runs(carry_runs, bit_len);
-    let mut has_incoming_carry = false;
-
-    for outer_local in 0..rows.len() {
-        let row_bits = rows[outer_local];
-        if row_bits == 0 {
-            has_incoming_carry = false;
-            continue;
-        }
-
-        let next_row_bits = if outer_local + 1 < rows.len() {
-            rows[outer_local + 1]
-        } else {
-            0
-        };
-        let row_base_index = n_index_base + outer_local * outer_stride;
-        let overlapping_bits = row_bits & next_row_bits;
-
-        if overlapping_bits == 0 {
-            if has_incoming_carry {
-                emit_carried_row_unit_quads::<N_AXIS, BIT_IS_U>(
-                    row_bits,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    carry_runs,
-                    quads,
-                );
-            } else {
-                emit_single_row_unit_quads::<N_AXIS>(
-                    row_bits,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    quads,
-                );
-            }
-            has_incoming_carry = false;
-            continue;
-        }
-
-        let continue_mask = build_continue_mask(
-            voxels,
-            overlapping_bits,
-            row_base_index,
-            bit_stride,
-            outer_stride,
-            carry_runs,
-        );
-
-        let ended_bits = row_bits & !continue_mask;
-        if ended_bits != 0 {
-            if has_incoming_carry {
-                emit_carried_row_unit_quads::<N_AXIS, BIT_IS_U>(
-                    ended_bits,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    carry_runs,
-                    quads,
-                );
-            } else {
-                emit_single_row_unit_quads::<N_AXIS>(
-                    ended_bits,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    quads,
-                );
-            }
-        }
-
-        has_incoming_carry = continue_mask != 0;
-    }
-}
-
-#[inline(always)]
-fn mesh_bidir_rows<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    rows: &[u64],
-    n_index_base: usize,
-    outer_stride: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_base: u32,
-    bit_base: u32,
-    carry_runs: &mut Vec<u8>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    // These rows are the residual case: nothing in the exterior-plane AO masks
-    // proves that they must stay unit-width or row-local, so they can reuse
-    // the same bidirectional carry merge shape as the vanilla path.
-    reset_carry_runs(carry_runs, bit_len);
-    let mut has_incoming_carry = false;
-
-    for outer_local in 0..rows.len() {
-        let row_bits = rows[outer_local];
-        if row_bits == 0 {
-            has_incoming_carry = false;
-            continue;
-        }
-
-        let next_row_bits = if outer_local + 1 < rows.len() {
-            rows[outer_local + 1]
-        } else {
-            0
-        };
-        let row_base_index = n_index_base + outer_local * outer_stride;
-        let overlapping_bits = row_bits & next_row_bits;
-
-        if overlapping_bits == 0 {
-            if has_incoming_carry {
-                emit_terminal_row_runs::<T, N_AXIS, BIT_IS_U>(
-                    voxels,
-                    row_bits,
-                    row_base_index,
-                    bit_stride,
-                    bit_len,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    carry_runs,
-                    quads,
-                );
-            } else {
-                emit_single_row_runs::<T, N_AXIS, BIT_IS_U>(
-                    voxels,
-                    row_bits,
-                    row_base_index,
-                    bit_stride,
-                    bit_len,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    quads,
-                );
-            }
-            has_incoming_carry = false;
-            continue;
-        }
-
-        let continue_mask = build_continue_mask(
-            voxels,
-            overlapping_bits,
-            row_base_index,
-            bit_stride,
-            outer_stride,
-            carry_runs,
-        );
-
-        let ended_bits = row_bits & !continue_mask;
-        if !has_incoming_carry {
-            if ended_bits != 0 {
-                emit_single_row_runs::<T, N_AXIS, BIT_IS_U>(
-                    voxels,
-                    ended_bits,
-                    row_base_index,
-                    bit_stride,
-                    bit_len,
-                    n_coord,
-                    outer_base + outer_local as u32,
-                    bit_base,
-                    quads,
-                );
-            }
-            has_incoming_carry = continue_mask != 0;
-            continue;
-        }
-
-        if ended_bits == 0 {
-            has_incoming_carry = continue_mask != 0;
-            continue;
-        }
-
-        emit_mixed_row_runs::<T, N_AXIS, BIT_IS_U>(
-            voxels,
-            ended_bits,
-            row_base_index,
-            bit_stride,
-            bit_len,
-            n_coord,
-            outer_base + outer_local as u32,
-            bit_base,
-            carry_runs,
-            quads,
-        );
-        has_incoming_carry = continue_mask != 0;
-    }
-}
-
-#[inline(always)]
-fn emit_single_row_unit_quads<const N_AXIS: usize>(
-    mut row_bits: u64,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_base: u32,
-    quads: &mut Vec<UnorientedQuad>,
-) {
-    let quad_count = row_bits.count_ones() as usize;
-    let base_len = quads.len();
-    quads.reserve(quad_count);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
-
-    while row_bits != 0 {
-        let bit_local = row_bits.trailing_zeros() as usize;
-        row_bits &= row_bits - 1;
-        write_unit_quad::<N_AXIS>(
-            &mut spare[written],
-            n_coord,
-            outer_coord,
-            bit_base + bit_local as u32,
-        );
-        written += 1;
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
-}
-
-#[inline(always)]
-fn emit_carried_row_unit_quads<const N_AXIS: usize, const BIT_IS_U: bool>(
-    mut row_bits: u64,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_base: u32,
-    carry_runs: &mut [u8],
-    quads: &mut Vec<UnorientedQuad>,
-) {
-    let quad_count = row_bits.count_ones() as usize;
-    let base_len = quads.len();
-    quads.reserve(quad_count);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
-
-    while row_bits != 0 {
-        let bit_local = row_bits.trailing_zeros() as usize;
-        row_bits &= row_bits - 1;
-        let run_carry = carry_runs[bit_local] as u32;
-        write_quad::<N_AXIS, BIT_IS_U>(
-            &mut spare[written],
-            n_coord,
-            outer_coord - run_carry,
-            bit_base + bit_local as u32,
-            1,
-            run_carry + 1,
-        );
-        carry_runs[bit_local] = 0;
-        written += 1;
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
-}
-
-#[inline(always)]
-fn reset_mask_rows(rows: &mut Vec<u64>, len: usize) {
-    rows.resize(len, 0);
-    rows.fill(0);
 }
 
 #[cfg(test)]

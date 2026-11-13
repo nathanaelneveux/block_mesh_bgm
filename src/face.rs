@@ -8,8 +8,6 @@
 //! - whether the caller's face belongs to the negative or positive sign of that
 //!   normal axis
 
-use std::mem::MaybeUninit;
-
 use block_mesh::{OrientedBlockFace, SignedAxis, UnorientedQuad};
 
 /// The parts of an `OrientedBlockFace` that matter to the binary mesher.
@@ -72,16 +70,18 @@ pub(crate) fn scan_axes(n_axis: usize) -> (usize, usize) {
     }
 }
 
-/// Writes one merged quad using the mesher's internal axis naming.
+/// Builds one quad from the mesher's internal axis naming.
+///
+/// `run_width` is measured along the packed bit axis and `run_length` along
+/// the outer axis; `BIT_IS_U` says which of those is the face's `u` axis.
 #[inline(always)]
-pub(crate) fn write_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
-    quad: &mut MaybeUninit<UnorientedQuad>,
+pub(crate) fn oriented_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
     n_coord: u32,
     outer_coord: u32,
     bit_coord: u32,
     run_width: u32,
     run_length: u32,
-) {
+) -> UnorientedQuad {
     let minimum = match N_AXIS {
         0 => [n_coord, bit_coord, outer_coord],
         1 => [bit_coord, n_coord, outer_coord],
@@ -94,30 +94,29 @@ pub(crate) fn write_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
         (run_length, run_width)
     };
 
-    quad.write(UnorientedQuad {
+    UnorientedQuad {
         minimum,
         width,
         height,
-    });
+    }
 }
 
-/// Writes a `1x1` quad in the same coordinate convention as [`write_quad`].
-#[inline(always)]
-pub(crate) fn write_unit_quad<const N_AXIS: usize>(
-    quad: &mut MaybeUninit<UnorientedQuad>,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_coord: u32,
-) {
-    let minimum = match N_AXIS {
-        0 => [n_coord, bit_coord, outer_coord],
-        1 => [bit_coord, n_coord, outer_coord],
-        2 => [bit_coord, outer_coord, n_coord],
-        _ => unreachable!(),
+/// Calls `$kernel::<T, N_AXIS, BIT_IS_U>($args)` with a face's orientation
+/// lifted into const generics.
+///
+/// Every hot loop is then compiled once per orientation, so axis selection and
+/// the width/height swap in [`oriented_quad`] cost nothing at runtime.
+macro_rules! dispatch_orientation {
+    ($n_axis:expr, $bit_is_u:expr, $kernel:ident::<$t:ty>($($arg:expr),* $(,)?)) => {
+        match ($n_axis, $bit_is_u) {
+            (0, false) => $kernel::<$t, 0, false>($($arg),*),
+            (0, true) => $kernel::<$t, 0, true>($($arg),*),
+            (1, false) => $kernel::<$t, 1, false>($($arg),*),
+            (1, true) => $kernel::<$t, 1, true>($($arg),*),
+            (2, false) => $kernel::<$t, 2, false>($($arg),*),
+            (2, true) => $kernel::<$t, 2, true>($($arg),*),
+            _ => unreachable!("face normal axis must be 0, 1, or 2"),
+        }
     };
-    quad.write(UnorientedQuad {
-        minimum,
-        width: 1,
-        height: 1,
-    });
 }
+pub(crate) use dispatch_orientation;

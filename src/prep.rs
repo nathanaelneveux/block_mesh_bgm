@@ -120,7 +120,11 @@ where
             empty_union |= !(opaque | trans) & query_x_mask;
         }
 
-        transpose_plane(opaque_rows, &mut scratch, &mut opaque_y_cols[y_plane.clone()]);
+        transpose_plane(
+            opaque_rows,
+            &mut scratch,
+            &mut opaque_y_cols[y_plane.clone()],
+        );
         transpose_plane(trans_rows, &mut scratch, &mut trans_y_cols[y_plane]);
     }
 
@@ -404,9 +408,9 @@ mod tests {
 
         let mut transposed = words;
         transpose64(&mut transposed);
-        for r in 0..64 {
-            for c in 0..64 {
-                assert_eq!((words[r] >> c) & 1, (transposed[c] >> r) & 1);
+        for (r, &row) in words.iter().enumerate() {
+            for (c, &column) in transposed.iter().enumerate() {
+                assert_eq!((row >> c) & 1, (column >> r) & 1);
             }
         }
     }

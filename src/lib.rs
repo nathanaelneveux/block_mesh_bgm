@@ -169,10 +169,11 @@ mod face;
 mod merge;
 mod prep;
 
-use ao::{mesh_face_rows_ao_safe, AoScratch};
+use ao::mesh_face_ao_safe;
 use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
 use context::MeshingContext;
-use merge::mesh_face_rows;
+use face::dispatch_orientation;
+use merge::{mesh_face, FaceJob};
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
 
@@ -194,11 +195,6 @@ pub struct BinaryGreedyQuadsBuffer {
     visible_rows: Vec<u64>,
     // Stage 2 scratch: visibility rows for the positive face of the same axis.
     visible_rows_alt: Vec<u64>,
-    // Stage 4 scratch: carry lengths for the current face slice.
-    carry_runs: Vec<u8>,
-    // AO-safe scratch: row masks derived from exterior-plane occupancy plus
-    // AO-specific carry state.
-    ao_scratch: AoScratch,
 }
 
 impl BinaryGreedyQuadsBuffer {
@@ -288,8 +284,6 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         trans_cols,
         visible_rows,
         visible_rows_alt,
-        carry_runs,
-        ao_scratch,
     } = output;
 
     // Stage 1: build the X- and Y-packed occupancy columns used by the three
@@ -310,9 +304,6 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
 
     for n_axis in 0..3 {
         let slice = context.slice_plan(n_axis);
-        let [neg_face_index, pos_face_index] = context.face_indices[n_axis];
-        let neg_axes = context.face_axes[neg_face_index];
-        let pos_axes = context.face_axes[pos_face_index];
 
         // Stage 2: derive visible-face rows for both signs of the current normal axis.
         reset_visible_rows(visible_rows, slice.total_rows());
@@ -332,53 +323,34 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
             visible_rows_alt,
         );
 
-        // Stage 3 and 4: emit unit quads for fragmented slices, otherwise
-        // merge rows with either the vanilla maximum-merge path or one of the
-        // alternate merge policies.
-        if AO_SAFE {
-            mesh_face_rows_ao_safe(
+        // Stages 3 and 4: merge each face's rows into quads with the selected
+        // merge policy, specialized for the face's orientation.
+        let [neg_face, pos_face] = context.face_indices[n_axis];
+        for (face_index, rows, slice_masks) in [
+            (neg_face, &visible_rows[..], neg_slice_masks),
+            (pos_face, &visible_rows_alt[..], pos_slice_masks),
+        ] {
+            let axes = context.face_axes[face_index];
+            let job = FaceJob {
                 voxels,
-                &context,
+                context: &context,
                 slice,
-                visible_rows,
-                neg_slice_masks,
-                neg_axes,
-                &opaque_cols[slice.bit_axis],
-                ao_scratch,
-                &mut quads.groups[neg_face_index],
-            );
-            mesh_face_rows_ao_safe(
-                voxels,
-                &context,
-                slice,
-                visible_rows_alt,
-                pos_slice_masks,
-                pos_axes,
-                &opaque_cols[slice.bit_axis],
-                ao_scratch,
-                &mut quads.groups[pos_face_index],
-            );
-        } else {
-            mesh_face_rows(
-                voxels,
-                &context,
-                slice,
-                visible_rows,
-                neg_slice_masks,
-                neg_axes,
-                carry_runs,
-                &mut quads.groups[neg_face_index],
-            );
-            mesh_face_rows(
-                voxels,
-                &context,
-                slice,
-                visible_rows_alt,
-                pos_slice_masks,
-                pos_axes,
-                carry_runs,
-                &mut quads.groups[pos_face_index],
-            );
+                rows,
+                slice_masks,
+                n_sign: axes.n_sign,
+                opaque_cols: &opaque_cols[slice.bit_axis],
+            };
+            let face_quads = &mut quads.groups[face_index];
+            let bit_is_u = slice.bit_axis == axes.u_axis;
+            if AO_SAFE {
+                dispatch_orientation!(
+                    axes.n_axis,
+                    bit_is_u,
+                    mesh_face_ao_safe::<T>(&job, face_quads)
+                );
+            } else {
+                dispatch_orientation!(axes.n_axis, bit_is_u, mesh_face::<T>(&job, face_quads));
+            }
         }
     }
 }
