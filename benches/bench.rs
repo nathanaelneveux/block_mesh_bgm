@@ -365,10 +365,9 @@ fn benchmark_cases() -> Vec<Case> {
 }
 
 fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
-    vec![build_multi_chunk_case(
-        "layered-caves-2x2x2",
-        [2, 2, 2],
-        |x, y, z| {
+    vec![
+        smooth_hills_case(),
+        build_multi_chunk_case("layered-caves-2x2x2", [2, 2, 2], |x, y, z| {
             let base = y <= 22;
             let cave = hash3(x as u32, y as u32, z as u32, 23) % 100 > 24;
             let ridge = hash3(x as u32, y as u32, z as u32, 91) % 100 > 14;
@@ -386,8 +385,37 @@ fn benchmark_multi_chunk_cases() -> Vec<MultiCase> {
             } else {
                 BenchVoxel::default()
             }
-        },
-    )]
+        }),
+    ]
+}
+
+/// Smooth rolling hills with grass, dirt, and stone layers and a few caves.
+///
+/// Unlike the hash-noise scenes, large areas share one material, so this is
+/// where greedy merging (and the AO-safe policy's extra splits) matter most.
+fn smooth_hills_case() -> MultiCase {
+    build_multi_chunk_case("smooth-hills-2x1x2", [2, 1, 2], |x, y, z| {
+        let (wx, wy, wz) = (x as f32, y as f32, z as f32);
+        let height = (14.0
+            + 5.0 * (wx * 0.11).sin()
+            + 4.0 * (wz * 0.09).cos()
+            + 2.0 * ((wx + wz) * 0.21).sin())
+        .round() as i32;
+        let cave = (wx * 0.3).sin() + (wy * 0.4).sin() + (wz * 0.27).cos() > 2.1;
+        let material = if y > height || cave {
+            return BenchVoxel::default();
+        } else if y == height {
+            1
+        } else if y + 3 > height {
+            2
+        } else {
+            3
+        };
+        BenchVoxel {
+            visibility: VoxelVisibility::Opaque,
+            material,
+        }
+    })
 }
 
 fn ao_benchmark_cases() -> Vec<Case> {
