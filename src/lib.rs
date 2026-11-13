@@ -3,18 +3,20 @@
 //! It replaces the meshers and nothing else: keep your voxel data and quad
 //! types. In the smooth-hills [benchmark],
 //! [`binary_greedy_quads`] was about 13× as fast as
-//! [`block_mesh::greedy_quads`].
+//! [`block_mesh::greedy_quads`], and twice as fast as even
+//! [`block_mesh::visible_block_faces`].
 //!
-//! [`binary_greedy_quads_ao_safe`] uses occupancy masks to find where opaque
-//! faces can merge while preserving per-vertex ambient occlusion (AO).
-//! Sample AO once per opaque quad. AO-safe meshing took 29% less time than
-//! plain binary greedy meshing on the layered-caves benchmark, and 31% more on
-//! the smooth hills.
+//! [`binary_greedy_quads_ao_safe`] merges faces without breaking per-vertex
+//! ambient occlusion (AO). It doesn't pack AO into the meshing path; it keeps
+//! only the merge boundaries AO depends on, worked out from occupancy masks,
+//! so you sample AO once per final quad. On the eight-chunk layered-caves
+//! benchmark it took 26% less time than plain binary greedy meshing, and 32%
+//! more on the smooth hills.
 //!
 //! [benchmark]: https://github.com/nathanaelneveux/block_mesh_bgm#benchmarks
 //!
 //! [Quick start](#mesh-your-first-chunk) · [Choose a mesher](#choose-a-mesher)
-//! · [Migration](#switch-from-block-mesh) · [AO-safe merging](#ao-safe-not-ao-baked)
+//! · [Migration](#switch-from-block-mesh) · [AO-safe merging](#ao-safe-not-ao-packed)
 //! · [Troubleshooting](#troubleshooting)
 //!
 //! # Mesh your first chunk
@@ -92,19 +94,25 @@
 //! per worker to retain its allocations. Pair each quad group with its
 //! entry in `faces` to use the existing [`OrientedBlockFace`] vertex helpers.
 //!
-//! # AO-safe, not AO-baked
+//! # AO-safe, not AO-packed
 //!
-//! A merged quad shades only its four corners, so merging across an AO change
-//! smears the darkening. Rather than bake AO into the mesh,
-//! [`binary_greedy_quads_ao_safe`] reuses the mesher's occupancy masks to
-//! find legal merge directions for a whole row of opaque faces at a time.
-//! This skips per-face AO signatures and lets the mesher use simpler paths
-//! for unit faces and faces that can merge along one axis.
+//! A merged quad shades only its four corners, so merging across a change in
+//! corner darkness smears the AO. Full AO packing solves that by doing
+//! neighborhood checks during meshing and dragging AO data for every face
+//! through the merge process itself.
+//!
+//! [`binary_greedy_quads_ao_safe`] goes the other direction. It does not pack
+//! AO into the meshing path; it just preserves the merge boundaries that
+//! vertex AO depends on. It reads opaque occupancy in the plane just outside
+//! each face from the masks the mesher already has, derives AO constraints a
+//! whole row at a time with shifts and masks, and peels off the unit-only and
+//! one-direction-only cases in bulk. Only the remaining cells go through the
+//! full two-direction merge. The AO rule stays binary the whole time.
 //!
 //! Each unit face in a merged opaque quad has the same four corner values in
-//! the same order. Call [`FaceAoSampler`] once per opaque quad at
-//! `quad.minimum` and count only [`block_mesh::VoxelVisibility::Opaque`]
-//! voxels as occluders.
+//! the same order, so you compute AO over the final quads, not per voxel. Call
+//! [`FaceAoSampler`] once per opaque quad at `quad.minimum` and count only
+//! [`block_mesh::VoxelVisibility::Opaque`] voxels as occluders.
 //!
 //! Translucent faces follow the ordinary greedy merge rules. If opaque and
 //! translucent blocks can share a material ID, return both the ID and
@@ -165,7 +173,7 @@
 //!
 //! The faces are the same, but quad edges may fall in different places than
 //! with [`block_mesh::greedy_quads`]. For shading changes near corners, see
-//! [AO-safe, not AO-baked](#ao-safe-not-ao-baked).
+//! [AO-safe, not AO-packed](#ao-safe-not-ao-packed).
 #![warn(missing_docs)]
 
 mod ao;
