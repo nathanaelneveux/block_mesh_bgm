@@ -1,9 +1,12 @@
 use block_mesh::ndshape::{RuntimeShape, Shape};
 use block_mesh::{
-    greedy_quads, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, Voxel,
-    VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
+    greedy_quads, visible_block_faces, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace,
+    QuadBuffer, SignedAxis, UnitQuadBuffer, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{
+    binary_greedy_quads, binary_greedy_quads_ao_safe, binary_visible_block_faces,
+    BinaryGreedyQuadsBuffer, BinaryUnitQuadBuffer,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +122,7 @@ fn matches_block_mesh_geometry_for_translucent_mix() {
 
         let pattern = (x * 17 + y * 7 + z * 13) % 9;
         match pattern {
-            0 | 1 | 2 => TestVoxel::opaque((pattern + 1) as u8, ((x + z) % 4) as u8),
+            0..=2 => TestVoxel::opaque((pattern + 1) as u8, ((x + z) % 4) as u8),
             3 | 4 => TestVoxel::translucent((pattern + 1) as u8, ((y + z) % 5) as u8),
             _ => TestVoxel::empty(((x + y + z) % 6) as u8),
         }
@@ -180,9 +183,9 @@ fn ao_safe_mode_preserves_geometry_and_splits_ao_boundaries() {
             return TestVoxel::empty(0);
         }
 
-        if y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z) {
-            TestVoxel::opaque(1, 0)
-        } else if y == 3 && (2..=4).contains(&x) && z == 1 {
+        let plate = y == 2 && (2..=4).contains(&x) && (2..=4).contains(&z);
+        let lip = y == 3 && (2..=4).contains(&x) && z == 1;
+        if plate || lip {
             TestVoxel::opaque(1, 0)
         } else {
             TestVoxel::empty(0)
@@ -531,6 +534,45 @@ fn uniform_queries_clear_reusable_output_without_emitting_faces() {
 }
 
 #[test]
+fn ao_safe_mode_respects_ao_at_the_maximum_extent() {
+    // A 62-voxel interior pads out to exactly 64 bits per row. AO masks for
+    // the padded exterior plane must still cover all 64 bits there.
+    let dims = [64, 64, 64];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_voxels(dims, |x, y, z| {
+        if y <= 10 || (x == 20 && z == 20 && y == 11) {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+
+    let vanilla = mesh_with_binary_bgm(&voxels, &shape, [0; 3], [63; 3], &faces);
+    let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, [0; 3], [63; 3], &faces);
+
+    assert_same_geometry(&voxels, &shape, [0; 3], [63; 3], &faces);
+    assert_same_geometry_buffers(&voxels, &shape, &faces, &vanilla, &ao_safe);
+    assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+    assert!(ao_safe.num_quads() > vanilla.num_quads());
+}
+
+#[test]
+fn terrain_at_the_maximum_extent_matches_block_mesh() {
+    let dims = [64, 64, 64];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_terrain_voxels(dims, 0x64);
+
+    for faces in [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()] {
+        assert_same_geometry(&voxels, &shape, [0; 3], [63; 3], &faces);
+        let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, [0; 3], [63; 3], &faces);
+        let expected = mesh_with_block_mesh(&voxels, &shape, [0; 3], [63; 3], &faces);
+        assert_same_geometry_buffers(&voxels, &shape, &faces, &expected, &ao_safe);
+        assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+    }
+}
+
+#[test]
 #[ignore = "informational benchmark-case report"]
 fn reports_quad_count_similarity_for_benchmark_cases() {
     for case in benchmark_like_cases() {
@@ -568,20 +610,83 @@ fn reports_quad_count_similarity_for_benchmark_cases() {
 }
 
 #[test]
-#[should_panic(expected = "supports at most 62 interior voxels per axis")]
-fn panics_when_interior_axis_exceeds_limit() {
-    let shape = RuntimeShape::<u32, 3>::new([65, 4, 4]);
-    let voxels = vec![TestVoxel::default(); shape.size() as usize];
-    let mut buffer = BinaryGreedyQuadsBuffer::new();
+fn queries_wider_than_one_tile_match_block_mesh() {
+    // Covers single-tile, just-over-one-tile (63 and 65 interior), and
+    // multi-tile axes, plus a query that starts away from the origin.
+    let dims = [130, 67, 96];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_terrain_voxels(dims, 0x7117);
 
-    binary_greedy_quads(
-        &voxels,
-        &shape,
-        [0; 3],
-        [64, 3, 3],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &mut buffer,
-    );
+    for (min, max) in [
+        ([0, 0, 0], [129, 66, 95]),
+        ([3, 0, 1], [127, 64, 66]),
+        ([0, 2, 0], [63, 65, 64]),
+    ] {
+        for faces in [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()] {
+            assert_same_geometry(&voxels, &shape, min, max, &faces);
+            let expected = mesh_with_block_mesh(&voxels, &shape, min, max, &faces);
+            let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, min, max, &faces);
+            assert_same_geometry_buffers(&voxels, &shape, &faces, &expected, &ao_safe);
+            assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+        }
+    }
+}
+
+#[test]
+fn tiled_ao_safe_mode_splits_ao_across_tile_seams() {
+    // A pillar right next to the seam between two tiles must still split the
+    // floor quads on the other side of the seam.
+    let dims = [100, 16, 16];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_voxels(dims, |x, y, z| {
+        if y <= 4 || (x == 49 && y == 5 && z == 8) {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+    let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, [0; 3], [99, 15, 15], &faces);
+    assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+}
+
+#[test]
+fn visible_block_faces_matches_block_mesh() {
+    let mut rng = StdRng::seed_from_u64(0xface);
+    let mut buffer = BinaryUnitQuadBuffer::new();
+    let mut cases = vec![(
+        [70, 40, 66],
+        make_terrain_voxels([70, 40, 66], 3),
+        [0, 0, 0],
+        [69, 39, 65],
+    )];
+    for _ in 0..48 {
+        let dims = [
+            rng.random_range(3..=12),
+            rng.random_range(3..=12),
+            rng.random_range(3..=12),
+        ];
+        let min = [0, 1, 2].map(|axis| rng.random_range(0..=(dims[axis] - 3)));
+        let max = [0, 1, 2].map(|axis| rng.random_range((min[axis] + 2)..dims[axis]));
+        cases.push((dims, make_random_voxels(&mut rng, dims), min, max));
+    }
+
+    for (dims, voxels, min, max) in cases {
+        let shape = RuntimeShape::<u32, 3>::new(dims);
+        for faces in [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()] {
+            let mut expected = UnitQuadBuffer::new();
+            visible_block_faces(&voxels, &shape, min, max, &faces, &mut expected);
+            binary_visible_block_faces(&voxels, &shape, min, max, &faces, &mut buffer);
+
+            for (expected, actual) in expected.groups.iter().zip(&buffer.quads.groups) {
+                let mut expected: Vec<_> = expected.iter().map(|quad| quad.minimum).collect();
+                let mut actual: Vec<_> = actual.iter().map(|quad| quad.minimum).collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(expected, actual);
+            }
+        }
+    }
 }
 
 fn assert_same_geometry(
@@ -800,6 +905,7 @@ fn offset_is_opaque(
     voxels[shape.linearize(offset_coord) as usize].visibility == VoxelVisibility::Opaque
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors offset_is_opaque with a second offset
 fn offset2_is_opaque(
     shape: &RuntimeShape<u32, 3>,
     voxels: &[TestVoxel],
@@ -857,6 +963,27 @@ fn make_random_voxels(rng: &mut StdRng, dims: [u32; 3]) -> Vec<TestVoxel> {
             0..=2 => TestVoxel::opaque(rng.random_range(1..=5), rng.random_range(0..=7)),
             3..=4 => TestVoxel::translucent(rng.random_range(1..=5), rng.random_range(0..=7)),
             _ => TestVoxel::empty(rng.random_range(0..=7)),
+        }
+    })
+}
+
+/// Heightmap terrain with caves, ore pockets, and a translucent water layer:
+/// large mergeable regions with plenty of AO boundaries.
+fn make_terrain_voxels(dims: [u32; 3], seed: u32) -> Vec<TestVoxel> {
+    make_voxels(dims, |x, y, z| {
+        let height = dims[1] / 3 + hash3(x / 6, 0, z / 6, seed) % (dims[1] / 3).max(1);
+        if y < height {
+            if hash3(x, y, z, seed ^ 0x55) % 100 < 6 {
+                TestVoxel::empty(0)
+            } else if hash3(x / 3, y / 3, z / 3, seed ^ 0xaa).is_multiple_of(9) {
+                TestVoxel::opaque(2, 0)
+            } else {
+                TestVoxel::opaque(1, 0)
+            }
+        } else if y < dims[1] / 2 {
+            TestVoxel::translucent(3, 0)
+        } else {
+            TestVoxel::empty(0)
         }
     })
 }
@@ -921,7 +1048,7 @@ fn benchmark_like_cases() -> Vec<CarryCase> {
             [34, 34, 34],
             [0; 3],
             [33; 3],
-            |x, y, z, dims| translucent_shell_sphere_voxel(x, y, z, dims),
+            translucent_shell_sphere_voxel,
         ),
         build_carry_case(
             "layered-caves",

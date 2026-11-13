@@ -1,16 +1,66 @@
-//! Fast ambient-occlusion sampling for meshes built from padded voxel arrays.
+//! Per-quad vertex ambient occlusion for meshes from
+//! [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe).
 //!
-//! AO-safe meshing guarantees that every vertex covered by a merged quad has a
-//! compatible AO value. That means rendering only needs to sample the eight
-//! voxels around one face of each final quad.
+//! For a merged opaque quad, AO-safe meshing preserves the four corner
+//! values of its unit faces. Sample the eight neighbors of one unit face to
+//! get the values for the whole quad.
 
 use block_mesh::{OrientedBlockFace, UnorientedQuad};
+use ndshape::Shape;
 
-/// Precomputed linear offsets for sampling the AO neighborhood of one face.
+/// Samples the four ambient occlusion values for a face orientation.
 ///
-/// Construct one sampler per face group, outside the quad loop. `strides` must
-/// describe a dense linear voxel array in X/Y/Z order; for a `34³` padded chunk
-/// that is `[1, 34, 34 * 34]`.
+/// Build one sampler per face group and voxel layout, outside the quad loop.
+/// Each [`sample`](Self::sample) reads eight neighbors using precomputed
+/// offsets, then looks up their four corner values.
+///
+/// # Example
+///
+/// A pillar darkens the floor around its base. The loop samples each output
+/// quad once and reads its four values in vertex order.
+///
+/// ```
+/// # use block_mesh::ndshape::{ConstShape, ConstShape3u32};
+/// # use block_mesh::{MergeVoxel, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG};
+/// # #[derive(Clone, Copy, PartialEq, Eq)]
+/// # struct Block(bool);
+/// # impl Voxel for Block {
+/// #     fn get_visibility(&self) -> VoxelVisibility {
+/// #         if self.0 { VoxelVisibility::Opaque } else { VoxelVisibility::Empty }
+/// #     }
+/// # }
+/// # impl MergeVoxel for Block {
+/// #     type MergeValue = bool;
+/// #     fn merge_value(&self) -> bool { self.0 }
+/// # }
+/// use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer, FaceAoSampler};
+///
+/// type Chunk = ConstShape3u32<18, 18, 18>;
+///
+/// // A floor with one pillar standing on it.
+/// let mut voxels = [Block(false); Chunk::SIZE as usize];
+/// for i in 0..Chunk::SIZE {
+///     let [x, y, z] = Chunk::delinearize(i);
+///     voxels[i as usize] = Block(y < 4 || (x == 8 && z == 8 && y < 8));
+/// }
+///
+/// let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+/// let mut buffer = BinaryGreedyQuadsBuffer::new();
+/// binary_greedy_quads_ao_safe(&voxels, &Chunk {}, [0; 3], [17; 3], &faces, &mut buffer);
+///
+/// let mut darkened = 0;
+/// for (group, face) in buffer.quads.groups.iter().zip(faces) {
+///     let sampler = FaceAoSampler::for_shape(face, &Chunk {});
+///     for quad in group {
+///         // 0 (dark) ..= 3 (open) per corner, in `quad_corners` order.
+///         let vertex_ao = sampler.sample(&voxels, quad.minimum, |block| {
+///             block.get_visibility() == VoxelVisibility::Opaque
+///         });
+///         darkened += vertex_ao.iter().filter(|&&ao| ao < 3).count();
+///     }
+/// }
+/// assert!(darkened > 0, "the floor darkens around the pillar's base");
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct FaceAoSampler {
     strides: [usize; 3],
@@ -20,7 +70,17 @@ pub struct FaceAoSampler {
 }
 
 impl FaceAoSampler {
-    /// Builds the sampler for one oriented block face.
+    /// Builds a sampler for `face`, with voxels laid out by `shape`.
+    pub fn for_shape<S>(face: OrientedBlockFace, shape: &S) -> Self
+    where
+        S: Shape<3, Coord = u32>,
+    {
+        Self::new(face, crate::context::shape_strides(shape))
+    }
+
+    /// Builds a sampler for `face`, with voxels in a dense array with the
+    /// given per-axis `strides` (`[1, 34, 34 * 34]` for a `34³` chunk in
+    /// X/Y/Z order).
     pub fn new(face: OrientedBlockFace, strides: [usize; 3]) -> Self {
         let unit_quad = UnorientedQuad {
             minimum: [0; 3],
@@ -74,11 +134,22 @@ impl FaceAoSampler {
         }
     }
 
-    /// Samples the four AO values for a quad whose source voxel is `minimum`.
+    /// Samples the unit face at `minimum` and returns its four AO values in
+    /// [`OrientedBlockFace::quad_corners`] order.
     ///
-    /// The padded voxel array must contain the complete one-voxel AO
-    /// neighborhood. The function checks that contract once, then reads all
-    /// eight neighbors without repeated bounds checks.
+    /// Each value ranges from `0` (fully occluded) to `3` (open). Two
+    /// occluding sides make a corner fully dark regardless of the diagonal.
+    ///
+    /// To shade a merged opaque quad from
+    /// [`binary_greedy_quads_ao_safe`](crate::binary_greedy_quads_ao_safe), pass
+    /// its `quad.minimum` and use `is_opaque` to identify voxels with
+    /// [`block_mesh::VoxelVisibility::Opaque`], just as the mesher does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a neighbor offset would index outside `voxels`. Use the same
+    /// padded voxel array and layout that produced the quad so all eight
+    /// neighbors are present.
     #[inline]
     pub fn sample<T>(
         &self,

@@ -1,10 +1,10 @@
 use std::hint::black_box;
 
 use block_mesh::{QuadBuffer, RIGHT_HANDED_Y_UP_CONFIG};
-use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer, FaceAoSampler};
 use block_mesh_bgm_examples::{
-    ao::FaceAoSampler, build_demo_samples, mesh_from_quads_with_ao, striped_sphere, SampleShape,
-    SAMPLE_MAX, SAMPLE_MIN, SAMPLE_STRIDES,
+    build_demo_samples, mesh_from_quads_with_ao, striped_sphere, SampleShape, SAMPLE_MAX,
+    SAMPLE_MIN, SAMPLE_STRIDES,
 };
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 

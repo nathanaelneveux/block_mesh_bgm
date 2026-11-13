@@ -1,587 +1,432 @@
-//! Stage 3 and 4 of the pipeline.
+//! Stage 3 and 4 of the pipeline: turning visible-face rows into quads.
 //!
 //! Once a face slice has been reduced to visibility rows, there are two useful
 //! regimes:
 //!
 //! - **unit-only slices**: no visible cell touches another visible cell, so the
 //!   mesher can emit one quad per bit without any merge bookkeeping
-//! - **carry slices**: visible rows may continue across multiple outer rows, so
-//!   the mesher tracks vertical carry lengths in `carry_runs`
+//!   ([`emit_unit_slice`])
+//! - **merge slices**: runs may widen along the packed row and continue across
+//!   rows, so the mesher tracks how many rows each run has already been carried
+//!   ([`merge_rows`])
 //!
-//! The carry path uses a few small fast paths:
-//!
-//! - rows with no outgoing overlap
-//! - rows with outgoing overlap but no incoming carry
-//! - the general case where some runs both continue and end on the current row
+//! [`merge_rows`] is shared by every merge policy in the crate. Vanilla meshing
+//! merges in both directions; the AO-safe path reuses the same loop with one or
+//! both directions switched off at compile time.
 
-use block_mesh::{MergeVoxel, UnorientedQuad};
+use std::mem::MaybeUninit;
+
+use block_mesh::{MergeVoxel, UnorientedQuad, UnorientedUnitQuad};
 
 use crate::bit_mask;
 use crate::context::{MeshingContext, SlicePlan};
-use crate::face::{write_quad, write_unit_quad, FaceAxes};
+use crate::face::{oriented_quad, quad_minimum, UnitQuadOutput};
 use crate::prep::FaceSliceMasks;
 
-/// Chooses the compile-time-specialized merge kernel for one face orientation.
-#[inline(always)]
-pub(crate) fn mesh_face_rows<T>(
-    voxels: &[T],
-    context: &MeshingContext,
-    slice: SlicePlan,
-    visible_rows: &[u64],
-    slice_masks: FaceSliceMasks,
-    axes: FaceAxes,
-    carry_runs: &mut Vec<u8>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    match (axes.n_axis, slice.bit_axis == axes.u_axis) {
-        (0, false) => mesh_face_rows_impl::<T, 0, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        (0, true) => mesh_face_rows_impl::<T, 0, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        (1, false) => mesh_face_rows_impl::<T, 1, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        (1, true) => mesh_face_rows_impl::<T, 1, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        (2, false) => mesh_face_rows_impl::<T, 2, false>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        (2, true) => mesh_face_rows_impl::<T, 2, true>(
-            voxels,
-            context,
-            slice,
-            visible_rows,
-            slice_masks,
-            carry_runs,
-            quads,
-        ),
-        _ => unreachable!(),
+/// Everything a merge kernel needs to know about one face orientation.
+pub(crate) struct FaceJob<'a, T> {
+    pub(crate) voxels: &'a [T],
+    pub(crate) context: &'a MeshingContext,
+    pub(crate) slice: SlicePlan,
+    /// Visible-face rows for every slice of this face, `outer_len` per slice.
+    pub(crate) rows: &'a [u64],
+    pub(crate) slice_masks: FaceSliceMasks,
+    /// `-1` or `1`: which side of the source voxel the face points to.
+    pub(crate) n_sign: i32,
+    /// Opaque occupancy columns packed along `slice.bit_axis`.
+    pub(crate) opaque_cols: &'a [u64],
+}
+
+impl<T> FaceJob<'_, T> {
+    /// The visible rows of the slice at `n_local`.
+    #[inline(always)]
+    pub(crate) fn slice_rows(&self, n_local: usize) -> &[u64] {
+        let start = n_local * self.slice.outer_len;
+        &self.rows[start..start + self.slice.outer_len]
+    }
+
+    /// Calls `visit(n_local, rows, unit_only)` for every slice with a visible
+    /// face, in increasing `n_local` order.
+    #[inline(always)]
+    pub(crate) fn for_each_active_slice(&self, mut visit: impl FnMut(usize, &[u64], bool)) {
+        let mut active = self.slice_masks.active;
+        while active != 0 {
+            let n_local = active.trailing_zeros() as usize;
+            active &= active - 1;
+            let unit_only = self.slice_masks.unit_only & (1 << n_local) != 0;
+            visit(n_local, self.slice_rows(n_local), unit_only);
+        }
     }
 }
 
-#[inline(always)]
-fn mesh_face_rows_impl<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    context: &MeshingContext,
-    slice: SlicePlan,
-    visible_rows: &[u64],
-    slice_masks: FaceSliceMasks,
-    carry_runs: &mut Vec<u8>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    if slice_masks.active == slice_masks.unit_only {
-        if slice_masks.active == bit_mask(0, slice.n_len) {
-            for n_local in 0..slice.n_len {
-                let row_start = n_local * slice.outer_len;
-                emit_unit_slice::<N_AXIS>(
-                    context.interior_min,
-                    slice.outer_axis,
-                    slice.bit_axis,
-                    context.interior_min[N_AXIS] + n_local as u32,
-                    &visible_rows[row_start..row_start + slice.outer_len],
-                    quads,
-                );
-            }
-        } else {
-            let mut active_slices = slice_masks.active;
-            while active_slices != 0 {
-                let n_local = active_slices.trailing_zeros() as usize;
-                active_slices &= active_slices - 1;
-                let row_start = n_local * slice.outer_len;
-                emit_unit_slice::<N_AXIS>(
-                    context.interior_min,
-                    slice.outer_axis,
-                    slice.bit_axis,
-                    context.interior_min[N_AXIS] + n_local as u32,
-                    &visible_rows[row_start..row_start + slice.outer_len],
-                    quads,
-                );
-            }
+/// Where one face slice lives, both in the voxel array and in quad
+/// coordinates.
+#[derive(Clone, Copy)]
+pub(crate) struct SliceGeometry {
+    n_coord: u32,
+    outer_base: u32,
+    bit_base: u32,
+    /// Voxel index of the slice's first interior cell.
+    index_base: usize,
+    outer_stride: usize,
+    bit_stride: usize,
+    bit_len: usize,
+}
+
+impl SliceGeometry {
+    #[inline(always)]
+    pub(crate) fn new<const N_AXIS: usize>(job: &FaceJob<'_, impl Sized>, n_local: usize) -> Self {
+        let context = job.context;
+        let slice = job.slice;
+        Self {
+            n_coord: context.interior_min[N_AXIS] + n_local as u32,
+            outer_base: context.interior_min[slice.outer_axis],
+            bit_base: context.interior_min[slice.bit_axis],
+            index_base: context.interior_start_index + n_local * context.strides[N_AXIS],
+            outer_stride: context.strides[slice.outer_axis],
+            bit_stride: context.strides[slice.bit_axis],
+            bit_len: slice.bit_len,
         }
-        return;
     }
 
-    mesh_face_carry::<T, N_AXIS, BIT_IS_U>(
-        voxels,
-        context,
-        slice,
-        visible_rows,
-        slice_masks,
-        carry_runs,
-        quads,
+    /// Voxel index of bit 0 of row `outer_local`. Step along the row with
+    /// `bit_stride` and to the next row with `outer_stride`.
+    #[inline(always)]
+    fn row_index(&self, outer_local: usize) -> usize {
+        self.index_base + outer_local * self.outer_stride
+    }
+}
+
+/// Reads a voxel's merge value without a bounds check.
+///
+/// # Safety
+///
+/// `index` must be in bounds. `Query::new` asserts that the whole
+/// query extent lies inside `voxels`, and the merge kernels only index interior
+/// cells of the current slice (or, for row continuation, the interior cell one
+/// row further on, which is only read when that row is visible too).
+#[inline(always)]
+unsafe fn merge_value_at<T: MergeVoxel>(voxels: &[T], index: usize) -> T::MergeValue {
+    debug_assert!(index < voxels.len());
+    unsafe { voxels.get_unchecked(index) }.merge_value()
+}
+
+/// How the visible faces of one orientation become quads.
+///
+/// The visibility pipeline is shared; a policy only decides how each face
+/// slice's rows are merged and what quad type comes out.
+pub(crate) trait FacePolicy<T> {
+    type Quad;
+
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<Self::Quad>,
     );
 }
 
+/// Calls `P::mesh_face` with the face's orientation lifted into const
+/// generics, so every hot loop is compiled once per orientation and axis
+/// selection costs nothing at runtime.
 #[inline(always)]
-fn mesh_face_carry<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+pub(crate) fn mesh_face_with<T, P: FacePolicy<T>>(
+    n_axis: usize,
+    bit_is_u: bool,
+    job: &FaceJob<'_, T>,
+    quads: &mut Vec<P::Quad>,
+) {
+    match (n_axis, bit_is_u) {
+        (0, false) => P::mesh_face::<0, false>(job, quads),
+        (0, true) => P::mesh_face::<0, true>(job, quads),
+        (1, false) => P::mesh_face::<1, false>(job, quads),
+        (1, true) => P::mesh_face::<1, true>(job, quads),
+        (2, false) => P::mesh_face::<2, false>(job, quads),
+        (2, true) => P::mesh_face::<2, true>(job, quads),
+        _ => unreachable!("face normal axis must be 0, 1, or 2"),
+    }
+}
+
+/// The vanilla maximum-merge policy: merge whenever merge values match.
+pub(crate) struct Greedy;
+
+impl<T: MergeVoxel> FacePolicy<T> for Greedy {
+    type Quad = UnorientedQuad;
+
+    #[inline(always)]
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<UnorientedQuad>,
+    ) {
+        job.for_each_active_slice(|n_local, rows, unit_only| {
+            let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
+            if unit_only {
+                emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
+            } else {
+                merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(job.voxels, &geometry, rows, quads);
+            }
+        });
+    }
+}
+
+/// One quad per visible face, like `block_mesh::visible_block_faces`.
+pub(crate) struct UnitFaces;
+
+impl<T> FacePolicy<T> for UnitFaces {
+    type Quad = UnorientedUnitQuad;
+
+    #[inline(always)]
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<UnorientedUnitQuad>,
+    ) {
+        job.for_each_active_slice(|n_local, rows, _| {
+            let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
+            emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
+        });
+    }
+}
+
+/// Greedily merges one slice's rows into quads.
+///
+/// `ALONG_ROW` allows runs to widen along the packed bit axis; `ACROSS_ROWS`
+/// allows them to continue into the next row. A run only continues when the
+/// next row's cell is visible and has the same merge value, and a run that
+/// has been carried can only widen over neighbours carried exactly as far, so
+/// every emitted quad is a full rectangle of matching faces.
+#[inline(never)]
+pub(crate) fn merge_rows<
+    T,
+    const N_AXIS: usize,
+    const BIT_IS_U: bool,
+    const ALONG_ROW: bool,
+    const ACROSS_ROWS: bool,
+>(
     voxels: &[T],
-    context: &MeshingContext,
-    slice: SlicePlan,
+    geometry: &SliceGeometry,
     rows: &[u64],
-    slice_masks: FaceSliceMasks,
-    carry_runs: &mut Vec<u8>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    reset_carry_runs(carry_runs, slice.bit_len);
-    let n_base = context.interior_min[N_AXIS];
-    let bit_base = context.interior_min[slice.bit_axis];
-    let outer_base = context.interior_min[slice.outer_axis];
-    let outer_stride = context.strides[slice.outer_axis];
-    let bit_stride = context.strides[slice.bit_axis];
-    let select_slices =
-        slice_masks.active != bit_mask(0, slice.n_len) || slice_masks.unit_only != 0;
+    // How many rows each still-open run has already been carried. Every run
+    // ends by the last row (its successor row is empty), which also resets its
+    // entry, so this always starts and finishes all zero.
+    let mut carry_runs = [0u8; 64];
+    let mut has_incoming_carry = false;
 
-    for n_local in 0..slice.n_len {
-        let slice_start = n_local * slice.outer_len;
-        let slice_rows = &rows[slice_start..slice_start + slice.outer_len];
-        let n_coord = n_base + n_local as u32;
-        if select_slices {
-            let slice_bit = 1u64 << n_local;
-            if slice_masks.active & slice_bit == 0 {
-                continue;
-            }
-            if slice_masks.unit_only & slice_bit != 0 {
-                emit_unit_slice::<N_AXIS>(
-                    context.interior_min,
-                    slice.outer_axis,
-                    slice.bit_axis,
-                    n_coord,
-                    slice_rows,
+    for (outer_local, &row_bits) in rows.iter().enumerate() {
+        if row_bits == 0 {
+            // An empty row cannot have received carry from the previous row.
+            continue;
+        }
+
+        let row_index = geometry.row_index(outer_local);
+        let continuing = if ACROSS_ROWS {
+            let next_row_bits = rows.get(outer_local + 1).copied().unwrap_or(0);
+            continuing_bits(
+                voxels,
+                geometry,
+                row_index,
+                row_bits & next_row_bits,
+                &mut carry_runs,
+            )
+        } else {
+            0
+        };
+
+        let ended = row_bits & !continuing;
+        if ended != 0 {
+            // Without incoming carry every entry is zero, so the cheaper
+            // emitter can skip reading and resetting carry state.
+            if has_incoming_carry {
+                emit_runs::<T, N_AXIS, BIT_IS_U, ALONG_ROW, true>(
+                    voxels,
+                    geometry,
+                    outer_local,
+                    row_index,
+                    ended,
+                    &mut carry_runs,
                     quads,
                 );
-                continue;
-            }
-        }
-
-        carry_runs.fill(0);
-        let mut has_incoming_carry = false;
-        let n_index_base = context.interior_start_index + n_local * context.strides[N_AXIS];
-        for outer_local in 0..slice.outer_len {
-            let row_bits = slice_rows[outer_local];
-            if row_bits == 0 {
-                continue;
-            }
-
-            let next_row_bits = if outer_local + 1 < slice.outer_len {
-                slice_rows[outer_local + 1]
             } else {
-                0
-            };
-            let row_base_index = n_index_base + outer_local * outer_stride;
-            let overlapping_bits = row_bits & next_row_bits;
-
-            // Every run ends on this row, so the general continuation logic is unnecessary.
-            if overlapping_bits == 0 {
-                if has_incoming_carry {
-                    emit_terminal_row_runs::<T, N_AXIS, BIT_IS_U>(
-                        voxels,
-                        row_bits,
-                        row_base_index,
-                        bit_stride,
-                        slice.bit_len,
-                        n_coord,
-                        outer_base + outer_local as u32,
-                        bit_base,
-                        carry_runs,
-                        quads,
-                    );
-                } else {
-                    emit_single_row_runs::<T, N_AXIS, BIT_IS_U>(
-                        voxels,
-                        row_bits,
-                        row_base_index,
-                        bit_stride,
-                        slice.bit_len,
-                        n_coord,
-                        outer_base + outer_local as u32,
-                        bit_base,
-                        quads,
-                    );
-                }
-                has_incoming_carry = false;
-                continue;
+                emit_runs::<T, N_AXIS, BIT_IS_U, ALONG_ROW, false>(
+                    voxels,
+                    geometry,
+                    outer_local,
+                    row_index,
+                    ended,
+                    &mut carry_runs,
+                    quads,
+                );
             }
-
-            let continue_mask = build_continue_mask(
-                voxels,
-                overlapping_bits,
-                row_base_index,
-                bit_stride,
-                outer_stride,
-                carry_runs,
-            );
-            let ended_bits = row_bits & !continue_mask;
-
-            // These runs are starting fresh on this row, so they can use the
-            // cheap single-row emitter instead of the full carry-aware path.
-            if !has_incoming_carry {
-                if ended_bits != 0 {
-                    emit_single_row_runs::<T, N_AXIS, BIT_IS_U>(
-                        voxels,
-                        ended_bits,
-                        row_base_index,
-                        bit_stride,
-                        slice.bit_len,
-                        n_coord,
-                        outer_base + outer_local as u32,
-                        bit_base,
-                        quads,
-                    );
-                }
-                has_incoming_carry = continue_mask != 0;
-                continue;
-            }
-
-            if ended_bits == 0 {
-                has_incoming_carry = continue_mask != 0;
-                continue;
-            }
-
-            emit_mixed_row_runs::<T, N_AXIS, BIT_IS_U>(
-                voxels,
-                ended_bits,
-                row_base_index,
-                bit_stride,
-                slice.bit_len,
-                n_coord,
-                outer_base + outer_local as u32,
-                bit_base,
-                carry_runs,
-                quads,
-            );
-            has_incoming_carry = continue_mask != 0;
         }
+        has_incoming_carry = continuing != 0;
     }
+
+    debug_assert!(carry_runs.iter().all(|&carry| carry == 0));
 }
 
-/// Builds the mask of bits whose runs continue into the next row.
+/// Returns the subset of `overlapping_bits` whose face continues into the next
+/// row with the same merge value, and bumps their carry counts.
 #[inline(always)]
-pub(crate) fn build_continue_mask<T>(
+fn continuing_bits<T>(
     voxels: &[T],
+    geometry: &SliceGeometry,
+    row_index: usize,
     mut overlapping_bits: u64,
-    row_base_index: usize,
-    bit_stride: usize,
-    outer_stride: usize,
-    carry_runs: &mut [u8],
+    carry_runs: &mut [u8; 64],
 ) -> u64
 where
     T: MergeVoxel,
 {
-    let mut continue_mask = 0u64;
+    let mut continuing = 0u64;
 
     while overlapping_bits != 0 {
         let bit_local = overlapping_bits.trailing_zeros() as usize;
-        let bit = 1u64 << bit_local;
-        let voxel_index = row_base_index + bit_local * bit_stride;
-        let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
+        overlapping_bits &= overlapping_bits - 1;
 
-        if unsafe { row_bit_continues(voxels, voxel_index, outer_stride, &quad_value) } {
-            continue_mask |= bit;
+        let index = row_index + bit_local * geometry.bit_stride;
+        // SAFETY: see `merge_value_at`; both cells are visible interior cells.
+        let (here, next) = unsafe {
+            (
+                merge_value_at(voxels, index),
+                merge_value_at(voxels, index + geometry.outer_stride),
+            )
+        };
+        if here == next {
+            continuing |= 1 << bit_local;
             carry_runs[bit_local] += 1;
         }
-
-        overlapping_bits &= overlapping_bits - 1;
     }
 
-    continue_mask
+    continuing
 }
 
-/// Emits ended runs for a row that also contains some continuing carry.
+/// Emits a quad for every run in `bits`, all of which end on this row.
+///
+/// With `ALONG_ROW`, each run widens over neighbouring set bits with the same
+/// merge value (and, with `CARRIED`, the same carry count). With `CARRIED`, a
+/// run's height is its carry count plus one and its start row is that many
+/// rows back.
 #[inline(always)]
-pub(crate) fn emit_mixed_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+fn emit_runs<
+    T,
+    const N_AXIS: usize,
+    const BIT_IS_U: bool,
+    const ALONG_ROW: bool,
+    const CARRIED: bool,
+>(
     voxels: &[T],
-    mut row_bits: u64,
-    row_base_index: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_base: u32,
-    carry_runs: &mut [u8],
+    geometry: &SliceGeometry,
+    outer_local: usize,
+    row_index: usize,
+    mut bits: u64,
+    carry_runs: &mut [u8; 64],
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
-    let base_len = quads.len();
-    quads.reserve(row_bits.count_ones() as usize);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
+    let outer_coord = geometry.outer_base + outer_local as u32;
 
-    while row_bits != 0 {
-        let bit_local = row_bits.trailing_zeros() as usize;
-        let voxel_index = row_base_index + bit_local * bit_stride;
-        let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
-        let run_length = carry_runs[bit_local] as usize + 1;
-        let mut run_width = 1usize;
-
-        while bit_local + run_width < bit_len {
-            let next_bit_local = bit_local + run_width;
-            let next_bit = 1u64 << next_bit_local;
-            if row_bits & next_bit == 0 || carry_runs[next_bit_local] != carry_runs[bit_local] {
-                break;
-            }
-
-            let next_index = row_base_index + next_bit_local * bit_stride;
-            if unsafe { voxels.get_unchecked(next_index) }
-                .merge_value()
-                .ne(&quad_value)
-            {
-                break;
-            }
-
-            carry_runs[next_bit_local] = 0;
-            run_width += 1;
-        }
-
-        row_bits &= !bit_mask(bit_local, run_width);
-        let start_outer = outer_coord - carry_runs[bit_local] as u32;
-        write_quad::<N_AXIS, BIT_IS_U>(
-            &mut spare[written],
-            n_coord,
-            start_outer,
-            bit_base + bit_local as u32,
-            run_width as u32,
-            run_length as u32,
-        );
-        written += 1;
-        carry_runs[bit_local] = 0;
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
-}
-
-/// Emits horizontal runs for a row with no incoming carry.
-#[inline(always)]
-pub(crate) fn emit_single_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    row_bits: u64,
-    row_base_index: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_base: u32,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    let base_len = quads.len();
-    quads.reserve(row_bits.count_ones() as usize);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
-    let mut bits_here = row_bits;
-
-    while bits_here != 0 {
-        let bit_local = bits_here.trailing_zeros() as usize;
-        let voxel_index = row_base_index + bit_local * bit_stride;
-        let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
-        let mut run_width = 1usize;
-
-        while bit_local + run_width < bit_len {
-            let next_bit_local = bit_local + run_width;
-            let next_bit = 1u64 << next_bit_local;
-            if bits_here & next_bit == 0 {
-                break;
-            }
-
-            let next_index = row_base_index + next_bit_local * bit_stride;
-            if unsafe { voxels.get_unchecked(next_index) }
-                .merge_value()
-                .ne(&quad_value)
-            {
-                break;
-            }
-
-            run_width += 1;
-        }
-
-        bits_here &= !bit_mask(bit_local, run_width);
-        write_quad::<N_AXIS, BIT_IS_U>(
-            &mut spare[written],
-            n_coord,
-            outer_coord,
-            bit_base + bit_local as u32,
-            run_width as u32,
-            1,
-        );
-        written += 1;
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
-}
-
-/// Emits runs for a row where every visible bit ends on the current row.
-#[inline(always)]
-pub(crate) fn emit_terminal_row_runs<T, const N_AXIS: usize, const BIT_IS_U: bool>(
-    voxels: &[T],
-    row_bits: u64,
-    row_base_index: usize,
-    bit_stride: usize,
-    bit_len: usize,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_base: u32,
-    carry_runs: &mut [u8],
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    let base_len = quads.len();
-    quads.reserve(row_bits.count_ones() as usize);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
-    let mut bits_here = row_bits;
-
-    while bits_here != 0 {
-        let bit_local = bits_here.trailing_zeros() as usize;
-        let voxel_index = row_base_index + bit_local * bit_stride;
-        let quad_value = unsafe { voxels.get_unchecked(voxel_index) }.merge_value();
-        let run_carry = carry_runs[bit_local];
-        let run_length = run_carry as usize + 1;
-        let mut run_width = 1usize;
-
-        while bit_local + run_width < bit_len {
-            let next_bit_local = bit_local + run_width;
-            let next_bit = 1u64 << next_bit_local;
-            if bits_here & next_bit == 0 || carry_runs[next_bit_local] != run_carry {
-                break;
-            }
-
-            let next_index = row_base_index + next_bit_local * bit_stride;
-            if unsafe { voxels.get_unchecked(next_index) }
-                .merge_value()
-                .ne(&quad_value)
-            {
-                break;
-            }
-
-            carry_runs[next_bit_local] = 0;
-            run_width += 1;
-        }
-
-        bits_here &= !bit_mask(bit_local, run_width);
-        write_quad::<N_AXIS, BIT_IS_U>(
-            &mut spare[written],
-            n_coord,
-            outer_coord - run_carry as u32,
-            bit_base + bit_local as u32,
-            run_width as u32,
-            run_length as u32,
-        );
-        written += 1;
-        carry_runs[bit_local] = 0;
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
-}
-
-/// Emits every visible cell in a fragmented slice as a `1x1` quad.
-#[inline(always)]
-pub(crate) fn emit_unit_slice<const N_AXIS: usize>(
-    interior_min: [u32; 3],
-    outer_axis: usize,
-    bit_axis: usize,
-    n_coord: u32,
-    visible_rows: &[u64],
-    quads: &mut Vec<UnorientedQuad>,
-) {
-    let outer_base = interior_min[outer_axis];
-    let bit_base = interior_min[bit_axis];
-    let additional_quads = visible_rows
-        .iter()
-        .map(|row_bits| row_bits.count_ones() as usize)
-        .sum::<usize>();
-    let base_len = quads.len();
-    quads.reserve(additional_quads);
-    let spare = quads.spare_capacity_mut();
-    let mut written = 0usize;
-
-    for (outer_local, &row_bits) in visible_rows.iter().enumerate() {
-        let mut bits = row_bits;
-        let outer_coord = outer_base + outer_local as u32;
-
+    append_quads(quads, bits.count_ones() as usize, |out| {
         while bits != 0 {
-            let bit_local = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            write_unit_quad::<N_AXIS>(
-                &mut spare[written],
-                n_coord,
-                outer_coord,
-                bit_base + bit_local as u32,
-            );
-            written += 1;
+            let start = bits.trailing_zeros() as usize;
+            let carry = if CARRIED { carry_runs[start] } else { 0 };
+            let mut width = 1;
+
+            if ALONG_ROW {
+                // SAFETY (both reads): see `merge_value_at`; `start` and every
+                // `next` are visible interior cells of this row.
+                let value_at = |bit: usize| unsafe {
+                    merge_value_at(voxels, row_index + bit * geometry.bit_stride)
+                };
+                let value = value_at(start);
+                while start + width < geometry.bit_len {
+                    let next = start + width;
+                    if bits & (1 << next) == 0
+                        || (CARRIED && carry_runs[next] != carry)
+                        || value_at(next) != value
+                    {
+                        break;
+                    }
+                    if CARRIED {
+                        carry_runs[next] = 0;
+                    }
+                    width += 1;
+                }
+            }
+
+            bits &= !bit_mask(start, width);
+            if CARRIED {
+                carry_runs[start] = 0;
+            }
+            out.push(oriented_quad::<N_AXIS, BIT_IS_U>(
+                geometry.n_coord,
+                outer_coord - u32::from(carry),
+                geometry.bit_base + start as u32,
+                width as u32,
+                u32::from(carry) + 1,
+            ));
         }
-    }
-
-    unsafe {
-        quads.set_len(base_len + written);
-    }
+    });
 }
 
+/// Emits every visible cell in `rows` as a `1x1` quad.
 #[inline(always)]
-pub(crate) fn reset_carry_runs(carry_runs: &mut Vec<u8>, len: usize) {
-    carry_runs.resize(len, 0);
-    carry_runs.fill(0);
+pub(crate) fn emit_unit_slice<const N_AXIS: usize, Q: UnitQuadOutput>(
+    geometry: &SliceGeometry,
+    rows: &[u64],
+    quads: &mut Vec<Q>,
+) {
+    let total = rows.iter().map(|row| row.count_ones() as usize).sum();
+
+    append_quads(quads, total, |out| {
+        for (outer_local, &row_bits) in rows.iter().enumerate() {
+            let outer_coord = geometry.outer_base + outer_local as u32;
+            let mut bits = row_bits;
+            while bits != 0 {
+                let bit_local = bits.trailing_zeros();
+                bits &= bits - 1;
+                out.push(Q::unit(quad_minimum::<N_AXIS>(
+                    geometry.n_coord,
+                    outer_coord,
+                    geometry.bit_base + bit_local,
+                )));
+            }
+        }
+    });
 }
 
-/// Checks whether the same face can continue one row farther along the outer axis.
-#[inline]
-unsafe fn row_bit_continues<T>(
-    voxels: &[T],
-    voxel_index: usize,
-    outer_stride: usize,
-    quad_value: &T::MergeValue,
-) -> bool
-where
-    T: MergeVoxel,
-{
-    voxels
-        .get_unchecked(voxel_index + outer_stride)
-        .merge_value()
-        .eq(quad_value)
+/// Reserves room for `max_quads` more quads, lets `fill` write them through a
+/// [`QuadSink`], then commits however many were written.
+///
+/// Writing into reserved spare capacity keeps growth checks out of the hot
+/// emission loops.
+#[inline(always)]
+fn append_quads<Q>(quads: &mut Vec<Q>, max_quads: usize, fill: impl FnOnce(&mut QuadSink<'_, Q>)) {
+    quads.reserve(max_quads);
+    let len = quads.len();
+    let mut sink = QuadSink {
+        spare: quads.spare_capacity_mut(),
+        written: 0,
+    };
+    fill(&mut sink);
+    let written = sink.written;
+    // SAFETY: `QuadSink::push` initialized exactly the first `written` slots
+    // of the spare capacity. If `fill` panics we never get here, and the
+    // length simply stays at `len`.
+    unsafe { quads.set_len(len + written) };
+}
+
+struct QuadSink<'a, Q> {
+    spare: &'a mut [MaybeUninit<Q>],
+    written: usize,
+}
+
+impl<Q> QuadSink<'_, Q> {
+    #[inline(always)]
+    fn push(&mut self, quad: Q) {
+        // Indexing (not `get_unchecked`) keeps an over-count a panic, not UB.
+        self.spare[self.written].write(quad);
+        self.written += 1;
+    }
 }

@@ -1,3 +1,12 @@
+//! Compares meshers on the same `bevy_voxel_world` terrain, with the average
+//! chunk meshing time in an overlay.
+//!
+//! Based on `bevy_voxel_world`'s own `custom_meshing` example: a
+//! `chunk_meshing_delegate` replaces the built-in mesher and runs on a thread
+//! in the task pool. Here the delegate can switch at runtime between
+//! `block-mesh`, this crate, and `bevy_voxel_world`'s built-in mesher, and can
+//! shade AO-safe meshes with `FaceAoSampler`.
+
 use std::{
     cell::RefCell,
     sync::{
@@ -22,7 +31,7 @@ use bevy::{
     },
 };
 use bevy_voxel_world::{
-    custom_meshing::{PaddedChunkShape, VoxelArray, CHUNK_SIZE_U},
+    custom_meshing::{generate_chunk_mesh, PaddedChunkShape, VoxelArray, CHUNK_SIZE_U},
     prelude::*,
     rendering::ATTRIBUTE_TEX_INDEX,
 };
@@ -30,8 +39,8 @@ use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, OrientedBlockFace, QuadBuffer,
     UnitQuadBuffer, UnorientedQuad, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
+use block_mesh_bgm::FaceAoSampler;
 use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
-use block_mesh_bgm_examples::ao::FaceAoSampler;
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
 
@@ -60,6 +69,7 @@ enum MeshingAlgorithm {
     GreedyQuads,
     #[default]
     BinaryGreedyQuads,
+    VoxelWorldBuiltIn,
 }
 
 impl MeshingAlgorithm {
@@ -68,6 +78,7 @@ impl MeshingAlgorithm {
             Self::VisibleFaces => 0,
             Self::GreedyQuads => 1,
             Self::BinaryGreedyQuads => 2,
+            Self::VoxelWorldBuiltIn => 3,
         }
     }
 
@@ -75,6 +86,7 @@ impl MeshingAlgorithm {
         match value {
             0 => Self::VisibleFaces,
             1 => Self::GreedyQuads,
+            3 => Self::VoxelWorldBuiltIn,
             _ => Self::BinaryGreedyQuads,
         }
     }
@@ -86,6 +98,8 @@ impl MeshingAlgorithm {
             Some(Self::GreedyQuads)
         } else if keyboard.just_pressed(KeyCode::Digit3) {
             Some(Self::BinaryGreedyQuads)
+        } else if keyboard.just_pressed(KeyCode::Digit4) {
+            Some(Self::VoxelWorldBuiltIn)
         } else {
             None
         }
@@ -96,6 +110,7 @@ impl MeshingAlgorithm {
             Self::VisibleFaces => "visible faces",
             Self::GreedyQuads => "greedy quads",
             Self::BinaryGreedyQuads => "binary greedy quads",
+            Self::VoxelWorldBuiltIn => "bevy_voxel_world built-in (always AO)",
         }
     }
 
@@ -241,7 +256,8 @@ impl VoxelWorldConfig for MainWorld {
                         let generation = meshing.timing_generation();
                         let start = Instant::now();
 
-                        let render_mesh = mesh_chunk(algorithm, ao_safe, &voxels, &texture_index_mapper);
+                        let render_mesh =
+                            mesh_chunk(algorithm, ao_safe, &voxels, &texture_index_mapper);
 
                         meshing.record_sample(generation, start.elapsed());
                         (render_mesh, None)
@@ -340,12 +356,21 @@ impl RenderMeshBuffers {
 fn mesh_chunk(
     algorithm: MeshingAlgorithm,
     ao_safe: bool,
-    voxels: &[WorldVoxel<u8>],
+    voxel_array: &VoxelArray<u8>,
     texture_index_mapper: &TextureIndexMapperFn<u8>,
 ) -> Mesh {
     let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+    let voxels: &[WorldVoxel<u8>] = voxel_array;
 
     match algorithm {
+        // The default mesher `bevy_voxel_world` uses when there is no delegate:
+        // its own binary mesher, which always merges AO-aware and builds the
+        // mesh itself.
+        MeshingAlgorithm::VoxelWorldBuiltIn => generate_chunk_mesh(
+            voxel_array.clone(),
+            IVec3::ZERO,
+            texture_index_mapper.clone(),
+        ),
         MeshingAlgorithm::VisibleFaces => SIMPLE_BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
             buffer.reset();
@@ -456,10 +481,10 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins.set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(WgpuSettings {
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                     features: WgpuFeatures::POLYGON_MODE_LINE,
                     ..default()
-                }),
+                })),
                 ..default()
             }),
             WireframePlugin::default(),
@@ -468,6 +493,7 @@ fn main() {
         .insert_resource(WireframeConfig {
             global: true,
             default_color: WHITE.into(),
+            ..default()
         })
         .add_systems(Startup, setup)
         .add_systems(
@@ -482,11 +508,14 @@ fn main() {
 
 fn setup(mut commands: Commands) {
     info!("bevy_voxel_world custom meshing example");
-    info!("Press 1 for visible faces, 2 for greedy quads, 3 for binary greedy quads.");
+    info!(
+        "Press 1 for visible faces, 2 for greedy quads, 3 for binary greedy quads, \
+         4 for bevy_voxel_world's built-in mesher."
+    );
     info!(
         "Press A to toggle ambient occlusion for visible faces and AO-safe binary greedy meshing."
     );
-    info!("Switching the mesher resets average timing and respawns the loaded chunks.");
+    info!("Switching the mesher resets average timing and remeshes the loaded chunks.");
     info!(
         "Initial meshing algorithm: {}",
         MeshingAlgorithm::default().label()
@@ -502,7 +531,7 @@ fn setup(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(0.98, 0.95, 0.82),
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.15, -0.1, 0.15), Vec3::Y),
@@ -548,10 +577,11 @@ fn update_overlay(mut overlay: Query<&mut Text, With<OverlayText>>, world: Res<M
              1: visible faces\n\
              2: greedy quads\n\
              3: binary greedy quads\n\
+             4: bevy_voxel_world built-in (always AO)\n\
              A: visible-face AO / binary greedy AO-safe [{}]\n\
              Current: {}\n\
              Average meshing time: {}\n\
-             Switching clears the average and respawns loaded chunks.",
+             Switching clears the average and remeshes loaded chunks.",
             toggle_label(snapshot.ao_safe),
             snapshot.algorithm.label(),
             average_text,
@@ -562,8 +592,8 @@ fn update_overlay(mut overlay: Query<&mut Text, With<OverlayText>>, world: Res<M
 fn switch_meshing_settings(
     keyboard: Res<ButtonInput<KeyCode>>,
     world: Res<MainWorld>,
-    mut commands: Commands,
-    chunks: Query<Entity, (With<Chunk<MainWorld>>, Without<NeedsDespawn>)>,
+    mut voxel_world: VoxelWorld<MainWorld>,
+    chunks: Query<(), With<Chunk<MainWorld>>>,
 ) {
     let current_algorithm = world.meshing.algorithm();
     let next_algorithm = MeshingAlgorithm::from_input(&keyboard);
@@ -606,16 +636,14 @@ fn switch_meshing_settings(
         return;
     }
 
-    let mut chunk_count = 0usize;
-    for entity in &chunks {
-        commands.entity(entity).try_insert(NeedsDespawn);
-        chunk_count += 1;
-    }
+    // Chunks keep their current meshes until the regenerated ones are ready.
+    voxel_world.regenerate_chunks();
 
     info!(
-        "Meshing algorithm: {} | ambient occlusion: {} (respawning {chunk_count} loaded chunks)",
+        "Meshing algorithm: {} | ambient occlusion: {} (remeshing {} loaded chunks)",
         world.meshing.algorithm().label(),
         toggle_label(world.meshing.ao_safe()),
+        chunks.iter().count(),
     );
 }
 

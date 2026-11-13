@@ -8,9 +8,7 @@
 //! - whether the caller's face belongs to the negative or positive sign of that
 //!   normal axis
 
-use std::mem::MaybeUninit;
-
-use block_mesh::{OrientedBlockFace, SignedAxis, UnorientedQuad};
+use block_mesh::{OrientedBlockFace, SignedAxis, UnorientedQuad, UnorientedUnitQuad};
 
 /// The parts of an `OrientedBlockFace` that matter to the binary mesher.
 #[derive(Clone, Copy)]
@@ -72,52 +70,65 @@ pub(crate) fn scan_axes(n_axis: usize) -> (usize, usize) {
     }
 }
 
-/// Writes one merged quad using the mesher's internal axis naming.
+/// Maps the mesher's internal `(n, outer, bit)` coordinates back to `[x, y, z]`.
 #[inline(always)]
-pub(crate) fn write_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
-    quad: &mut MaybeUninit<UnorientedQuad>,
+pub(crate) fn quad_minimum<const N_AXIS: usize>(
+    n_coord: u32,
+    outer_coord: u32,
+    bit_coord: u32,
+) -> [u32; 3] {
+    match N_AXIS {
+        0 => [n_coord, bit_coord, outer_coord],
+        1 => [bit_coord, n_coord, outer_coord],
+        2 => [bit_coord, outer_coord, n_coord],
+        _ => unreachable!(),
+    }
+}
+
+/// Builds one quad from the mesher's internal axis naming.
+///
+/// `run_width` is measured along the packed bit axis and `run_length` along
+/// the outer axis; `BIT_IS_U` says which of those is the face's `u` axis.
+#[inline(always)]
+pub(crate) fn oriented_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
     n_coord: u32,
     outer_coord: u32,
     bit_coord: u32,
     run_width: u32,
     run_length: u32,
-) {
-    let minimum = match N_AXIS {
-        0 => [n_coord, bit_coord, outer_coord],
-        1 => [bit_coord, n_coord, outer_coord],
-        2 => [bit_coord, outer_coord, n_coord],
-        _ => unreachable!(),
-    };
+) -> UnorientedQuad {
     let (width, height) = if BIT_IS_U {
         (run_width, run_length)
     } else {
         (run_length, run_width)
     };
 
-    quad.write(UnorientedQuad {
-        minimum,
+    UnorientedQuad {
+        minimum: quad_minimum::<N_AXIS>(n_coord, outer_coord, bit_coord),
         width,
         height,
-    });
+    }
 }
 
-/// Writes a `1x1` quad in the same coordinate convention as [`write_quad`].
-#[inline(always)]
-pub(crate) fn write_unit_quad<const N_AXIS: usize>(
-    quad: &mut MaybeUninit<UnorientedQuad>,
-    n_coord: u32,
-    outer_coord: u32,
-    bit_coord: u32,
-) {
-    let minimum = match N_AXIS {
-        0 => [n_coord, bit_coord, outer_coord],
-        1 => [bit_coord, n_coord, outer_coord],
-        2 => [bit_coord, outer_coord, n_coord],
-        _ => unreachable!(),
-    };
-    quad.write(UnorientedQuad {
-        minimum,
-        width: 1,
-        height: 1,
-    });
+/// Output quad types that can represent a single `1x1` face.
+pub(crate) trait UnitQuadOutput {
+    fn unit(minimum: [u32; 3]) -> Self;
+}
+
+impl UnitQuadOutput for UnorientedQuad {
+    #[inline(always)]
+    fn unit(minimum: [u32; 3]) -> Self {
+        Self {
+            minimum,
+            width: 1,
+            height: 1,
+        }
+    }
+}
+
+impl UnitQuadOutput for UnorientedUnitQuad {
+    #[inline(always)]
+    fn unit(minimum: [u32; 3]) -> Self {
+        Self { minimum }
+    }
 }
