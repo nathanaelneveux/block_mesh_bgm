@@ -10,7 +10,7 @@ repository = "https://github.com/nathanaelneveux/block_mesh_bgm"
 keywords = ["voxel", "mesh", "greedy", "binary", "ambient-occlusion"]
 categories = ["graphics", "rendering"]
 readme = "README.md"
-exclude = ["tests/AO_binary_tests.md"]
+exclude = ["tests/AO_binary_tests.md", "docs/doc-review.md"]
 
 [workspace]
 members = ["examples_crate"]
