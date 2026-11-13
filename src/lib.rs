@@ -4,12 +4,17 @@
 //! `block-mesh` meshers, built on bitmasks instead of per-voxel loops. It is
 //! about ten times faster than [`block_mesh::greedy_quads`].
 //!
-//! It also does something greedy meshers usually avoid: it merges faces while
-//! keeping per-vertex ambient occlusion (AO) exact, without computing a single
-//! per-face AO signature.
+//! It also does something binary greedy meshers usually give up on: it merges
+//! faces while keeping per-vertex ambient occlusion (AO) exact, and on
+//! cave-heavy terrain it is even faster than plain greedy meshing.
+//!
+//! This crate replaces the meshers and nothing else. Padding, [`Voxel`],
+//! [`MergeVoxel`], shapes, and turning quads into vertices with
+//! [`OrientedBlockFace`] all work exactly as in [`block_mesh`], whose docs
+//! remain the reference for them.
 //!
 //! [Quick start](#mesh-your-first-chunk) · [Choose a mesher](#choose-a-mesher)
-//! · [Migration](#switch-from-block-mesh) · [Ambient occlusion](#ambient-occlusion)
+//! · [Migration](#switch-from-block-mesh) · [AO](#ao-safe-not-ao-baked)
 //! · [Troubleshooting](#troubleshooting)
 //!
 //! # Mesh your first chunk
@@ -62,51 +67,8 @@
 //! Change the second block to `Block(2)` to see 10 quads. The touching faces
 //! still disappear, and the sides stay split at the material boundary.
 //!
-//! ## Set the query bounds
-//!
-//! `min` and `max` are inclusive coordinates in the voxel array. The outer
-//! layer is padding. Faces come from `min + 1` through `max - 1` on each axis.
-//! Fill the border with neighboring chunk data so faces stay hidden where
-//! solid chunks touch. Use empty voxels where the world ends.
-//!
-//! ## Build vertex buffers
-//!
-//! Pass `&buffer.quads` and `&faces` from the example to `vertex_buffers`.
-//! Each [`OrientedBlockFace`] supplies the positions, normals, and winding
-//! for its group. The two-block example produces 24 vertices and 36 indices.
-//!
-//! ```
-//! use block_mesh::{OrientedBlockFace, QuadBuffer};
-//! # use block_mesh::UnorientedQuad;
-//!
-//! fn vertex_buffers(
-//!     quads: &QuadBuffer,
-//!     faces: &[OrientedBlockFace; 6],
-//! ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
-//!     let mut positions = Vec::new();
-//!     let mut normals = Vec::new();
-//!     let mut indices = Vec::new();
-//!
-//!     for (group, face) in quads.groups.iter().zip(faces) {
-//!         for quad in group {
-//!             indices.extend(face.quad_mesh_indices(positions.len() as u32));
-//!             positions.extend(face.quad_mesh_positions(quad, 1.0));
-//!             normals.extend(face.quad_mesh_normals());
-//!         }
-//!     }
-//!
-//!     (positions, normals, indices)
-//! }
-//! # let faces = block_mesh::RIGHT_HANDED_Y_UP_CONFIG.faces;
-//! # let mut quads = QuadBuffer::new();
-//! # for group in &mut quads.groups {
-//! #     group.push(UnorientedQuad { minimum: [1; 3], width: 1, height: 1 });
-//! # }
-//! # let (positions, normals, indices) = vertex_buffers(&quads, &faces);
-//! # assert_eq!(positions.len(), 24);
-//! # assert_eq!(normals.len(), 24);
-//! # assert_eq!(indices.len(), 36);
-//! ```
+//! The query bounds include `block-mesh`'s usual one-voxel padding, and each
+//! quad group pairs with its entry in `faces` exactly as upstream.
 //!
 //! # Choose a mesher
 //!
@@ -129,20 +91,21 @@
 //! - **Tiling.** The mesher tiles any axis with more than 62 interior voxels.
 //!   Tiles read neighboring voxels for visibility and AO. Quads stop at seams.
 //!
-//! Reuse one buffer per worker to retain its allocations.
+//! The mesher reads your voxel slice in place, with no repacking into a fixed
+//! layout. Reuse one buffer per worker to retain its allocations.
 //!
-//! # Ambient occlusion
+//! # AO-safe, not AO-baked
 //!
-//! Greedy meshing and per-vertex AO are a famously awkward pair. A pillar
-//! darkens the floor at its base, but a large quad can span both that dark
-//! edge and the open floor, and its four vertices cannot shade both. The
-//! usual fix computes an AO signature for every visible face and merges only
-//! matching signatures, which puts an eight-voxel lookup per face on the hot
-//! path.
+//! Binary greedy meshers usually treat AO as a speed tax: baking it means an
+//! AO signature for every visible face and merges only between matching
+//! signatures. A pillar darkens the floor at its base, but a large quad can
+//! span both that dark edge and the open floor, and its four vertices cannot
+//! shade both.
 //!
-//! [`binary_greedy_quads_ao_safe`] gets the same guarantee without any
-//! signatures, from bitmasks the mesher already has. It splits opaque
-//! surfaces wherever a merge would combine different corner AO values. Each unit face in a merged opaque
+//! [`binary_greedy_quads_ao_safe`] doesn't bake AO. It keeps only the merge
+//! boundaries AO depends on, worked out from bitmasks the mesher already has,
+//! and leaves the AO values to your shading step. It splits opaque surfaces
+//! wherever a merge would combine different corner AO values. Each unit face in a merged opaque
 //! quad has the same four values in the same order, so [`FaceAoSampler`] can
 //! sample once at `quad.minimum`. Match the mesher's opacity rule by treating
 //! only [`block_mesh::VoxelVisibility::Opaque`] as an occluder. Translucent
@@ -193,22 +156,21 @@
 //!    translucent voxels. Translucent faces show next to empty voxels.
 //! 3. **Emit quads.** The unit mesher emits each set bit as a quad. The greedy
 //!    meshers grow runs across rows and join them side by side when the run
-//!    lengths and merge values match.
+//!    lengths and merge values match. [`MergeVoxel`] is only consulted where
+//!    the bitmasks say a merge is possible.
 //!
 //! # Troubleshooting
 //!
-//! ## Why are faces missing at the edges of my chunk?
+//! ## Why is meshing slower than the benchmarks?
 //!
-//! The outermost layer of the query is padding. To mesh a `32³` chunk, give
-//! it a `34³` padded query. Copy in the surrounding chunk data where it exists
-//! and use empty voxels at the edge of the world.
+//! Build in release mode, or raise `opt-level` for dependencies in dev
+//! builds. Bitwise code is many times slower unoptimized.
 //!
 //! ## Why does my mesh look different after switching?
 //!
-//! Greedy meshers may place quad edges differently. If your textures stretch
-//! over larger quads, use wrapping UVs or choose [`binary_visible_block_faces`]
-//! for a separate quad per block face. For shading changes near corners, see
-//! [Ambient occlusion](#ambient-occlusion).
+//! The faces are the same, but quad edges may fall in different places than
+//! with [`block_mesh::greedy_quads`]. For shading changes near corners, see
+//! [AO-safe, not AO-baked](#ao-safe-not-ao-baked).
 #![warn(missing_docs)]
 
 mod ao;

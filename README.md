@@ -5,9 +5,11 @@
 
 **Binary greedy meshing for [`block-mesh`](https://github.com/bonsairobo/block-mesh-rs).** Same voxels, same shapes, same quads — swap one function and mesh four chunks of smooth hills in **70 µs** instead of **887 µs**.
 
-It also does something greedy meshers usually avoid: it merges faces while keeping per-vertex ambient occlusion (AO) exact, without computing a single per-face AO signature.
+It also does something binary greedy meshers usually give up on: it merges faces while keeping per-vertex ambient occlusion (AO) exact, and on cave-heavy terrain it is even faster than plain greedy meshing.
 
-[Quick start](#mesh-your-first-chunk) · [Migration](#switch-from-block-mesh) · [Ambient occlusion](#keep-ambient-occlusion) · [Benchmarks](#benchmarks)
+This crate replaces the meshers and nothing else. Padding, `Voxel`, `MergeVoxel`, shapes, and turning quads into vertices work exactly as in `block-mesh`, and its [README](https://github.com/bonsairobo/block-mesh-rs) is still the place to learn them.
+
+[Quick start](#mesh-your-first-chunk) · [From block-mesh](#switch-from-block-mesh) · [From other BGM crates](#coming-from-binary-greedy-meshing) · [AO](#ao-safe-not-ao-baked) · [Benchmarks](#benchmarks)
 
 ## Mesh your first chunk
 
@@ -56,10 +58,6 @@ fn main() {
 
 The touching faces disappear, and the four pairs along the sides merge. Change the second block to `Block(2)` to see the same shape take **10 quads** across two materials.
 
-The bounds are inclusive and contain one padding voxel at either end of each axis. Only coordinates `1..=2` can emit faces. Fill the padding with neighboring chunk data, using empty voxels where the world ends.
-
-Pair each quad group with its entry in `faces` to build [positions, normals, and indices](https://docs.rs/block-mesh-bgm/latest/block_mesh_bgm/#build-vertex-buffers).
-
 ## Switch from `block-mesh`
 
 | What you need | Mesher | Output buffer |
@@ -74,13 +72,27 @@ Keep your voxels, shape, bounds, and face config. Call the new buffer’s `new()
 - **Every call clears the output.** If you relied on upstream `visible_block_faces` appending, collect the quads after each call.
 - **Queries tile automatically beyond 62 interior voxels on any axis.** Tiles read their neighbors for visibility and AO. Quads stop at tile seams.
 
-Reuse one buffer per worker to retain its allocations.
+The mesher reads your voxel slice in place, with no repacking into a fixed layout, and translucency follows `VoxelVisibility` exactly. Reuse one buffer per worker to retain its allocations.
 
-## Keep ambient occlusion
+## Coming from binary-greedy-meshing
 
-Greedy meshing and per-vertex AO are a famously awkward pair. A single raised voxel darkens the floor around it, but a big merged quad can only shade its four corners, so the darkening smears or vanishes. The usual fix computes an AO signature for every visible face and merges only matching signatures, which puts an eight-voxel lookup per face on the hot path.
+This crate builds on [cgerikj's binary greedy meshing](https://github.com/cgerikj/binary-greedy-meshing) and its Rust port, [`binary-greedy-meshing`](https://github.com/Inspirateur/binary-greedy-meshing). Like them, it packs occupancy into `u64` masks, culls 64 faces at a time, and only looks up voxel types where the masks say a merge is possible. What changes:
 
-`binary_greedy_quads_ao_safe` never computes a signature. It reads the plane just outside each face as bitsets the mesher already has, and sorts a whole row of faces at once into four classes: free to merge, row-only, column-only, or single. Single and one-direction faces are peeled off in bulk on cheap paths; only the rest takes the full two-direction merge.
+| | cgerikj v2 | `binary-greedy-meshing` | `block-mesh-bgm` |
+| --- | --- | --- | --- |
+| Input | Padded `64³` voxels plus an occupancy mask | Padded `64³` `u16` array in ZXY order | Your voxel type, any `block-mesh` shape |
+| Chunk size | `64³` padded, cubic | `62³` interior | Any; larger queries are tiled |
+| Transparency | Not built in | Yes | Yes, via `VoxelVisibility` |
+| Ambient occlusion | Baked in v1, dropped in v2 | Not supported | AO-safe merging + per-quad sampler |
+| Output | Packed quads for vertex pulling | Packed `u64` quads | `block-mesh` quads |
+
+If you render with vertex pulling, pack each `UnorientedQuad` into your own format after meshing.
+
+## AO-safe, not AO-baked
+
+Binary greedy meshers usually treat AO as a speed tax. cgerikj's v1 baked it into the mesh, doubling meshing time on its sphere scene; v2 dropped it, and the Rust port's AO issue is still open. The underlying problem: a big merged quad can only shade its four corners, so merging across an AO change smears or erases the darkening.
+
+`binary_greedy_quads_ao_safe` doesn't bake AO or compute per-face AO signatures. It keeps only the merge boundaries AO depends on. It reads the plane just outside each face as bitsets the mesher already has, and sorts a whole row of faces at once into four classes: free to merge, row-only, column-only, or single. Single and one-direction faces are peeled off in bulk on cheap paths; only the rest takes the full two-direction merge.
 
 ![Top view of the same floor. Binary greedy uses four floor quads. AO-safe greedy uses twelve and shades the ring around the raised voxel.](docs/ao-quad-layout.png)
 
@@ -113,7 +125,9 @@ Criterion medians on an Apple M4 with reused buffers. Timings cover meshing only
 | Layered caves · eight chunks | 3.77 ms | 304 µs | 216 µs |
 | Large model · one `130×66×98` padded query | 9.39 ms | 1.03 ms | 1.03 ms |
 
-AO-safe merging adds work on the smooth hills, where slopes split many quads for AO; in the caves most faces take its cheaper merge paths. For unit faces on the hills, `binary_visible_block_faces` took 60 µs versus 139 µs for `visible_block_faces`.
+Binary greedy is competitive with or faster than even `visible_block_faces`, the usual speed baseline, while emitting far fewer quads; for unit faces on the hills, `binary_visible_block_faces` took 60 µs versus 139 µs. AO-safe merging adds work on the smooth hills, where slopes split many quads for AO; in the caves most faces take its cheaper merge paths.
+
+Measure in release mode. Debug builds of bitwise code are many times slower.
 
 Run `cargo bench --bench bench` for the full suite. Add `-- smooth-hills` to focus on the hills. The table used 50 samples, a 1-second warm-up, and a 2-second measurement target per case.
 
