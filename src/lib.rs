@@ -383,7 +383,16 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
     }
 }
 
+/// Returns `width` consecutive set bits starting at bit `start`.
+///
+/// `width` may be the full 64 bits: the padded query of a 62-voxel interior
+/// is exactly 64 wide, so `(1 << width) - 1` would overflow there.
 #[inline]
 pub(crate) fn bit_mask(start: usize, width: usize) -> u64 {
-    ((1u64 << width) - 1) << start
+    debug_assert!(start + width <= 64);
+    if width == 0 {
+        0
+    } else {
+        (u64::MAX >> (64 - width)) << start
+    }
 }
