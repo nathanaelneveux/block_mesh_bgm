@@ -30,8 +30,8 @@ use block_mesh::{
     greedy_quads, visible_block_faces, GreedyQuadsBuffer, OrientedBlockFace, QuadBuffer,
     UnitQuadBuffer, UnorientedQuad, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
+use block_mesh_bgm::FaceAoSampler;
 use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
-use block_mesh_bgm_examples::ao::FaceAoSampler;
 use ndshape::ConstShape;
 use noise::{HybridMulti, NoiseFn, Perlin};
 

@@ -168,14 +168,15 @@ mod context;
 mod face;
 mod merge;
 mod prep;
+mod sampler;
 
-use ao::mesh_face_ao_safe;
-use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer};
-use context::MeshingContext;
-use face::dispatch_orientation;
-use merge::{mesh_face, FaceJob};
+use ao::AoSafe;
+use block_mesh::{MergeVoxel, OrientedBlockFace, QuadBuffer, UnitQuadBuffer, Voxel};
+use context::{MeshingContext, Query};
+use merge::{mesh_face_with, FaceJob, FacePolicy, Greedy, UnitFaces};
 use ndshape::Shape;
 use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visible_rows};
+pub use sampler::FaceAoSampler;
 
 /// Reusable output and scratch storage for [`binary_greedy_quads`] and
 /// [`binary_greedy_quads_ao_safe`].
@@ -186,15 +187,7 @@ use prep::{build_axis_columns, build_visible_row_pair, reset_columns, reset_visi
 pub struct BinaryGreedyQuadsBuffer {
     /// Output quads grouped by face, matching `block-mesh`'s `QuadBuffer`.
     pub quads: QuadBuffer,
-    // Stage 1 scratch: packed opaque occupancy columns for the two bit axes
-    // used by the fixed scan plans.
-    opaque_cols: [Vec<u64>; 2],
-    // Stage 1 scratch: packed translucent occupancy columns with the same layout.
-    trans_cols: [Vec<u64>; 2],
-    // Stage 2 scratch: visibility rows for the negative face of one normal axis.
-    visible_rows: Vec<u64>,
-    // Stage 2 scratch: visibility rows for the positive face of the same axis.
-    visible_rows_alt: Vec<u64>,
+    scratch: Scratch,
 }
 
 impl BinaryGreedyQuadsBuffer {
@@ -206,24 +199,57 @@ impl BinaryGreedyQuadsBuffer {
     }
 }
 
+/// Reusable output and scratch storage for [`binary_visible_block_faces`].
+#[derive(Default)]
+pub struct BinaryUnitQuadBuffer {
+    /// Output quads grouped by face, matching `block-mesh`'s `UnitQuadBuffer`.
+    pub quads: UnitQuadBuffer,
+    scratch: Scratch,
+}
+
+impl BinaryUnitQuadBuffer {
+    /// Creates an empty reusable output/scratch buffer.
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Scratch shared by every entry point. Sized for one tile; never shrinks.
+#[derive(Default)]
+struct Scratch {
+    // Stage 1: packed opaque occupancy columns for the two bit axes used by
+    // the fixed scan plans.
+    opaque_cols: [Vec<u64>; 2],
+    // Stage 1: packed translucent occupancy columns with the same layout.
+    trans_cols: [Vec<u64>; 2],
+    // Stage 2: visibility rows for the negative face of one normal axis.
+    neg_rows: Vec<u64>,
+    // Stage 2: visibility rows for the positive face of the same axis.
+    pos_rows: Vec<u64>,
+}
+
 /// Generates greedy quads using a binary-mask-backed implementation.
 ///
 /// The public API mirrors [`block_mesh::greedy_quads`]. The output lands in
 /// [`BinaryGreedyQuadsBuffer::quads`], which uses the same public
-/// `block-mesh` types as the upstream mesher.
+/// `block-mesh` types as the upstream mesher. The buffer is cleared first.
 ///
 /// # Output contract
 ///
 /// This implementation preserves the set of visible unit faces that
-/// `block_mesh::greedy_quads` would emit for supported inputs, and it usually
-/// stays very close to the upstream quad count. It does not promise the exact
-/// same quad partition.
+/// `block_mesh::greedy_quads` would emit, and it usually stays very close to
+/// the upstream quad count. It does not promise the exact same quad
+/// partition.
 ///
-/// # Supported extents
+/// # Extents
 ///
-/// The interior query extent may be at most `62` voxels wide on each axis.
-/// Including the required one-voxel border, the full query box may therefore be
-/// at most `64` voxels wide on each axis.
+/// Any query extent is supported. Interiors up to `62` voxels per axis (`64`
+/// including the one-voxel border, the usual binary-meshing chunk size) are
+/// meshed in one pass. Wider queries are meshed in tiles of at most `62`
+/// interior voxels per axis; visibility is exact across tile seams, but quads
+/// do not merge across them.
 pub fn binary_greedy_quads<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -235,17 +261,30 @@ pub fn binary_greedy_quads<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    binary_greedy_quads_impl::<T, S, false>(voxels, voxels_shape, min, max, faces, output);
+    let BinaryGreedyQuadsBuffer { quads, scratch } = output;
+    mesh_query::<T, S, Greedy>(
+        voxels,
+        voxels_shape,
+        min,
+        max,
+        faces,
+        &mut quads.groups,
+        scratch,
+    );
 }
 
 /// Generates greedy quads with AO-safe merge restrictions for opaque faces.
 ///
 /// This uses the same visibility pipeline as [`binary_greedy_quads`], but it
-/// refuses merges that would cross AO boundaries on opaque faces. Translucent
-/// faces keep the same merge rule they use in the vanilla path.
+/// refuses merges that would cross AO boundaries on opaque faces: every unit
+/// face inside an emitted opaque quad has the same four vertex AO values.
+/// Translucent faces keep the same merge rule they use in the vanilla path.
 ///
 /// This only changes the merge policy. It does not emit AO values or lighting
-/// data for you.
+/// data for you; [`FaceAoSampler`] computes them per quad afterwards.
+///
+/// Extents work as in [`binary_greedy_quads`], and AO stays exact across tile
+/// seams.
 pub fn binary_greedy_quads_ao_safe<T, S>(
     voxels: &[T],
     voxels_shape: &S,
@@ -257,34 +296,92 @@ pub fn binary_greedy_quads_ao_safe<T, S>(
     T: MergeVoxel,
     S: Shape<3, Coord = u32>,
 {
-    binary_greedy_quads_impl::<T, S, true>(voxels, voxels_shape, min, max, faces, output);
+    let BinaryGreedyQuadsBuffer { quads, scratch } = output;
+    mesh_query::<T, S, AoSafe>(
+        voxels,
+        voxels_shape,
+        min,
+        max,
+        faces,
+        &mut quads.groups,
+        scratch,
+    );
 }
 
-fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
+/// Emits one unit quad per visible face, like
+/// [`block_mesh::visible_block_faces`].
+///
+/// Uses the same binary visibility pipeline as [`binary_greedy_quads`] and
+/// emits exactly the faces `visible_block_faces` would, for any query extent.
+/// Unlike upstream, the output buffer is cleared first.
+pub fn binary_visible_block_faces<T, S>(
     voxels: &[T],
     voxels_shape: &S,
     min: [u32; 3],
     max: [u32; 3],
     faces: &[OrientedBlockFace; 6],
-    output: &mut BinaryGreedyQuadsBuffer,
+    output: &mut BinaryUnitQuadBuffer,
 ) where
-    T: MergeVoxel,
+    T: Voxel,
     S: Shape<3, Coord = u32>,
 {
-    let Some(context) = MeshingContext::new(voxels, voxels_shape, min, max, faces) else {
-        output.quads.reset();
+    let BinaryUnitQuadBuffer { quads, scratch } = output;
+    mesh_query::<T, S, UnitFaces>(
+        voxels,
+        voxels_shape,
+        min,
+        max,
+        faces,
+        &mut quads.groups,
+        scratch,
+    );
+}
+
+/// Validates the query, then meshes it one tile at a time.
+fn mesh_query<T, S, P>(
+    voxels: &[T],
+    voxels_shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    faces: &[OrientedBlockFace; 6],
+    groups: &mut [Vec<P::Quad>; 6],
+    scratch: &mut Scratch,
+) where
+    T: Voxel,
+    S: Shape<3, Coord = u32>,
+    P: FacePolicy<T>,
+{
+    for group in groups.iter_mut() {
+        group.clear();
+    }
+
+    let Some(query) = Query::new(voxels, voxels_shape, min, max, faces) else {
         return;
     };
+    query.for_each_tile(|interior_min, interior_max| {
+        let context = MeshingContext::for_tile(&query, interior_min, interior_max);
+        mesh_tile::<T, P>(voxels, &query, &context, groups, scratch);
+    });
+}
 
-    output.quads.reset();
-
-    let BinaryGreedyQuadsBuffer {
-        quads,
+/// Runs the full pipeline over one tile of at most 62 interior voxels per
+/// axis, appending to `groups`.
+fn mesh_tile<T, P>(
+    voxels: &[T],
+    query: &Query,
+    context: &MeshingContext,
+    groups: &mut [Vec<P::Quad>; 6],
+    scratch: &mut Scratch,
+) where
+    T: Voxel,
+    P: FacePolicy<T>,
+{
+    let Scratch {
         opaque_cols,
         trans_cols,
-        visible_rows,
-        visible_rows_alt,
-    } = output;
+        neg_rows,
+        pos_rows,
+    } = scratch;
 
     // Stage 1: build the X- and Y-packed occupancy columns used by the three
     // fixed face scan plans. No plan packs Z, so building that third
@@ -292,7 +389,7 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
     reset_columns(opaque_cols, trans_cols, context.query_shape);
     let occupancy = build_axis_columns(
         voxels,
-        min,
+        context.query_min(),
         context.query_shape,
         context.strides,
         opaque_cols,
@@ -306,8 +403,8 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
         let slice = context.slice_plan(n_axis);
 
         // Stage 2: derive visible-face rows for both signs of the current normal axis.
-        reset_visible_rows(visible_rows, slice.total_rows());
-        reset_visible_rows(visible_rows_alt, slice.total_rows());
+        reset_visible_rows(neg_rows, slice.total_rows());
+        reset_visible_rows(pos_rows, slice.total_rows());
         let (neg_slice_masks, pos_slice_masks) = build_visible_row_pair(
             context.query_shape,
             slice.bit_axis,
@@ -319,38 +416,29 @@ fn binary_greedy_quads_impl<T, S, const AO_SAFE: bool>(
             &opaque_cols[slice.bit_axis],
             &trans_cols[slice.bit_axis],
             occupancy.has_translucent,
-            visible_rows,
-            visible_rows_alt,
+            neg_rows,
+            pos_rows,
         );
 
         // Stages 3 and 4: merge each face's rows into quads with the selected
-        // merge policy, specialized for the face's orientation.
-        let [neg_face, pos_face] = context.face_indices[n_axis];
+        // policy, specialized for the face's orientation.
+        let [neg_face, pos_face] = query.face_indices[n_axis];
         for (face_index, rows, slice_masks) in [
-            (neg_face, &visible_rows[..], neg_slice_masks),
-            (pos_face, &visible_rows_alt[..], pos_slice_masks),
+            (neg_face, &neg_rows[..], neg_slice_masks),
+            (pos_face, &pos_rows[..], pos_slice_masks),
         ] {
-            let axes = context.face_axes[face_index];
+            let axes = query.face_axes[face_index];
             let job = FaceJob {
                 voxels,
-                context: &context,
+                context,
                 slice,
                 rows,
                 slice_masks,
                 n_sign: axes.n_sign,
                 opaque_cols: &opaque_cols[slice.bit_axis],
             };
-            let face_quads = &mut quads.groups[face_index];
             let bit_is_u = slice.bit_axis == axes.u_axis;
-            if AO_SAFE {
-                dispatch_orientation!(
-                    axes.n_axis,
-                    bit_is_u,
-                    mesh_face_ao_safe::<T>(&job, face_quads)
-                );
-            } else {
-                dispatch_orientation!(axes.n_axis, bit_is_u, mesh_face::<T>(&job, face_quads));
-            }
+            mesh_face_with::<T, P>(n_axis, bit_is_u, &job, &mut groups[face_index]);
         }
     }
 }

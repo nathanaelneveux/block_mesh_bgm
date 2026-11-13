@@ -1,5 +1,3 @@
-pub mod ao;
-
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, Mesh, VertexAttributeValues},
@@ -12,7 +10,7 @@ use block_mesh::{
     VoxelVisibility,
 };
 
-use ao::FaceAoSampler;
+use block_mesh_bgm::FaceAoSampler;
 
 pub type SampleShape = ConstShape3u32<34, 34, 34>;
 

@@ -1,9 +1,12 @@
 use block_mesh::ndshape::{RuntimeShape, Shape};
 use block_mesh::{
-    greedy_quads, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, QuadBuffer, SignedAxis, Voxel,
-    VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
+    greedy_quads, visible_block_faces, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace,
+    QuadBuffer, SignedAxis, UnitQuadBuffer, Voxel, VoxelVisibility, RIGHT_HANDED_Y_UP_CONFIG,
 };
-use block_mesh_bgm::{binary_greedy_quads, binary_greedy_quads_ao_safe, BinaryGreedyQuadsBuffer};
+use block_mesh_bgm::{
+    binary_greedy_quads, binary_greedy_quads_ao_safe, binary_visible_block_faces,
+    BinaryGreedyQuadsBuffer, BinaryUnitQuadBuffer,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -607,20 +610,83 @@ fn reports_quad_count_similarity_for_benchmark_cases() {
 }
 
 #[test]
-#[should_panic(expected = "supports at most 62 interior voxels per axis")]
-fn panics_when_interior_axis_exceeds_limit() {
-    let shape = RuntimeShape::<u32, 3>::new([65, 4, 4]);
-    let voxels = vec![TestVoxel::default(); shape.size() as usize];
-    let mut buffer = BinaryGreedyQuadsBuffer::new();
+fn queries_wider_than_one_tile_match_block_mesh() {
+    // Covers single-tile, just-over-one-tile (63 and 65 interior), and
+    // multi-tile axes, plus a query that starts away from the origin.
+    let dims = [130, 67, 96];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_terrain_voxels(dims, 0x7117);
 
-    binary_greedy_quads(
-        &voxels,
-        &shape,
-        [0; 3],
-        [64, 3, 3],
-        &RIGHT_HANDED_Y_UP_CONFIG.faces,
-        &mut buffer,
-    );
+    for (min, max) in [
+        ([0, 0, 0], [129, 66, 95]),
+        ([3, 0, 1], [127, 64, 66]),
+        ([0, 2, 0], [63, 65, 64]),
+    ] {
+        for faces in [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()] {
+            assert_same_geometry(&voxels, &shape, min, max, &faces);
+            let expected = mesh_with_block_mesh(&voxels, &shape, min, max, &faces);
+            let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, min, max, &faces);
+            assert_same_geometry_buffers(&voxels, &shape, &faces, &expected, &ao_safe);
+            assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+        }
+    }
+}
+
+#[test]
+fn tiled_ao_safe_mode_splits_ao_across_tile_seams() {
+    // A pillar right next to the seam between two tiles must still split the
+    // floor quads on the other side of the seam.
+    let dims = [100, 16, 16];
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    let voxels = make_voxels(dims, |x, y, z| {
+        if y <= 4 || (x == 49 && y == 5 && z == 8) {
+            TestVoxel::opaque(1, 0)
+        } else {
+            TestVoxel::empty(0)
+        }
+    });
+    let faces = RIGHT_HANDED_Y_UP_CONFIG.faces;
+    let ao_safe = mesh_with_binary_bgm_ao_safe(&voxels, &shape, [0; 3], [99, 15, 15], &faces);
+    assert_uniform_ao_per_quad(&voxels, &shape, &faces, &ao_safe);
+}
+
+#[test]
+fn visible_block_faces_matches_block_mesh() {
+    let mut rng = StdRng::seed_from_u64(0xface);
+    let mut buffer = BinaryUnitQuadBuffer::new();
+    let mut cases = vec![(
+        [70, 40, 66],
+        make_terrain_voxels([70, 40, 66], 3),
+        [0, 0, 0],
+        [69, 39, 65],
+    )];
+    for _ in 0..48 {
+        let dims = [
+            rng.random_range(3..=12),
+            rng.random_range(3..=12),
+            rng.random_range(3..=12),
+        ];
+        let min = [0, 1, 2].map(|axis| rng.random_range(0..=(dims[axis] - 3)));
+        let max = [0, 1, 2].map(|axis| rng.random_range((min[axis] + 2)..dims[axis]));
+        cases.push((dims, make_random_voxels(&mut rng, dims), min, max));
+    }
+
+    for (dims, voxels, min, max) in cases {
+        let shape = RuntimeShape::<u32, 3>::new(dims);
+        for faces in [RIGHT_HANDED_Y_UP_CONFIG.faces, canonical_faces()] {
+            let mut expected = UnitQuadBuffer::new();
+            visible_block_faces(&voxels, &shape, min, max, &faces, &mut expected);
+            binary_visible_block_faces(&voxels, &shape, min, max, &faces, &mut buffer);
+
+            for (expected, actual) in expected.groups.iter().zip(&buffer.quads.groups) {
+                let mut expected: Vec<_> = expected.iter().map(|quad| quad.minimum).collect();
+                let mut actual: Vec<_> = actual.iter().map(|quad| quad.minimum).collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(expected, actual);
+            }
+        }
+    }
 }
 
 fn assert_same_geometry(

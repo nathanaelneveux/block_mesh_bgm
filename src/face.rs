@@ -8,7 +8,7 @@
 //! - whether the caller's face belongs to the negative or positive sign of that
 //!   normal axis
 
-use block_mesh::{OrientedBlockFace, SignedAxis, UnorientedQuad};
+use block_mesh::{OrientedBlockFace, SignedAxis, UnorientedQuad, UnorientedUnitQuad};
 
 /// The parts of an `OrientedBlockFace` that matter to the binary mesher.
 #[derive(Clone, Copy)]
@@ -70,6 +70,21 @@ pub(crate) fn scan_axes(n_axis: usize) -> (usize, usize) {
     }
 }
 
+/// Maps the mesher's internal `(n, outer, bit)` coordinates back to `[x, y, z]`.
+#[inline(always)]
+pub(crate) fn quad_minimum<const N_AXIS: usize>(
+    n_coord: u32,
+    outer_coord: u32,
+    bit_coord: u32,
+) -> [u32; 3] {
+    match N_AXIS {
+        0 => [n_coord, bit_coord, outer_coord],
+        1 => [bit_coord, n_coord, outer_coord],
+        2 => [bit_coord, outer_coord, n_coord],
+        _ => unreachable!(),
+    }
+}
+
 /// Builds one quad from the mesher's internal axis naming.
 ///
 /// `run_width` is measured along the packed bit axis and `run_length` along
@@ -82,12 +97,6 @@ pub(crate) fn oriented_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
     run_width: u32,
     run_length: u32,
 ) -> UnorientedQuad {
-    let minimum = match N_AXIS {
-        0 => [n_coord, bit_coord, outer_coord],
-        1 => [bit_coord, n_coord, outer_coord],
-        2 => [bit_coord, outer_coord, n_coord],
-        _ => unreachable!(),
-    };
     let (width, height) = if BIT_IS_U {
         (run_width, run_length)
     } else {
@@ -95,28 +104,31 @@ pub(crate) fn oriented_quad<const N_AXIS: usize, const BIT_IS_U: bool>(
     };
 
     UnorientedQuad {
-        minimum,
+        minimum: quad_minimum::<N_AXIS>(n_coord, outer_coord, bit_coord),
         width,
         height,
     }
 }
 
-/// Calls `$kernel::<T, N_AXIS, BIT_IS_U>($args)` with a face's orientation
-/// lifted into const generics.
-///
-/// Every hot loop is then compiled once per orientation, so axis selection and
-/// the width/height swap in [`oriented_quad`] cost nothing at runtime.
-macro_rules! dispatch_orientation {
-    ($n_axis:expr, $bit_is_u:expr, $kernel:ident::<$t:ty>($($arg:expr),* $(,)?)) => {
-        match ($n_axis, $bit_is_u) {
-            (0, false) => $kernel::<$t, 0, false>($($arg),*),
-            (0, true) => $kernel::<$t, 0, true>($($arg),*),
-            (1, false) => $kernel::<$t, 1, false>($($arg),*),
-            (1, true) => $kernel::<$t, 1, true>($($arg),*),
-            (2, false) => $kernel::<$t, 2, false>($($arg),*),
-            (2, true) => $kernel::<$t, 2, true>($($arg),*),
-            _ => unreachable!("face normal axis must be 0, 1, or 2"),
-        }
-    };
+/// Output quad types that can represent a single `1x1` face.
+pub(crate) trait UnitQuadOutput {
+    fn unit(minimum: [u32; 3]) -> Self;
 }
-pub(crate) use dispatch_orientation;
+
+impl UnitQuadOutput for UnorientedQuad {
+    #[inline(always)]
+    fn unit(minimum: [u32; 3]) -> Self {
+        Self {
+            minimum,
+            width: 1,
+            height: 1,
+        }
+    }
+}
+
+impl UnitQuadOutput for UnorientedUnitQuad {
+    #[inline(always)]
+    fn unit(minimum: [u32; 3]) -> Self {
+        Self { minimum }
+    }
+}

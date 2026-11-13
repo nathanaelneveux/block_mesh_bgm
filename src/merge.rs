@@ -16,11 +16,11 @@
 
 use std::mem::MaybeUninit;
 
-use block_mesh::{MergeVoxel, UnorientedQuad};
+use block_mesh::{MergeVoxel, UnorientedQuad, UnorientedUnitQuad};
 
 use crate::bit_mask;
 use crate::context::{MeshingContext, SlicePlan};
-use crate::face::oriented_quad;
+use crate::face::{oriented_quad, quad_minimum, UnitQuadOutput};
 use crate::prep::FaceSliceMasks;
 
 /// Everything a merge kernel needs to know about one face orientation.
@@ -75,7 +75,7 @@ pub(crate) struct SliceGeometry {
 
 impl SliceGeometry {
     #[inline(always)]
-    pub(crate) fn new<T, const N_AXIS: usize>(job: &FaceJob<'_, T>, n_local: usize) -> Self {
+    pub(crate) fn new<const N_AXIS: usize>(job: &FaceJob<'_, impl Sized>, n_local: usize) -> Self {
         let context = job.context;
         let slice = job.slice;
         Self {
@@ -111,22 +111,78 @@ unsafe fn merge_value_at<T: MergeVoxel>(voxels: &[T], index: usize) -> T::MergeV
     unsafe { voxels.get_unchecked(index) }.merge_value()
 }
 
-/// Merges the faces of one orientation with the vanilla maximum-merge policy.
+/// How the visible faces of one orientation become quads.
+///
+/// The visibility pipeline is shared; a policy only decides how each face
+/// slice's rows are merged and what quad type comes out.
+pub(crate) trait FacePolicy<T> {
+    type Quad;
+
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<Self::Quad>,
+    );
+}
+
+/// Calls `P::mesh_face` with the face's orientation lifted into const
+/// generics, so every hot loop is compiled once per orientation and axis
+/// selection costs nothing at runtime.
 #[inline(always)]
-pub(crate) fn mesh_face<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+pub(crate) fn mesh_face_with<T, P: FacePolicy<T>>(
+    n_axis: usize,
+    bit_is_u: bool,
     job: &FaceJob<'_, T>,
-    quads: &mut Vec<UnorientedQuad>,
-) where
-    T: MergeVoxel,
-{
-    job.for_each_active_slice(|n_local, rows, unit_only| {
-        let geometry = SliceGeometry::new::<T, N_AXIS>(job, n_local);
-        if unit_only {
-            emit_unit_slice::<N_AXIS>(&geometry, rows, quads);
-        } else {
-            merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(job.voxels, &geometry, rows, quads);
-        }
-    });
+    quads: &mut Vec<P::Quad>,
+) {
+    match (n_axis, bit_is_u) {
+        (0, false) => P::mesh_face::<0, false>(job, quads),
+        (0, true) => P::mesh_face::<0, true>(job, quads),
+        (1, false) => P::mesh_face::<1, false>(job, quads),
+        (1, true) => P::mesh_face::<1, true>(job, quads),
+        (2, false) => P::mesh_face::<2, false>(job, quads),
+        (2, true) => P::mesh_face::<2, true>(job, quads),
+        _ => unreachable!("face normal axis must be 0, 1, or 2"),
+    }
+}
+
+/// The vanilla maximum-merge policy: merge whenever merge values match.
+pub(crate) struct Greedy;
+
+impl<T: MergeVoxel> FacePolicy<T> for Greedy {
+    type Quad = UnorientedQuad;
+
+    #[inline(always)]
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<UnorientedQuad>,
+    ) {
+        job.for_each_active_slice(|n_local, rows, unit_only| {
+            let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
+            if unit_only {
+                emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
+            } else {
+                merge_rows::<T, N_AXIS, BIT_IS_U, true, true>(job.voxels, &geometry, rows, quads);
+            }
+        });
+    }
+}
+
+/// One quad per visible face, like `block_mesh::visible_block_faces`.
+pub(crate) struct UnitFaces;
+
+impl<T> FacePolicy<T> for UnitFaces {
+    type Quad = UnorientedUnitQuad;
+
+    #[inline(always)]
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<UnorientedUnitQuad>,
+    ) {
+        job.for_each_active_slice(|n_local, rows, _| {
+            let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
+            emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
+        });
+    }
 }
 
 /// Greedily merges one slice's rows into quads.
@@ -316,10 +372,10 @@ fn emit_runs<
 
 /// Emits every visible cell in `rows` as a `1x1` quad.
 #[inline(always)]
-pub(crate) fn emit_unit_slice<const N_AXIS: usize>(
+pub(crate) fn emit_unit_slice<const N_AXIS: usize, Q: UnitQuadOutput>(
     geometry: &SliceGeometry,
     rows: &[u64],
-    quads: &mut Vec<UnorientedQuad>,
+    quads: &mut Vec<Q>,
 ) {
     let total = rows.iter().map(|row| row.count_ones() as usize).sum();
 
@@ -330,13 +386,11 @@ pub(crate) fn emit_unit_slice<const N_AXIS: usize>(
             while bits != 0 {
                 let bit_local = bits.trailing_zeros();
                 bits &= bits - 1;
-                out.push(oriented_quad::<N_AXIS, true>(
+                out.push(Q::unit(quad_minimum::<N_AXIS>(
                     geometry.n_coord,
                     outer_coord,
                     geometry.bit_base + bit_local,
-                    1,
-                    1,
-                ));
+                )));
             }
         }
     });
@@ -348,11 +402,7 @@ pub(crate) fn emit_unit_slice<const N_AXIS: usize>(
 /// Writing into reserved spare capacity keeps growth checks out of the hot
 /// emission loops.
 #[inline(always)]
-fn append_quads(
-    quads: &mut Vec<UnorientedQuad>,
-    max_quads: usize,
-    fill: impl FnOnce(&mut QuadSink<'_>),
-) {
+fn append_quads<Q>(quads: &mut Vec<Q>, max_quads: usize, fill: impl FnOnce(&mut QuadSink<'_, Q>)) {
     quads.reserve(max_quads);
     let len = quads.len();
     let mut sink = QuadSink {
@@ -367,14 +417,14 @@ fn append_quads(
     unsafe { quads.set_len(len + written) };
 }
 
-struct QuadSink<'a> {
-    spare: &'a mut [MaybeUninit<UnorientedQuad>],
+struct QuadSink<'a, Q> {
+    spare: &'a mut [MaybeUninit<Q>],
     written: usize,
 }
 
-impl QuadSink<'_> {
+impl<Q> QuadSink<'_, Q> {
     #[inline(always)]
-    fn push(&mut self, quad: UnorientedQuad) {
+    fn push(&mut self, quad: Q) {
         // Indexing (not `get_unchecked`) keeps an over-count a panic, not UB.
         self.spare[self.written].write(quad);
         self.written += 1;

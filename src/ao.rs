@@ -18,21 +18,35 @@
 use block_mesh::{MergeVoxel, UnorientedQuad};
 
 use crate::bit_mask;
-use crate::merge::{emit_unit_slice, merge_rows, FaceJob, SliceGeometry};
+use crate::merge::{emit_unit_slice, merge_rows, FaceJob, FacePolicy, SliceGeometry};
 use crate::prep::column_row_layout;
 
-/// Merges the faces of one orientation with AO-safe merge restrictions.
+/// Greedy merging that refuses merges across AO boundaries on opaque faces.
+pub(crate) struct AoSafe;
+
+impl<T: MergeVoxel> FacePolicy<T> for AoSafe {
+    type Quad = UnorientedQuad;
+
+    #[inline(always)]
+    fn mesh_face<const N_AXIS: usize, const BIT_IS_U: bool>(
+        job: &FaceJob<'_, T>,
+        quads: &mut Vec<UnorientedQuad>,
+    ) {
+        mesh_face_ao_safe::<T, N_AXIS, BIT_IS_U>(job, quads);
+    }
+}
+
 #[inline(always)]
-pub(crate) fn mesh_face_ao_safe<T, const N_AXIS: usize, const BIT_IS_U: bool>(
+fn mesh_face_ao_safe<T, const N_AXIS: usize, const BIT_IS_U: bool>(
     job: &FaceJob<'_, T>,
     quads: &mut Vec<UnorientedQuad>,
 ) where
     T: MergeVoxel,
 {
     job.for_each_active_slice(|n_local, rows, unit_only| {
-        let geometry = SliceGeometry::new::<T, N_AXIS>(job, n_local);
+        let geometry = SliceGeometry::new::<N_AXIS>(job, n_local);
         if unit_only {
-            emit_unit_slice::<N_AXIS>(&geometry, rows, quads);
+            emit_unit_slice::<N_AXIS, _>(&geometry, rows, quads);
             return;
         }
 
@@ -42,7 +56,7 @@ pub(crate) fn mesh_face_ao_safe<T, const N_AXIS: usize, const BIT_IS_U: bool>(
         let len = rows.len();
         let voxels = job.voxels;
         if classes.unit_union != 0 {
-            emit_unit_slice::<N_AXIS>(&geometry, &classes.unit[..len], quads);
+            emit_unit_slice::<N_AXIS, _>(&geometry, &classes.unit[..len], quads);
         }
         if classes.horizontal_union != 0 {
             merge_rows::<T, N_AXIS, BIT_IS_U, true, false>(
